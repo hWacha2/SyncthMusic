@@ -17,9 +17,10 @@ pub mod pipe;
 pub mod resolve;
 pub mod scan;
 pub mod store;
+pub mod vault;
 
 pub use hlc::Hlc;
 pub use op::{Op, OpKind};
 pub use resolve::{resolve, Action, Outcome};
 pub use scan::{scan, ScanReport};
-pub use store::{EntryRow, PendingDelete, Replica};
+pub use store::{EntryRow, PendingDelete, Replica, VaultRow};

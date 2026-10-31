@@ -479,7 +479,13 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
         },
     )?;
     match recv_msg(&mut r)? {
-        Msg::HelloAck { dev, .. } => tracing::info!("подключено к {dev}"),
+        Msg::HelloAck { dev, .. } => {
+            anyhow::ensure!(
+                dev != replica.device_id(),
+                "подключились к самому себе — проверьте адрес"
+            );
+            tracing::info!("подключено к {dev}");
+        }
         Msg::Error { message } => bail!("пир отказал: {message}"),
         other => bail!("неожиданный ответ: {other:?}"),
     }
@@ -509,10 +515,15 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
 }
 
 /// Серверная сторона: принять одно соединение и обслужить его.
+pub fn serve_stream(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
+    serve_one(stream, replica, token)
+}
+
 fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
     let root = replica.root()?.context("корень библиотеки не задан")?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     let mut w = BufWriter::new(stream.try_clone()?);
     let mut r = BufReader::new(stream);
     let mut stats = SyncStats::default();
@@ -540,6 +551,15 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
                     },
                 )?;
                 bail!("несовместимая версия протокола");
+            }
+            if dev == replica.device_id() {
+                send_msg(
+                    &mut w,
+                    &Msg::Error {
+                        message: "это то же самое устройство".into(),
+                    },
+                )?;
+                bail!("клиент представился нашим же device id");
             }
         }
         other => bail!("ожидали hello, получили {other:?}"),
@@ -635,7 +655,7 @@ pub fn spawn_one(replica: Replica, bind: &str, token: String) -> Result<ServerHa
 
 const DISCOVERY_MAGIC: &[u8] = b"SYNCTH-DISCOVER-V1";
 
-fn start_discovery(dev: String, port: u16) -> Result<()> {
+pub fn start_discovery(dev: String, port: u16) -> Result<()> {
     std::thread::spawn(move || {
         let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
             return;

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use syncth_core::{net, pipe, resolve, scan, Action, Replica};
+use syncth_core::{net, pipe, resolve, scan, vault, Action, Replica};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,6 +80,11 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         seconds: u64,
     },
+    /// Корзина: удалённое можно вернуть, пока не истёк срок хранения.
+    Vault {
+        #[command(subcommand)]
+        action: VaultCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -89,7 +94,7 @@ enum PendingCmd {
     /// Решить судьбу одного удаления.
     Resolve {
         path: String,
-        /// Удалить трек из библиотеки на всех устройствах (необратимо).
+        /// Удалить трек из библиотеки на всех устройствах (копия остаётся в корзине).
         #[arg(long, conflicts_with = "only_here")]
         delete_everywhere: bool,
         /// Убрать только с этого устройства, в общей библиотеке оставить.
@@ -100,6 +105,19 @@ enum PendingCmd {
     Restore { path: String },
     /// Снять ожидания, ничего не удаляя (например, файлы вернули вручную).
     Forget { path: Option<String> },
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultCmd {
+    /// Что лежит в корзине.
+    List,
+    /// Вернуть трек из корзины в библиотеку (уедет на другие устройства).
+    Restore { path: String },
+    /// Удалить из корзины всё старше срока и файлы-сироты.
+    Gc {
+        #[arg(long, default_value_t = vault::DEFAULT_TTL_DAYS)]
+        days: u64,
+    },
 }
 
 fn main() {
@@ -201,6 +219,7 @@ fn run() -> Result<()> {
                     ignored.len()
                 );
             }
+            println!("корзина:    {}", replica.vault_rows()?.len());
         }
 
         Command::Export { dir } => {
@@ -299,6 +318,7 @@ fn run() -> Result<()> {
                             }
                             println!("файлов удалено здесь: {}", out.files_removed);
                             println!("операций: {}", out.ops_emitted);
+                            println!("Копия сохранена в корзине: syncth vault list");
                             println!("Удаление уедет на другие устройства при следующем обмене.");
                         }
                         Action::OnlyHere => {
@@ -317,7 +337,8 @@ fn run() -> Result<()> {
                 }
                 PendingCmd::Restore { path } => {
                     resolve::restore(&mut replica, &path)?;
-                    println!("«{path}» снова в локальной библиотеке; файл докачается при обмене.");
+                    println!("«{path}» снова в локальной библиотеке.");
+                    println!("Если файла здесь нет, он докачается при следующем обмене.");
                 }
                 PendingCmd::Forget { path } => match path {
                     Some(p) => {
@@ -402,6 +423,39 @@ fn run() -> Result<()> {
                 }
             }
         }
+
+        Command::Vault { action } => match action {
+            VaultCmd::List => {
+                let rows = replica.vault_rows()?;
+                if rows.is_empty() {
+                    println!("корзина пуста");
+                } else {
+                    println!("в корзине {} трек(ов):", rows.len());
+                    for r in rows {
+                        println!(
+                            "  {}  ({} , {})",
+                            r.path,
+                            human(r.size),
+                            age_days(r.deleted_at)
+                        );
+                    }
+                    println!();
+                    println!("Вернуть: syncth vault restore \"<путь>\"");
+                }
+            }
+            VaultCmd::Restore { path } => {
+                resolve::restore(&mut replica, &path)?;
+                println!("«{path}» возвращён из корзины в библиотеку.");
+                println!("Изменение уедет на другие устройства при следующем обмене.");
+            }
+            VaultCmd::Gc { days } => {
+                let report = vault::gc(&replica, days)?;
+                println!("корзина очищена");
+                println!("  записей удалено: {}", report.rows_removed);
+                println!("  файлов удалено:  {}", report.blobs_removed);
+                println!("  сирот удалено:   {}", report.orphans_removed);
+            }
+        },
     }
 
     Ok(())
@@ -450,6 +504,17 @@ fn blake3_short(s: &str) -> String {
         acc = acc.wrapping_mul(1099511628211);
     }
     format!("{acc:016x}")[..8].to_string()
+}
+
+fn age_days(deleted_at_ms: u64) -> String {
+    let now = syncth_core::Hlc::wall_ms();
+    let days = now.saturating_sub(deleted_at_ms) / (24 * 60 * 60 * 1000);
+    match days {
+        0 => "сегодня".to_string(),
+        1 => "1 день назад".to_string(),
+        n if n < 5 => format!("{n} дня назад"),
+        n => format!("{n} дней назад"),
+    }
 }
 
 fn human(bytes: u64) -> String {

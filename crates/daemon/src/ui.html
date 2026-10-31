@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SynctMusic</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f25;
+    --panel2: #232830;
+    --line: #2e343e;
+    --text: #e6e9ef;
+    --muted: #8b94a3;
+    --accent: #6aa9ff;
+    --good: #57c785;
+    --warn: #e6b450;
+    --bad: #ef6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font: 15px/1.45 "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+  h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; color: var(--muted); }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .sub { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--good); margin-right: 7px; }
+  .dot.paused { background: var(--warn); }
+  .dot.busy { background: var(--accent); animation: pulse 1s infinite; }
+  .dot.error { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+  .card .v small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #213a5e; border-color: #2f5b93; }
+  button.danger { background: #3a2224; border-color: #6b3336; color: #ffc9c9; }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .error {
+    background: #3a2224; border: 1px solid #6b3336; color: #ffd4d4;
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .row:first-of-type { border-top: 0; }
+  .path { font-size: 13px; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 420px;
+    background: #1f2b22; border: 1px solid #355841; color: #d7f5e1;
+    border-radius: 10px; padding: 11px 14px; font-size: 13px;
+    opacity: 0; transform: translateY(8px); transition: .18s; pointer-events: none;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.err { background: #3a2224; border-color: #6b3336; color: #ffd4d4; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1><span id="dot" class="dot"></span>SynctMusic</h1>
+      <div class="sub"><span id="statusline">загрузка…</span></div>
+    </div>
+    <div class="sub" id="dev"></div>
+  </div>
+
+  <div id="error" class="error" hidden></div>
+
+  <div class="cards">
+    <div class="card"><div class="k">Треков</div><div class="v" id="files">—</div></div>
+    <div class="card"><div class="k">Здесь</div><div class="v" id="local">—</div></div>
+    <div class="card"><div class="k">Размер</div><div class="v" id="size">—</div></div>
+    <div class="card"><div class="k">Операций</div><div class="v" id="ops">—</div></div>
+    <div class="card"><div class="k">В корзине</div><div class="v" id="vaultcount">—</div></div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="btn-scan">Сканировать</button>
+    <button class="primary" id="btn-sync">Синхронизировать</button>
+    <button id="btn-pause">Пауза</button>
+    <button id="btn-gc">Очистить корзину</button>
+  </div>
+
+  <section>
+    <h2>Ожидают решения об удалении</h2>
+    <div id="pending"></div>
+  </section>
+
+  <section>
+    <h2>Конфликты</h2>
+    <div id="conflicts"></div>
+  </section>
+
+  <section>
+    <h2>Корзина</h2>
+    <div id="vault"></div>
+  </section>
+
+  <section>
+    <h2>Исключено на этом устройстве</h2>
+    <div id="ignored"></div>
+  </section>
+
+  <section>
+    <h2>Устройства</h2>
+    <div id="peers"></div>
+  </section>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let busy = false;
+let lastPaused = false;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+function human(bytes) {
+  const k = 1024;
+  if (bytes >= k * k * k) return (bytes / (k * k * k)).toFixed(2) + " ГиБ";
+  if (bytes >= k * k) return (bytes / (k * k)).toFixed(1) + " МиБ";
+  if (bytes >= k) return Math.round(bytes / k) + " КиБ";
+  return bytes + " Б";
+}
+
+function ago(ms) {
+  if (!ms) return "никогда";
+  const d = Math.max(0, Date.now() - ms) / 1000;
+  if (d < 60) return "только что";
+  if (d < 3600) return Math.floor(d / 60) + " мин назад";
+  if (d < 86400) return Math.floor(d / 3600) + " ч назад";
+  return Math.floor(d / 86400) + " дн назад";
+}
+
+function toast(text, isError) {
+  const t = $("toast");
+  t.textContent = text;
+  t.className = "toast show" + (isError ? " err" : "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.className = "toast"; }, 5000);
+}
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {})
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data.message || "готово";
+}
+
+async function action(path, body, okText) {
+  if (busy) return;
+  busy = true;
+  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  try {
+    const msg = await api(path, body);
+    toast(okText ? okText + "\n" + msg : msg, false);
+    await refresh();
+  } catch (e) {
+    toast(String(e.message || e), true);
+  } finally {
+    busy = false;
+    document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    document.querySelectorAll(".danger").forEach((b) => (b.disabled = false));
+    updatePauseButton(lastPaused);
+  }
+}
+
+function updatePauseButton(paused) {
+  lastPaused = paused;
+  $("btn-pause").textContent = paused ? "Продолжить" : "Пауза";
+}
+
+function row(path, metaText, buttons) {
+  const r = el("div", "row");
+  const left = el("div");
+  left.appendChild(el("div", "path", path));
+  if (metaText) left.appendChild(el("div", "meta", metaText));
+  r.appendChild(left);
+  if (buttons && buttons.length) {
+    const a = el("div", "actions");
+    buttons.forEach((b) => a.appendChild(b));
+    r.appendChild(a);
+  }
+  return r;
+}
+
+function button(text, cls, onClick) {
+  const b = el("button", "small" + (cls ? " " + cls : ""), text);
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function fill(container, emptyText, items) {
+  container.replaceChildren();
+  if (!items.length) {
+    container.appendChild(el("div", "empty", emptyText));
+    return;
+  }
+  items.forEach((n) => container.appendChild(n));
+}
+
+function render(s) {
+  $("dev").textContent = s.device;
+  $("files").textContent = s.files;
+  $("local").textContent = s.local;
+  $("size").textContent = human(s.size || 0);
+  $("ops").textContent = s.ops;
+  $("vaultcount").textContent = s.vault.length;
+  updatePauseButton(s.paused);
+
+  const dot = $("dot");
+  dot.className = "dot" + (s.syncing ? " busy" : s.paused ? " paused" : s.last_error ? " error" : "");
+  const parts = [];
+  if (s.syncing) parts.push("синхронизация…");
+  else if (s.paused) parts.push("автосинк на паузе");
+  else parts.push("работает");
+  parts.push("скан: " + ago(s.last_scan));
+  parts.push("синк: " + ago(s.last_sync));
+  parts.push(s.root);
+  $("statusline").textContent = parts.join(" · ");
+
+  const err = $("error");
+  if (s.last_error) {
+    err.hidden = false;
+    err.textContent = s.last_error;
+  } else {
+    err.hidden = true;
+  }
+
+  fill($("pending"), "Нет удалений, ждущих решения.", s.pending.map((p) =>
+    row(p.path, "пропал с диска " + ago(p.detected_at), [
+      button("Удалить везде", "danger", () => action("/api/pending/resolve", { path: p.path, action: "delete_everywhere" }, "Удалено из библиотеки")),
+      button("Только здесь", null, () => action("/api/pending/resolve", { path: p.path, action: "only_here" }, "Убрано только здесь")),
+      button("Забыть", null, () => action("/api/pending/forget", { path: p.path }, "Ожидание снято"))
+    ])
+  ));
+
+  fill($("conflicts"), "Конфликтных копий нет.", s.conflicts.map((p) =>
+    row(p, "две правки одного трека — обе сохранены", [])
+  ));
+
+  fill($("vault"), "Корзина пуста.", s.vault.map((v) =>
+    row(v.path, human(v.size) + " · удалено " + ago(v.deleted_at), [
+      button("Восстановить", null, () => action("/api/restore", { path: v.path }, "Трек возвращён"))
+    ])
+  ));
+
+  fill($("ignored"), "Ничего не исключено.", s.ignored.map((p) =>
+    row(p, "есть в общей библиотеке, но не здесь", [
+      button("Вернуть сюда", null, () => action("/api/ignore", { path: p, ignored: false }, "Файл снова ожидается"))
+    ])
+  ));
+
+  fill($("peers"), "Пока никого не видели.", s.peers.map((p) =>
+    row(p.addr, p.error ? "ошибка: " + p.error : "последний сеанс: " + ago(p.last_seen), [])
+  ));
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("dot").className = "dot error";
+    $("statusline").textContent = "демон не отвечает: " + e.message;
+  }
+}
+
+$("btn-scan").addEventListener("click", () => action("/api/scan", {}, "Скан завершён"));
+$("btn-sync").addEventListener("click", () => action("/api/sync", {}, "Синхронизация"));
+$("btn-pause").addEventListener("click", () => action("/api/pause", { paused: !lastPaused }, lastPaused ? "Автосинк включён" : "Пауза"));
+$("btn-gc").addEventListener("click", () => {
+  if (confirm("Удалить из корзины всё старше срока хранения?")) action("/api/gc", {}, "Корзина очищена");
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

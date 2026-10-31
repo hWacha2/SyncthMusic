@@ -18,7 +18,8 @@ use crate::store::Replica;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Удалить трек из библиотеки на всех устройствах. Необратимо.
+    /// Удалить трек из библиотеки на всех устройствах. Обратимо, пока копия
+    /// жива в локальной корзине (`vault`).
     DeleteEverywhere,
     /// Убрать с этого устройства, но оставить в общей библиотеке.
     /// Обратимо через `restore`.
@@ -54,8 +55,17 @@ pub fn resolve(replica: &mut Replica, path: &str, action: Action) -> Result<Outc
 fn delete_everywhere(replica: &mut Replica, root: &Path, blob: &str) -> Result<Outcome> {
     let mut out = Outcome::default();
     let targets = replica.live_paths_by_blob(blob)?;
+    let mut failed: Vec<String> = Vec::new();
 
     for path in targets {
+        // Сначала корзина: удаление должно быть обратимым. Если сохранить
+        // копию не удалось, файл не трогаем — лучше ошибка, чем потеря.
+        if let Err(e) = crate::vault::preserve_file(replica, root, &path) {
+            out.failed.push((path.clone(), format!("корзина: {e:#}")));
+            failed.push(path);
+            continue;
+        }
+
         let kind = OpKind::EntryDel { path: path.clone() };
         let op = Op::new(
             replica.device_id().to_string(),
@@ -74,18 +84,10 @@ fn delete_everywhere(replica: &mut Replica, root: &Path, blob: &str) -> Result<O
     }
 
     // Ожидания, указывавшие на этот блоб под другими путями, больше не нужны.
+    // Неудачные пути оставляем в очереди — их можно повторить.
     for p in replica.pending_deletes()? {
-        if p.blob == blob {
+        if p.blob == blob && !failed.contains(&p.path) {
             replica.clear_pending_delete(&p.path)?;
-        }
-    }
-
-    if out.deleted_paths.is_empty() {
-        // Уже удалено другим устройством — просто снимаем ожидание.
-        for p in replica.pending_deletes()? {
-            if p.blob == blob {
-                replica.clear_pending_delete(&p.path)?;
-            }
         }
     }
 
@@ -98,7 +100,9 @@ fn only_here(replica: &mut Replica, path: &str, root: &Path) -> Result<Outcome> 
     replica.clear_pending_delete(path)?;
     out.ignored_paths.push(path.to_string());
 
-    // Файла уже нет (иначе он не был бы в ожидании), но на всякий случай.
+    // Файла уже нет (иначе он не был бы в ожидании), но если он здесь —
+    // сначала в корзину, потом убираем из библиотеки.
+    crate::vault::preserve_file(replica, root, path)?;
     if remove_file(root, path).is_ok() {
         out.files_removed += 1;
     }
@@ -106,12 +110,11 @@ fn only_here(replica: &mut Replica, path: &str, root: &Path) -> Result<Outcome> 
 }
 
 /// Возвращает запись в локальную библиотеку. Файл докачается при следующем
-/// обмене с тем, у кого он есть.
+/// обмене с тем, у кого он есть; если запись удалена везде — берём копию
+/// из корзины.
 pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
     match replica.entry(path)? {
-        Some(e) if e.deleted => bail!(
-            "«{path}» удалён во всей библиотеке — восстановить его можно только из резервной копии"
-        ),
+        Some(e) if e.deleted => crate::vault::restore(replica, path),
         Some(_) => {
             replica.set_ignored(path, false)?;
             replica.mark_absent(path)?;
@@ -136,7 +139,7 @@ fn remove_file(root: &Path, rel: &str) -> Result<()> {
 }
 
 /// Не оставляем пустые папки от удалённых альбомов, но не трогаем корень.
-fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
+pub(crate) fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
     while let Some(d) = dir {
         if d == root || !d.starts_with(root) {
             return;
@@ -175,6 +178,12 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
         let on_disk = scan::hash_file(&abs);
         match on_disk {
             Ok(h) if h == blob => {
+                // Удаление пришло от другого устройства — сохраняем копию в
+                // локальную корзину, чтобы его можно было отменить.
+                if let Err(e) = crate::vault::preserve_file(replica, root, &path) {
+                    tracing::warn!("не удалось положить {path} в корзину: {e:#}");
+                    continue;
+                }
                 std::fs::remove_file(&abs)
                     .with_context(|| format!("удаление {}", abs.display()))?;
                 replica.mark_absent(&path)?;

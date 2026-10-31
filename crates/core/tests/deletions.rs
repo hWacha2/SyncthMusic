@@ -188,10 +188,11 @@ fn restore_refuses_to_resurrect_a_deleted_track() {
     scan::scan(&ctx.root_a, &mut a).unwrap();
     resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
 
+    // Файла на A уже не было, когда принималось решение, — в корзине пусто.
     let err = resolve::restore(&mut a, "Album/01.flac")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("резервной копии"), "{err}");
+    assert!(err.contains("корзине"), "{err}");
 }
 
 #[test]

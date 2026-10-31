@@ -152,6 +152,24 @@ if ($stateA -ne $stateB) { throw "после удаления состояние
 
 Write-Host ""
 Write-Host "OK: удаление подтверждено на телефоне и применилось на ПК." -ForegroundColor Green
+
+# ---------------------------------------------------------------- корзина
+Write-Host ""
+Write-Host "=== Корзина: удаление обратимо ===" -ForegroundColor Green
+Run-Syncth $dataB 'vault list' @('vault', 'list')
+Run-Syncth $dataB 'vault restore' @('vault', 'restore', 'БГ/2008 - Русский альбом/01 - Поезд в огне.flac')
+
+if (-not (Test-Path $onPC)) { throw "vault restore не вернул файл на ПК" }
+Sync-Pair $dataB $dataA 47893 $token
+
+$onPhone = Join-Path $musicA 'БГ\2008 - Русский альбом\01 - Поезд в огне.flac'
+if (-not (Test-Path $onPhone)) { throw "восстановление не доехало до телефона" }
+$stateA = Get-State $dataA
+$stateB = Get-State $dataB
+if ($stateA -ne $stateB) { throw "после восстановления состояние разошлось" }
+
+Write-Host ""
+Write-Host "OK: трек вернулся из корзины на ПК и уехал обратно на телефон." -ForegroundColor Green
 Write-Host "Остальные файлы целы, state_hash совпадает: $stateA" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Демо завершено." -ForegroundColor Green

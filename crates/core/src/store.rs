@@ -62,6 +62,19 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
     blob        TEXT NOT NULL,
     detected_at INTEGER NOT NULL
 );
+
+-- Корзина: hardlink на блоб в data_dir/vault (0 байт на NTFS).
+CREATE TABLE IF NOT EXISTS vault (
+    blob       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    added_at   INTEGER NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    PRIMARY KEY (blob, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_path ON vault(path);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +94,16 @@ pub struct PendingDelete {
     pub detected_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultRow {
+    pub blob: String,
+    pub path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub added_at: u64,
+    pub deleted_at: u64,
+}
+
 pub struct Replica {
     conn: Connection,
     dev: String,
@@ -91,6 +114,7 @@ impl Replica {
     /// Реплика в памяти — для тестов и `syncth doctor`.
     pub fn in_memory(dev: &str) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut replica = Self {
             conn,
             dev: dev.to_string(),
@@ -105,6 +129,7 @@ impl Replica {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("не удалось создать {}", data_dir.display()))?;
         let conn = Connection::open(data_dir.join("library.db"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let mut replica = Self {
@@ -557,6 +582,131 @@ impl Replica {
         self.conn
             .execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
         Ok(())
+    }
+
+    /// Полные метаданные записи, даже если она удалена. Нужно корзине:
+    /// после tombstone `entry()` намеренно прячет payload.
+    pub fn entry_raw(&self, path: &str) -> Result<Option<(String, u64, i64, u64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT blob, size, mtime_ns, added_at FROM entries WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Пути с конфликтными копиями — для UI.
+    pub fn conflict_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path FROM entries
+             WHERE deleted = 0 AND path LIKE '%.sync-conflict-%'
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---------------------------------------------------------------- vault
+
+    pub fn add_vault_row(&self, row: &VaultRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO vault(blob, path, size, mtime_ns, added_at, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(blob, path) DO UPDATE SET
+                 size = excluded.size,
+                 mtime_ns = excluded.mtime_ns,
+                 added_at = excluded.added_at,
+                 deleted_at = excluded.deleted_at",
+            params![
+                row.blob,
+                row.path,
+                row.size as i64,
+                row.mtime_ns,
+                row.added_at as i64,
+                row.deleted_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn vault_rows(&self) -> Result<Vec<VaultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blob, path, size, mtime_ns, added_at, deleted_at
+             FROM vault ORDER BY deleted_at DESC, path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VaultRow {
+                blob: r.get(0)?,
+                path: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime_ns: r.get(3)?,
+                added_at: r.get::<_, i64>(4)? as u64,
+                deleted_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn vault_for_path(&self, path: &str) -> Result<Option<VaultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blob, path, size, mtime_ns, added_at, deleted_at
+             FROM vault WHERE path = ?1 ORDER BY deleted_at DESC LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![path], |r| {
+                Ok(VaultRow {
+                    blob: r.get(0)?,
+                    path: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    mtime_ns: r.get(3)?,
+                    added_at: r.get::<_, i64>(4)? as u64,
+                    deleted_at: r.get::<_, i64>(5)? as u64,
+                })
+            })
+            .optional()?)
+    }
+
+    pub fn remove_vault_row(&self, blob: &str, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM vault WHERE blob = ?1 AND path = ?2",
+            params![blob, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn vault_refs(&self, blob: &str) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM vault WHERE blob = ?1",
+            params![blob],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    pub fn vault_rows_before(&self, ts: u64) -> Result<Vec<VaultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blob, path, size, mtime_ns, added_at, deleted_at
+             FROM vault WHERE deleted_at < ?1 ORDER BY deleted_at",
+        )?;
+        let rows = stmt.query_map(params![ts as i64], |r| {
+            Ok(VaultRow {
+                blob: r.get(0)?,
+                path: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime_ns: r.get(3)?,
+                added_at: r.get::<_, i64>(4)? as u64,
+                deleted_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
