@@ -85,6 +85,18 @@ enum Command {
         #[command(subcommand)]
         action: VaultCmd,
     },
+    /// Строка сопряжения для второго устройства (её же показывает демон с QR).
+    PairCode {
+        /// Адрес этого устройства для второго (по умолчанию LAN-IP:47887).
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long, default_value_t = 47887)]
+        port: u16,
+    },
+    /// Принять строку сопряжения: общий токен и адрес первого устройства.
+    Pair { code: String },
+    /// Сопряжённые устройства.
+    Peers,
 }
 
 #[derive(Subcommand, Debug)]
@@ -456,6 +468,45 @@ fn run() -> Result<()> {
                 println!("  сирот удалено:   {}", report.orphans_removed);
             }
         },
+
+        Command::PairCode { addr, port } => {
+            let token = replica.ensure_token()?;
+            let addr = addr.unwrap_or_else(|| net::advertised_addr(port));
+            let code = net::pair_code(&dev, &token, &addr);
+            println!("{code}");
+            println!();
+            println!("На втором устройстве:");
+            println!("  syncth --data-dir <его data-dir> pair \"{code}\"");
+            println!();
+            println!("Демон на этом устройстве должен слушать {addr}.");
+        }
+
+        Command::Pair { code } => {
+            let info = net::parse_pair_code(&code)?;
+            replica.set_token(&info.token)?;
+            replica.add_peer(&info.dev, &info.addr)?;
+            println!("сопряжено с {}", info.dev);
+            println!("  адрес: {}", info.addr);
+            println!("  токен библиотеки обновлён");
+            if replica.root()?.is_none() {
+                println!();
+                println!("Корень ещё не задан — выполните: syncth init --root <путь>");
+            } else {
+                println!();
+                println!("Запущенный демон подхватит новый токен при следующем сеансе.");
+            }
+        }
+
+        Command::Peers => {
+            let peers = replica.known_peers()?;
+            if peers.is_empty() {
+                println!("сопряжённых устройств нет");
+            } else {
+                for (dev, addr) in peers {
+                    println!("{dev}\t{addr}");
+                }
+            }
+        }
     }
 
     Ok(())

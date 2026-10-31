@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 use notify::Watcher;
 use syncth_core::{net, resolve, scan, vault, Action, Hlc, Replica};
 
+mod tray;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "syncthd",
@@ -71,6 +73,18 @@ struct Cli {
     #[arg(long)]
     no_watch: bool,
 
+    /// Порог свободного места, %. Ниже — синхронизация приостанавливается.
+    #[arg(long, default_value_t = 5.0)]
+    min_free_percent: f64,
+
+    /// Не показывать иконку в трее.
+    #[arg(long)]
+    no_tray: bool,
+
+    /// Не показывать уведомления Windows об удалениях.
+    #[arg(long)]
+    no_notify: bool,
+
     /// Прописать демон в автозапуск Windows и выйти.
     #[arg(long)]
     install_autostart: bool,
@@ -109,6 +123,11 @@ struct Runtime {
     last_scan: Option<u64>,
     last_sync: Option<u64>,
     last_error: Option<String>,
+    disk_low: bool,
+    disk_free_percent: Option<f64>,
+    disk_free: u64,
+    disk_total: u64,
+    disk_threshold: f64,
     peers: BTreeMap<String, PeerStatus>,
 }
 
@@ -152,6 +171,11 @@ enum Cmd {
         paused: bool,
         reply: Reply,
     },
+    CheckDisk(Reply),
+    Pair {
+        code: String,
+        reply: Reply,
+    },
 }
 
 fn run() -> Result<()> {
@@ -186,14 +210,14 @@ fn run() -> Result<()> {
         bail!("data-dir не должен находиться внутри библиотеки");
     }
 
-    let token = match cli
+    if let Some(t) = cli
         .token
         .clone()
         .or_else(|| std::env::var("SYNCTH_TOKEN").ok())
     {
-        Some(t) => t,
-        None => replica.ensure_token()?,
-    };
+        replica.set_token(&t)?;
+    }
+    let token = replica.ensure_token()?;
 
     let listener =
         std::net::TcpListener::bind(&cli.bind).with_context(|| format!("bind {}", cli.bind))?;
@@ -225,12 +249,17 @@ fn run() -> Result<()> {
     };
 
     let runtime: Shared = Arc::new(Mutex::new(Runtime::default()));
+    let disk = DiskProbe {
+        paths: vec![root.clone(), absolute(&cli.data_dir)?],
+        min_percent: cli.min_free_percent.clamp(0.0, 100.0),
+    };
     let cfg = WorkerConfig {
         root: root.clone(),
-        token: token.clone(),
         sync_interval: Duration::from_secs(cli.sync_interval.max(5)),
         vault_days: cli.vault_days,
         explicit_peers: cli.peers.clone(),
+        notify: !cli.no_notify,
+        disk: disk.clone(),
     };
 
     let rt = runtime.clone();
@@ -242,8 +271,8 @@ fn run() -> Result<()> {
     {
         let data_dir = cli.data_dir.clone();
         let dev = dev.clone();
-        let token = token.clone();
         let runtime = runtime.clone();
+        let disk = disk.clone();
         std::thread::spawn(move || {
             let mut replica = match Replica::open(&data_dir, &dev) {
                 Ok(r) => r,
@@ -253,6 +282,20 @@ fn run() -> Result<()> {
                 }
             };
             while let Ok(stream) = stream_rx.recv() {
+                if refresh_disk(&runtime, &disk) {
+                    let _ = net::reject_stream(
+                        stream,
+                        "на этом устройстве мало места — синхронизация приостановлена",
+                    );
+                    continue;
+                }
+                let token = match replica.ensure_token() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("токен: {e:#}");
+                        continue;
+                    }
+                };
                 runtime.lock().unwrap().syncing = true;
                 finish_sync(
                     &runtime,
@@ -266,17 +309,23 @@ fn run() -> Result<()> {
     // параллельно с записью рабочего потока.
     let read = Arc::new(Mutex::new(Replica::open(&cli.data_dir, &dev)?));
     let ui_ctx = UiCtx {
-        commands: cmd_tx,
+        commands: cmd_tx.clone(),
         read,
-        runtime,
+        runtime: runtime.clone(),
         root,
         dev: dev.clone(),
+        sync_addr: net::advertised_addr(port),
     };
+    if !cli.no_tray {
+        tray::spawn(cmd_tx, runtime.clone(), format!("http://{}", cli.ui));
+    }
     println!("syncthd запущен");
     println!("  устройство: {dev}");
     println!("  корень:     {}", ui_ctx.root.display());
     println!("  синк:       {}", cli.bind);
+    println!("  токен:      {}…", &token[..8.min(token.len())]);
     println!("  UI:         http://{}", cli.ui);
+    println!("  порог места: {:.0}%", disk.min_percent);
     println!("  данные:     {}", absolute(&cli.data_dir)?.display());
     serve_ui(&cli.ui, ui_ctx)
 }
@@ -285,10 +334,11 @@ fn run() -> Result<()> {
 
 struct WorkerConfig {
     root: PathBuf,
-    token: String,
     sync_interval: Duration,
     vault_days: u64,
     explicit_peers: Vec<String>,
+    notify: bool,
+    disk: DiskProbe,
 }
 
 fn worker(
@@ -302,9 +352,11 @@ fn worker(
     let mut pending_scan = false;
     let mut scan_at = Instant::now();
     let mut next_sync = Instant::now() + cfg.sync_interval;
+    let mut last_disk_check = Instant::now() - Duration::from_secs(60);
 
     // Первичный скан: догоняем изменения, сделанные при выключенном демоне.
-    if let Err(e) = do_scan(&mut replica, &root, &runtime) {
+    refresh_disk(&runtime, &cfg.disk);
+    if let Err(e) = do_scan(&mut replica, &root, &runtime, cfg.notify) {
         runtime.lock().unwrap().error(format!("скан: {e:#}"));
     }
     if let Err(e) = vault::gc(&replica, cfg.vault_days) {
@@ -313,16 +365,47 @@ fn worker(
     let mut last_gc = Instant::now();
 
     loop {
-        tracing::trace!("worker loop");
         match commands.recv_timeout(Duration::from_millis(200)) {
             Ok(Cmd::Scan(reply)) => {
-                let res =
-                    do_scan(&mut replica, &root, &runtime).map(|_| "скан завершён".to_string());
+                let res = do_scan(&mut replica, &root, &runtime, cfg.notify)
+                    .map(|_| "скан завершён".to_string());
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Sync(reply)) => {
                 let res = do_sync(&mut replica, &cfg, &runtime, true);
                 respond(reply, res, &runtime);
+            }
+            Ok(Cmd::CheckDisk(reply)) => {
+                let low = refresh_disk(&runtime, &cfg.disk);
+                let free = runtime
+                    .lock()
+                    .unwrap()
+                    .disk_free_percent
+                    .map(|p| format!("{p:.1}%"))
+                    .unwrap_or_else(|| "неизвестно".into());
+                let msg: Result<String> = if low {
+                    Err(anyhow::anyhow!(
+                        "мало места: свободно {free} — синхронизация приостановлена"
+                    ))
+                } else {
+                    Ok(format!("места достаточно: свободно {free}"))
+                };
+                respond(reply, msg, &runtime);
+            }
+            Ok(Cmd::Pair { code, reply }) => {
+                let res = (|| -> Result<String> {
+                    let info = net::parse_pair_code(&code)?;
+                    replica.set_token(&info.token)?;
+                    replica.add_peer(&info.dev, &info.addr)?;
+                    Ok(format!("сопряжено с {} ({})", info.dev, info.addr))
+                })();
+                let ok = res.is_ok();
+                respond(reply, res, &runtime);
+                if ok {
+                    // Не ждём следующего периода: пользователь только что
+                    // выбрал «сопрячь», он ждёт эффекта.
+                    next_sync = Instant::now();
+                }
             }
             Ok(Cmd::Resolve {
                 path,
@@ -404,16 +487,22 @@ fn worker(
 
         if pending_scan && Instant::now() >= scan_at {
             pending_scan = false;
-            if let Err(e) = do_scan(&mut replica, &root, &runtime) {
+            if let Err(e) = do_scan(&mut replica, &root, &runtime, cfg.notify) {
                 runtime.lock().unwrap().error(format!("скан: {e:#}"));
             }
         }
 
+        if last_disk_check.elapsed() >= Duration::from_secs(5) {
+            last_disk_check = Instant::now();
+            refresh_disk(&runtime, &cfg.disk);
+        }
+
         let now = Instant::now();
         if now >= next_sync {
-            tracing::debug!("пора автосинка");
             next_sync = now + cfg.sync_interval;
-            if !runtime.lock().unwrap().paused {
+            let low = refresh_disk(&runtime, &cfg.disk);
+            let paused = runtime.lock().unwrap().paused;
+            if !paused && !low {
                 if let Err(e) = do_sync(&mut replica, &cfg, &runtime, false) {
                     tracing::debug!("автосинк: {e:#}");
                 }
@@ -444,12 +533,14 @@ fn respond(reply: Reply, res: Result<String>, runtime: &Shared) {
     let _ = reply.send(res.map_err(|e| format!("{e:#}")));
 }
 
-fn do_scan(replica: &mut Replica, root: &Path, runtime: &Shared) -> Result<()> {
+fn do_scan(replica: &mut Replica, root: &Path, runtime: &Shared, notify: bool) -> Result<()> {
     let report = scan::scan(root, replica)?;
     let saved = resolve::prune_deleted_files(replica, root)?;
     let mut rt = runtime.lock().unwrap();
     rt.last_scan = Some(Hlc::wall_ms());
-    rt.last_error = None;
+    if !rt.disk_low {
+        rt.last_error = None;
+    }
     drop(rt);
     tracing::info!(
         "скан: +{} новых, ~{} изменённых, {} без изменений, пропало {}",
@@ -463,11 +554,36 @@ fn do_scan(replica: &mut Replica, root: &Path, runtime: &Shared) -> Result<()> {
             "пропало с диска: {} — решение в веб-UI",
             report.missing.len()
         );
+        if notify {
+            notify_deletions(&report.missing);
+        }
     }
     if !saved.is_empty() {
         tracing::warn!("сохранено конфликтных копий: {}", saved.len());
     }
     Ok(())
+}
+
+/// Уведомление Windows: удаление не должно проходить незамеченным.
+fn notify_deletions(missing: &[String]) {
+    let count = missing.len();
+    let first = missing.first().cloned().unwrap_or_default();
+    std::thread::spawn(move || {
+        let mut body = first;
+        if count > 1 {
+            body.push_str(&format!("\nи ещё {} файл(ов)", count - 1));
+        }
+        body.push_str("\nОткройте SynctMusic: удалить везде или оставить только здесь.");
+        let result = notify_rust::Notification::new()
+            .appname("SynctMusic")
+            .summary(&format!("Пропало файлов: {count}"))
+            .body(&body)
+            .timeout(notify_rust::Timeout::Milliseconds(10_000))
+            .show();
+        if let Err(e) = result {
+            tracing::debug!("уведомление не показано: {e:#}");
+        }
+    });
 }
 
 fn do_sync(
@@ -476,12 +592,21 @@ fn do_sync(
     runtime: &Shared,
     manual: bool,
 ) -> Result<String> {
+    if refresh_disk(runtime, &cfg.disk) {
+        bail!("мало места на диске — синхронизация приостановлена до освобождения места");
+    }
+    let token = replica.ensure_token()?;
     let me = replica.device_id().to_string();
     let mut targets: Vec<(String, String)> = cfg
         .explicit_peers
         .iter()
         .map(|a| (a.clone(), a.clone()))
         .collect();
+    for (dev, addr) in replica.known_peers()? {
+        if dev != me && !targets.iter().any(|(_, a)| *a == addr) {
+            targets.push((dev, addr));
+        }
+    }
 
     match net::discover(Duration::from_secs(2)) {
         Ok(found) => {
@@ -513,7 +638,7 @@ fn do_sync(
     let mut done = Vec::new();
     let mut errors = Vec::new();
     for (dev, addr) in targets {
-        match net::sync_with_peer(replica, &addr, &cfg.token) {
+        match net::sync_with_peer(replica, &addr, &token) {
             Ok(stats) => {
                 done.push(format!("{dev} ({addr}): {}", stats.summary()));
                 let mut rt = runtime.lock().unwrap();
@@ -569,11 +694,78 @@ fn finish_sync(runtime: &Shared, result: Result<String>) {
     match result {
         Ok(summary) => {
             rt.last_sync = Some(Hlc::wall_ms());
-            rt.last_error = None;
+            if !rt.disk_low {
+                rt.last_error = None;
+            }
             tracing::info!("входящий сеанс: {summary}");
         }
         Err(e) => rt.error(format!("входящий сеанс: {e:#}")),
     }
+}
+
+// ------------------------------------------------------------------ disk guard
+
+#[derive(Debug, Clone)]
+struct DiskProbe {
+    paths: Vec<PathBuf>,
+    min_percent: f64,
+}
+
+impl DiskProbe {
+    /// Возвращает (свободно, всего, процент) по самому тесному тому.
+    fn snapshot(&self) -> Option<(u64, u64, f64)> {
+        let mut worst: Option<(u64, u64, f64)> = None;
+        for path in &self.paths {
+            let (Ok(total), Ok(free)) = (fs4::total_space(path), fs4::available_space(path)) else {
+                continue;
+            };
+            if total == 0 {
+                continue;
+            }
+            let percent = free as f64 / total as f64 * 100.0;
+            if worst.map(|(_, _, p)| percent < p).unwrap_or(true) {
+                worst = Some((free, total, percent));
+            }
+        }
+        worst
+    }
+}
+
+/// Обновляет состояние и возвращает `true`, если места мало.
+///
+/// Предупреждение ставится только при переходе через порог: иначе каждые
+/// 5 секунд в лог и UI уходила бы одна и та же строка.
+fn refresh_disk(runtime: &Shared, probe: &DiskProbe) -> bool {
+    let Some((free, total, percent)) = probe.snapshot() else {
+        return runtime.lock().unwrap().disk_low;
+    };
+    let mut rt = runtime.lock().unwrap();
+    rt.disk_threshold = probe.min_percent;
+    rt.disk_free = free;
+    rt.disk_total = total;
+    rt.disk_free_percent = Some(percent);
+
+    let low = percent < probe.min_percent;
+    if low && !rt.disk_low {
+        let msg = format!(
+            "мало места на диске: свободно {percent:.1}% (порог {:.0}%) — синхронизация приостановлена",
+            probe.min_percent
+        );
+        tracing::warn!("{msg}");
+        rt.last_error = Some(msg);
+    } else if !low && rt.disk_low {
+        tracing::info!("места достаточно ({percent:.1}%) — синхронизация возобновлена");
+        if rt
+            .last_error
+            .as_deref()
+            .map(|s| s.starts_with("мало места"))
+            .unwrap_or(false)
+        {
+            rt.last_error = None;
+        }
+    }
+    rt.disk_low = low;
+    low
 }
 
 // ------------------------------------------------------------------ watcher
@@ -606,6 +798,8 @@ struct UiCtx {
     runtime: Shared,
     root: PathBuf,
     dev: String,
+    /// Адрес, который попадёт в строку сопряжения.
+    sync_addr: String,
 }
 
 fn serve_ui(addr: &str, ctx: UiCtx) -> Result<()> {
@@ -632,6 +826,11 @@ fn handle_request(mut request: tiny_http::Request, ctx: &UiCtx) {
             200,
             "application/json; charset=utf-8",
             api_status(ctx).to_string(),
+        ),
+        (tiny_http::Method::Get, "/api/pair-code") => (
+            200,
+            "application/json; charset=utf-8",
+            api_pair_code(ctx).to_string(),
         ),
         (tiny_http::Method::Post, p) => match api_action(ctx, p, &mut request) {
             Ok(msg) => (
@@ -683,6 +882,12 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
         "/api/scan" => run_cmd(&ctx.commands, Cmd::Scan),
         "/api/sync" => run_cmd(&ctx.commands, Cmd::Sync),
         "/api/gc" => run_cmd(&ctx.commands, Cmd::Gc),
+        "/api/disk/check" => run_cmd(&ctx.commands, Cmd::CheckDisk),
+        "/api/pair" => {
+            let body = body_json(request);
+            let code = str_field(&body, "code")?;
+            run_cmd(&ctx.commands, move |reply| Cmd::Pair { code, reply })
+        }
         "/api/pause" => {
             let paused = body.get("paused").and_then(Value::as_bool).unwrap_or(false);
             run_cmd(&ctx.commands, move |reply| Cmd::Pause { paused, reply })
@@ -757,15 +962,41 @@ fn api_status(ctx: &UiCtx) -> Value {
             })
         })
         .collect();
+    let known_peers: Vec<Value> = r
+        .known_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(dev, addr)| json!({ "dev": dev, "addr": addr }))
+        .collect();
+
+    let state = if rt.disk_low {
+        "paused_with_warning"
+    } else if rt.paused {
+        "paused"
+    } else if rt.syncing {
+        "syncing"
+    } else if rt.last_error.is_some() {
+        "error"
+    } else {
+        "running"
+    };
 
     json!({
         "device": ctx.dev,
         "root": ctx.root.to_string_lossy(),
+        "state": state,
         "paused": rt.paused,
         "syncing": rt.syncing,
         "last_scan": rt.last_scan,
         "last_sync": rt.last_sync,
         "last_error": rt.last_error,
+        "disk": {
+            "low": rt.disk_low,
+            "free_percent": rt.disk_free_percent,
+            "free": rt.disk_free,
+            "total": rt.disk_total,
+            "threshold": rt.disk_threshold,
+        },
         "ops": r.op_count().unwrap_or(0),
         "files": r.live_entries().map(|v| v.len()).unwrap_or(0),
         "local": r.local_entries().map(|v| v.len()).unwrap_or(0),
@@ -775,6 +1006,26 @@ fn api_status(ctx: &UiCtx) -> Value {
         "conflicts": conflicts,
         "vault": vault,
         "peers": rt.peers.values().collect::<Vec<_>>(),
+        "known_peers": known_peers,
+        "pair_addr": ctx.sync_addr,
+    })
+}
+
+fn api_pair_code(ctx: &UiCtx) -> Value {
+    let token = ctx.read.lock().unwrap().ensure_token().unwrap_or_default();
+    let code = net::pair_code(&ctx.dev, &token, &ctx.sync_addr);
+    let svg = qrcode::QrCode::new(code.as_bytes())
+        .map(|qr| {
+            qr.render::<qrcode::render::svg::Color>()
+                .min_dimensions(190, 190)
+                .build()
+        })
+        .unwrap_or_default();
+    json!({
+        "code": code,
+        "svg": svg,
+        "addr": ctx.sync_addr,
+        "dev": ctx.dev,
     })
 }
 

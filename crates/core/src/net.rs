@@ -700,6 +700,88 @@ pub fn discover(timeout: Duration) -> Result<Vec<(String, String)>> {
     Ok(found)
 }
 
+/// Отклонить входящее соединение понятной ошибкой (например, мало места).
+pub fn reject_stream(stream: TcpStream, message: &str) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut w = BufWriter::new(stream.try_clone()?);
+    let mut r = BufReader::new(stream);
+    match recv_msg(&mut r) {
+        Ok(Msg::Hello { .. }) => send_msg(
+            &mut w,
+            &Msg::Error {
+                message: message.to_string(),
+            },
+        ),
+        _ => Ok(()),
+    }
+}
+
+// ------------------------------------------------------------------ pairing
+
+/// Данные из строки сопряжения. Никакого обмена ключами: библиотека — это
+/// общий токен, который переносится вручную/QR один раз.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairInfo {
+    pub dev: String,
+    pub token: String,
+    pub addr: String,
+}
+
+/// Строка вида `syncth://pair?v=1&dev=…&token=…&addr=192.168.1.5:47887`.
+pub fn pair_code(dev: &str, token: &str, addr: &str) -> String {
+    format!("syncth://pair?v=1&dev={dev}&token={token}&addr={addr}")
+}
+
+pub fn parse_pair_code(code: &str) -> Result<PairInfo> {
+    let code = code.trim();
+    let rest = code
+        .strip_prefix("syncth://pair?")
+        .with_context(|| "ожидали строку syncth://pair?…")?;
+    let mut dev = None;
+    let mut token = None;
+    let mut addr = None;
+    for part in rest.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "dev" => dev = Some(value.to_string()),
+            "token" => token = Some(value.to_string()),
+            "addr" => addr = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let dev = dev.context("в строке сопряжения нет dev")?;
+    let token = token.context("в строке сопряжения нет token")?;
+    let addr = addr.context("в строке сопряжения нет addr")?;
+    anyhow::ensure!(!dev.is_empty(), "пустой device id");
+    anyhow::ensure!(
+        token.len() >= 32 && token.chars().all(|c| c.is_ascii_hexdigit()),
+        "токен должен быть hex-строкой"
+    );
+    anyhow::ensure!(
+        addr.rsplit_once(':').is_some(),
+        "адрес должен быть вида ip:порт"
+    );
+    Ok(PairInfo { dev, token, addr })
+}
+
+/// Локальный IPv4, который видит сеть. UDP-connect пакетов не отправляет.
+pub fn local_ip() -> Option<String> {
+    let sock = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    sock.connect(("8.8.8.8", 80)).ok()?;
+    Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+/// Адрес, который стоит показывать в строке сопряжения.
+pub fn advertised_addr(port: u16) -> String {
+    match local_ip() {
+        Some(ip) if ip != "0.0.0.0" => format!("{ip}:{port}"),
+        _ => format!("127.0.0.1:{port}"),
+    }
+}
+
 fn human(bytes: u64) -> String {
     const K: f64 = 1024.0;
     let b = bytes as f64;
@@ -745,5 +827,22 @@ mod tests {
         buf.extend_from_slice(&(MAX_MSG as u32 + 1).to_be_bytes());
         let err = recv_msg(&mut &buf[..]).unwrap_err().to_string();
         assert!(err.contains("слишком большое"), "{err}");
+    }
+
+    #[test]
+    fn pair_code_roundtrip() {
+        let token = "a".repeat(64);
+        let code = pair_code("dev-1234abcd", &token, "192.168.1.5:47887");
+        let info = parse_pair_code(&code).unwrap();
+        assert_eq!(info.dev, "dev-1234abcd");
+        assert_eq!(info.token, token);
+        assert_eq!(info.addr, "192.168.1.5:47887");
+    }
+
+    #[test]
+    fn pair_code_rejects_garbage() {
+        assert!(parse_pair_code("https://example.com").is_err());
+        assert!(parse_pair_code("syncth://pair?dev=x&token=zz&addr=1.2.3.4:5").is_err());
+        assert!(parse_pair_code("syncth://pair?dev=x&token=abcd&addr=localhost").is_err());
     }
 }

@@ -52,6 +52,28 @@
     border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 13px;
     white-space: pre-wrap; word-break: break-word;
   }
+  .warn {
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    flex-wrap: wrap;
+    background: #3a3220; border: 1px solid #6b5a2e; color: #ffe8b0;
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 13px;
+  }
+  .pair { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .pair svg { background: #0e1013; border-radius: 8px; display: block; }
+  .pair-info { flex: 1; min-width: 260px; }
+  .code {
+    display: block; background: #0e1013; border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 10px; margin: 6px 0 8px;
+    font: 12px/1.4 Consolas, monospace; word-break: break-all; color: #bcd2f5;
+    user-select: all;
+  }
+  textarea {
+    width: 100%; min-height: 62px; resize: vertical;
+    background: #0e1013; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 10px; font: 12px/1.4 Consolas, monospace;
+    margin: 6px 0 8px;
+  }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
   .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
   .row:first-of-type { border-top: 0; }
@@ -81,6 +103,10 @@
   </div>
 
   <div id="error" class="error" hidden></div>
+  <div id="disk" class="warn" hidden>
+    <span id="disk-text"></span>
+    <button class="small" id="btn-disk">Проверить снова</button>
+  </div>
 
   <div class="cards">
     <div class="card"><div class="k">Треков</div><div class="v" id="files">—</div></div>
@@ -96,6 +122,22 @@
     <button id="btn-pause">Пауза</button>
     <button id="btn-gc">Очистить корзину</button>
   </div>
+
+  <section>
+    <h2>Сопряжение</h2>
+    <div class="pair">
+      <div id="qr"></div>
+      <div class="pair-info">
+        <div class="empty">Покажите этот QR второму устройству или скопируйте строку:</div>
+        <code class="code" id="pair-code">…</code>
+        <button class="small" id="btn-copy">Скопировать код</button>
+        <hr>
+        <div class="empty">Сопрячь это устройство с другим — вставьте его строку:</div>
+        <textarea id="pair-input" placeholder="syncth://pair?v=1&dev=…&token=…&addr=192.168.1.5:47887"></textarea>
+        <button class="primary" id="btn-pair">Сопрячь</button>
+      </div>
+    </div>
+  </section>
 
   <section>
     <h2>Ожидают решения об удалении</h2>
@@ -235,9 +277,11 @@ function render(s) {
   updatePauseButton(s.paused);
 
   const dot = $("dot");
-  dot.className = "dot" + (s.syncing ? " busy" : s.paused ? " paused" : s.last_error ? " error" : "");
+  const low = s.disk && s.disk.low;
+  dot.className = "dot" + (s.syncing ? " busy" : low ? " warn" : s.paused ? " paused" : s.last_error ? " error" : "");
   const parts = [];
-  if (s.syncing) parts.push("синхронизация…");
+  if (low) parts.push("мало места — синхронизация приостановлена");
+  else if (s.syncing) parts.push("синхронизация…");
   else if (s.paused) parts.push("автосинк на паузе");
   else parts.push("работает");
   parts.push("скан: " + ago(s.last_scan));
@@ -245,8 +289,20 @@ function render(s) {
   parts.push(s.root);
   $("statusline").textContent = parts.join(" · ");
 
+  const diskBox = $("disk");
+  if (low) {
+    diskBox.hidden = false;
+    const d = s.disk;
+    const pct = d.free_percent === null || d.free_percent === undefined ? "?" : d.free_percent.toFixed(1);
+    $("disk-text").textContent =
+      "Мало места: свободно " + pct + "% (порог " + (d.threshold || 0) + "%). " +
+      "Приём файлов остановлен, чтобы не забить диск. Освободите место — синхронизация продолжится сама.";
+  } else {
+    diskBox.hidden = true;
+  }
+
   const err = $("error");
-  if (s.last_error) {
+  if (s.last_error && !low) {
     err.hidden = false;
     err.textContent = s.last_error;
   } else {
@@ -277,9 +333,49 @@ function render(s) {
     ])
   ));
 
-  fill($("peers"), "Пока никого не видели.", s.peers.map((p) =>
-    row(p.addr, p.error ? "ошибка: " + p.error : "последний сеанс: " + ago(p.last_seen), [])
-  ));
+  const seen = new Map((s.peers || []).map((p) => [p.addr, p]));
+  const known = (s.known_peers || []).map((p) => {
+    const status = seen.get(p.addr);
+    if (status) seen.delete(p.addr);
+    return row(
+      p.addr,
+      (status && status.error ? "ошибка: " + status.error : status ? "последний сеанс: " + ago(status.last_seen) : "сопряжено, ещё не соединялись") +
+        " · " + p.dev,
+      []
+    );
+  });
+  // Устройства, найденные по discovery, но ещё не сопряжённые.
+  const fresh = [...seen.values()].filter((p) => !(s.known_peers || []).some((k) => k.addr === p.addr));
+  fill($("peers"), "Пока никого не видели.", known.concat(fresh.map((p) =>
+    row(p.addr, (p.error ? "ошибка: " + p.error : "последний сеанс: " + ago(p.last_seen)) + " · не сопряжено", [])
+  )));
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Код скопирован");
+  } catch {
+    // Буфер обмена может быть запрещён: показываем код для ручного копирования.
+    toast("Скопируйте код вручную", true);
+  }
+}
+
+async function loadPairCode() {
+  try {
+    const r = await fetch("/api/pair-code", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const p = await r.json();
+    $("pair-code").textContent = p.code;
+    const qr = $("qr");
+    qr.replaceChildren();
+    if (p.svg) {
+      // SVG приходит от собственного демона, но всё равно не исполняем скрипты.
+      qr.innerHTML = p.svg.replace(/<script[\s\S]*?<\/script>/gi, "");
+    }
+  } catch (e) {
+    toast("Не удалось получить код сопряжения: " + (e.message || e), true);
+  }
 }
 
 async function refresh() {
@@ -299,6 +395,20 @@ $("btn-pause").addEventListener("click", () => action("/api/pause", { paused: !l
 $("btn-gc").addEventListener("click", () => {
   if (confirm("Удалить из корзины всё старше срока хранения?")) action("/api/gc", {}, "Корзина очищена");
 });
+$("btn-copy").addEventListener("click", () => copyText($("pair-code").textContent));
+$("btn-pair").addEventListener("click", () => {
+  const code = $("pair-input").value.trim();
+  if (!code) { toast("Вставьте строку сопряжения", true); return; }
+  const btn = $("btn-pair");
+  const restore = () => { btn.textContent = "Сопрячь"; };
+  btn.textContent = "Сопрягаю…";
+  action("/api/pair", { code }, "Сопряжено")
+    .then(() => { $("pair-input").value = ""; loadPairCode(); })
+    .finally(() => { restore(); refresh(); });
+});
+$("btn-disk").addEventListener("click", () => action("/api/disk/check", {}, ""));
+
+loadPairCode();
 
 refresh();
 setInterval(refresh, 3000);

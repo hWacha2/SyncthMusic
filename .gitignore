@@ -6,3 +6,4 @@
 *.db-wal
 *.db-shm
 *.proptest-regressions
+.e2e/

@@ -75,6 +75,14 @@ CREATE TABLE IF NOT EXISTS vault (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_path ON vault(path);
+
+-- Сопряжённые устройства: адрес запоминается, чтобы не искать друг друга
+-- по UDP каждый раз и чтобы работал запуск без discovery.
+CREATE TABLE IF NOT EXISTS peers (
+    dev      TEXT PRIMARY KEY,
+    addr     TEXT NOT NULL,
+    added_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +164,7 @@ impl Replica {
                 [],
             )?;
         }
-        self.set_meta("schema_version", "3")?;
+        self.set_meta("schema_version", "4")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
                 // Идентичность устройства стабильна: она важнее аргумента CLI.
@@ -232,6 +240,32 @@ impl Replica {
         let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
         self.set_meta("token", &token)?;
         Ok(token)
+    }
+
+    /// Принять токен другого устройства при пейринге. Не генерируем новый:
+    /// библиотека — это общий секрет, а не две независимые.
+    pub fn set_token(&self, token: &str) -> Result<()> {
+        anyhow::ensure!(!token.is_empty(), "пустой токен библиотеки");
+        self.set_meta("token", token)
+    }
+
+    // ---------------------------------------------------------------- peers
+
+    pub fn add_peer(&self, dev: &str, addr: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO peers(dev, addr, added_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(dev) DO UPDATE SET addr = excluded.addr",
+            params![dev, addr, Hlc::wall_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn known_peers(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT dev, addr FROM peers ORDER BY dev")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ---------------------------------------------------------------- clock

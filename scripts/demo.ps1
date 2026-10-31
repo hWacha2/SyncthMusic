@@ -98,6 +98,17 @@ New-Item -ItemType Directory -Force -Path $musicB | Out-Null
 Run-Syncth $dataB 'init --root music-b' @('init', '--root', $musicB)
 
 Write-Host ""
+Write-Host "=== Сопряжение: одна строка вместо ручного токена ===" -ForegroundColor Green
+$pairAddr = '127.0.0.1:47890'
+$pairCode = (& $exe --data-dir $dataA pair-code --addr $pairAddr | Select-Object -First 1).Trim()
+Run-Syncth $dataB 'pair' @('pair', $pairCode)
+$peers = & $exe --data-dir $dataB peers
+if (-not ($peers -join "`n").Contains($pairAddr)) { throw "B не запомнил адрес A: $peers" }
+$token = (& $exe --data-dir $dataB token).Trim()
+if ($token -ne (& $exe --data-dir $dataA token).Trim()) { throw "токен библиотеки не совпал после сопряжения" }
+Write-Host "OK: B принял строку, запомнил адрес A и получил общий токен" -ForegroundColor DarkGray
+
+Write-Host ""
 Write-Host "=== Передача по Wi-Fi (TCP, без сервера и облака) ===" -ForegroundColor Green
 Sync-Pair $dataA $dataB 47890 $token
 
