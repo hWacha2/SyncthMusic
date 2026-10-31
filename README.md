@@ -284,8 +284,16 @@ powershell -ExecutionPolicy Bypass -File scripts\android-setup.ps1
 
 | Что | Где |
 |---|---|
-| ПК-клиент: тексты, разметка, стили | `crates/desktop/ui/app.js`, `styles.css`, `index.html` |
-| Android-клиент | `crates/mobile/ui/app.js`, `styles.css`, `index.html` |
+| ПК-клиент: тексты | `crates/desktop/ui/i18n.js` |
+| ПК-клиент: разметка, отрисовка, стили | `crates/desktop/ui/index.html`, `app.js`, `styles.css` |
+| Android-клиент: тексты | `crates/mobile/ui/i18n.js` |
+| Android-клиент: разметка, отрисовка, стили | `crates/mobile/ui/index.html`, `app.js`, `styles.css` |
+
+Тексты обоих клиентов лежат в `i18n.js` отдельными словарями `ru` и `en`.
+В разметке используется `data-i18n="ключ"`, в коде — `I18N.t(ключ)`. Язык
+переключается кнопкой в интерфейсе (ПК — в левой панели и в настройках,
+Android — в разделе «Ещё») и запоминается в `localStorage`; по умолчанию
+берётся язык системы. Новый ключ нужно добавить в оба словаря.
 
 **ПК.** Запуск в режиме разработки (окно открывается сразу, Rust
 пересобирается при изменениях):

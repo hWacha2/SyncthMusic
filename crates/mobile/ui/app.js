@@ -1,14 +1,16 @@
 'use strict';
 
 // SynctMusic для Android. Ядро живёт в приложении, поэтому все действия —
-// это прямые команды Tauri: без демона, без HTTP и без портов, кроме синка.
+// это прямые команды Tauri: без службы, без HTTP и без портов, кроме синка.
 
 const invoke = (cmd, args) => {
   if (!window.__TAURI__ || !window.__TAURI__.core) {
-    return Promise.reject(new Error('нет доступа к ядру приложения'));
+    return Promise.reject(new Error('app core unavailable'));
   }
   return window.__TAURI__.core.invoke(cmd, args);
 };
+
+const { t, tp, plural, num, size, ago } = I18N;
 
 const state = {
   info: null,
@@ -29,49 +31,8 @@ const esc = (value) =>
 
 const icon = (name, cls = '') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
 
-const num = (value) => Number(value || 0).toLocaleString('ru-RU');
-
-function plural(n, one, few, many) {
-  const abs = Math.abs(n) % 100;
-  const last = abs % 10;
-  if (abs > 10 && abs < 20) return many;
-  if (last > 1 && last < 5) return few;
-  if (last === 1) return one;
-  return many;
-}
-
-function bytes(value) {
-  const b = Number(value || 0);
-  if (b < 1024) return `${b} Б`;
-  const units = ['КБ', 'МБ', 'ГБ', 'ТБ'];
-  let v = b / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
-  return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace('.', ',')} ${units[i]}`;
-}
-
-const toMillis = (ts) => {
-  const n = Number(ts || 0);
-  if (!n) return 0;
-  return n > 1e12 ? n : n * 1000;
-};
-
-function ago(ts) {
-  const ms = toMillis(ts);
-  if (!ms) return 'только что';
-  const diff = Math.max(0, Date.now() - ms);
-  const minutes = Math.floor(diff / 60000);
-  if (minutes < 1) return 'только что';
-  if (minutes < 60) return `${minutes} ${plural(minutes, 'минуту', 'минуты', 'минут')} назад`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} ${plural(hours, 'час', 'часа', 'часов')} назад`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} ${plural(days, 'день', 'дня', 'дней')} назад`;
-  return new Date(ms).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short' });
-}
-
 const errText = (error) => {
-  if (!error) return 'неизвестная ошибка';
+  if (!error) return t('common.unknownError');
   if (typeof error === 'string') return error;
   return error.message || String(error);
 };
@@ -98,6 +59,7 @@ async function loadStatus() {
 }
 
 async function boot() {
+  I18N.apply();
   try {
     state.info = await invoke('app_info');
     state.status = state.info.info && state.info.info.root != null ? await invoke('status') : null;
@@ -135,12 +97,12 @@ function render() {
   const problems = snap.pending.length + snap.conflicts.length;
   led.className = 'led ' + (state.busy ? 'led--warn' : problems ? 'led--warn' : state.status ? 'led--ok' : '');
   stateText.textContent = state.busy
-    ? 'работает'
+    ? t('appbar.busy')
     : !state.status
-      ? (state.error ? 'ошибка' : 'не настроено')
+      ? (state.error ? t('appbar.error') : t('appbar.notConfigured'))
       : problems
-        ? 'нужны решения'
-        : 'синхронно';
+        ? t('appbar.attention')
+        : t('appbar.synced');
 
   const badge = $('#badge-pending');
   badge.textContent = String(snap.pending.length);
@@ -148,6 +110,8 @@ function render() {
 
   for (const tab of document.querySelectorAll('.tab')) {
     tab.classList.toggle('is-on', tab.dataset.tab === state.tab);
+    const label = tab.querySelector('span[data-i18n]');
+    if (label) label.textContent = t(label.dataset.i18n);
   }
 
   const view = $('#view');
@@ -165,10 +129,10 @@ function errorScreen(message) {
   return `<section class="panel">
     <div class="empty">
       ${icon('alert', 'empty-ic')}
-      <b>Не удалось открыть библиотеку</b>
+      <b>${esc(t('error.title'))}</b>
       <p>${esc(message)}</p>
     </div>
-    <button class="btn btn--block btn--soft" data-act="refresh">Попробовать снова</button>
+    <button class="btn btn--block btn--soft" data-act="refresh">${esc(t('error.retry'))}</button>
   </section>`;
 }
 
@@ -178,18 +142,18 @@ function setupScreen() {
   const picks = candidates.slice(0, 8).map((c) =>
     `<button class="pick" data-pick="${esc(c.path)}">${esc(c.name)}</button>`).join('');
   return `<section class="panel">
-    <div class="kicker">первый запуск</div>
-    <h1 class="hero-title">Где лежит <em>музыка?</em></h1>
-    <p class="hero-hint">SynctMusic ничего не перекладывает: он запоминает папку и следит за ней.</p>
+    <div class="kicker">${esc(t('setup.kicker'))}</div>
+    <h1 class="hero-title">${esc(t('setup.title'))}</h1>
+    <p class="hero-hint">${esc(t('setup.hint'))}</p>
     <div class="field">
-      <label for="root-input">Путь к папке</label>
+      <label for="root-input">${esc(t('setup.label'))}</label>
       <input class="input" id="root-input" value="${esc(info.default_root || '')}" spellcheck="false" autocapitalize="off">
     </div>
     ${picks ? `<div class="picks">${picks}</div>` : ''}
     <div class="actions">
-      <button class="btn btn--primary" data-act="init">${icon('folder')}Начать</button>
+      <button class="btn btn--primary" data-act="init">${icon('folder')}${esc(t('setup.start'))}</button>
     </div>
-    <p class="hint">Нужен доступ «Ко всем файлам» — без него Android не даст читать музыку вне папки приложения.</p>
+    <p class="hint">${esc(t('setup.permission'))}</p>
   </section>`;
 }
 
@@ -200,81 +164,79 @@ function overviewView(snap) {
   const tone = pending || conflicts ? 'var(--warn)' : 'var(--lime)';
   const progress = pending || conflicts ? 0.38 : 1;
   const title = pending || conflicts
-    ? 'Нужно ваше <em>решение</em>'
-    : 'Всё <em>синхронно</em>';
+    ? t('overview.title.attention')
+    : t('overview.title.ok');
   const hint = pending
-    ? `${pending} ${plural(pending, 'файл пропал', 'файла пропали', 'файлов пропали')} с диска — решите, что с ними делать.`
+    ? tp('overview.hint.pending', pending)
     : conflicts
-      ? 'Есть конфликтные копии — проверьте, какая версия нужна.'
-      : 'Файлы под наблюдением, удаления под контролем.';
+      ? t('overview.hint.conflicts')
+      : t('overview.hint.ok');
   const root = snap.root || '';
 
   const pendingRow = pending
     ? `<div class="rows">${snap.pending.slice(0, 3).map((p) => `
         <div class="row">
           <div class="row-top"><span class="row-path">${esc(p.path)}</span></div>
-          <div class="row-meta">пропал ${esc(ago(p.detected_at))}</div>
+          <div class="row-meta">${esc(t('pending.rowMeta', { ago: ago(p.detected_at) }))}</div>
         </div>`).join('')}</div>
-      ${pending > 3 ? `<p class="hint">И ещё ${pending - 3}.</p>` : ''}
-      <div class="actions"><button class="btn btn--block btn--soft" data-tab-jump="pending">Разобрать очередь</button></div>`
-    : `<div class="empty">${icon('check', 'empty-ic')}<b>Очередь пуста</b><p>Ни один файл не пропал без решения.</p></div>`;
+      ${pending > 3 ? `<p class="hint">${esc(t('attention.more', { n: pending - 3 }))}</p>` : ''}
+      <div class="actions"><button class="btn btn--block btn--soft" data-tab-jump="pending">${esc(t('pending.toQueue'))}</button></div>`
+    : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('pending.emptyTitle'))}</b><p>${esc(t('pending.emptyText'))}</p></div>`;
 
   return `
   <section class="panel">
     <div class="hero">
       <div class="hero-text">
-        <div class="kicker">библиотека</div>
-        <h1 class="hero-title">${title}</h1>
+        <div class="kicker">${esc(t('overview.kicker'))}</div>
+        <h1 class="hero-title">${esc(title)}</h1>
         <p class="hero-hint">${esc(hint)}</p>
       </div>
       <div class="dial" style="--p:${progress};--tone:${tone}">
         <div class="dial-inner">
           <span class="dial-num">${pending || conflicts ? '!' : 'OK'}</span>
-          <span class="dial-sub">${num(snap.files)} ф.</span>
+          <span class="dial-sub">${num(snap.files)}</span>
         </div>
       </div>
     </div>
     <div class="actions">
-      <button class="btn btn--primary" data-act="sync" ${state.busy ? 'disabled' : ''}>${icon('sync')}Синхронизировать</button>
-      <button class="btn btn--soft" data-act="scan" ${state.busy ? 'disabled' : ''}>${icon('scan')}Скан</button>
+      <button class="btn btn--primary" data-act="sync" ${state.busy ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>
+      <button class="btn btn--soft" data-act="scan" ${state.busy ? 'disabled' : ''}>${icon('scan')}${esc(t('act.scan'))}</button>
     </div>
   </section>
 
   <div class="stats">
     <div class="stat">
-      <div class="stat-k">файлов в индексе</div>
+      <div class="stat-k">${esc(t('stat.files'))}</div>
       <div class="stat-v">${num(snap.files)}</div>
-      <div class="stat-note">${num(snap.local)} есть на телефоне</div>
+      <div class="stat-note">${esc(t('stat.filesNote', { n: num(snap.local) }))}</div>
     </div>
     <div class="stat">
-      <div class="stat-k">объём</div>
-      <div class="stat-v">${esc(bytes(snap.size))}</div>
-      <div class="stat-note">без кодирования и копий</div>
+      <div class="stat-k">${esc(t('stat.size'))}</div>
+      <div class="stat-v">${esc(size(snap.size).text)}</div>
     </div>
     <div class="stat">
-      <div class="stat-k">записей в журнале</div>
+      <div class="stat-k">${esc(t('stat.ops'))}</div>
       <div class="stat-v">${num(snap.ops)}</div>
-      <div class="stat-note">дельта, а не весь заново</div>
+      ${snap.last_scan ? `<div class="stat-note">${esc(t('stat.opsNote', { ago: ago(snap.last_scan) }))}</div>` : ''}
     </div>
     <div class="stat">
-      <div class="stat-k">в корзине</div>
+      <div class="stat-k">${esc(t('stat.vault'))}</div>
       <div class="stat-v">${num(snap.vault.length)}</div>
-      <div class="stat-note">удаления обратимы</div>
     </div>
   </div>
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <span class="kicker">удаления</span>
-      <span class="chip ${pending ? 'chip--warn' : 'chip--ok'}">${pending ? 'есть очередь' : 'чисто'}</span>
+      <span class="kicker">${esc(t('section.deletions'))}</span>
+      <span class="chip ${pending ? 'chip--warn' : 'chip--ok'}">${esc(pending ? t('chip.hasPending') : t('chip.clean'))}</span>
     </div>
     ${pendingRow}
   </section>
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <span class="kicker">устройства</span>
-      <span class="chip">${peers ? num(peers) : 'никого'}</span>
+      <span class="kicker">${esc(t('section.devices'))}</span>
+      <span class="chip">${peers ? num(peers) : esc(t('common.none'))}</span>
     </div>
     ${peers
       ? `<div class="rows">${snap.known_peers.map((p) => `
@@ -285,14 +247,14 @@ function overviewView(snap) {
             </div>
             <div class="row-meta">${esc(p.addr)}</div>
           </div>`).join('')}</div>`
-      : `<div class="empty"><b>Пока никого</b><p>Сопрягите телефон с ПК в разделе «Ещё».</p></div>`}
-    <div class="actions"><button class="btn btn--block btn--ghost" data-tab-jump="more">Сопряжение и настройки</button></div>
+      : `<div class="empty"><b>${esc(t('devices.emptyTitle'))}</b><p>${esc(t('devices.emptyText'))}</p></div>`}
+    <div class="actions"><button class="btn btn--block btn--ghost" data-tab-jump="more">${esc(t('devices.pair'))}</button></div>
   </section>
 
   <section class="panel panel--flat">
-    <div class="panel-head"><span class="kicker">папка</span></div>
-    <div class="row-meta">${esc(root || 'не выбрана')}</div>
-    <div class="actions"><button class="btn btn--block btn--ghost" data-act="change-root">Сменить папку</button></div>
+    <div class="panel-head"><span class="kicker">${esc(t('section.folder'))}</span></div>
+    <div class="row-meta">${esc(root || t('folder.notSelected'))}</div>
+    <div class="actions"><button class="btn btn--block btn--ghost" data-act="change-root">${esc(t('folder.change'))}</button></div>
   </section>`;
 }
 
@@ -300,40 +262,40 @@ function pendingView(snap) {
   const rows = snap.pending.map((p) => `
     <div class="row">
       <div class="row-top"><span class="row-path">${esc(p.path)}</span></div>
-      <div class="row-meta">пропал ${esc(ago(p.detected_at))}</div>
+      <div class="row-meta">${esc(t('pending.rowMeta', { ago: ago(p.detected_at) }))}</div>
       <div class="row-actions">
-        <button class="btn btn--sm btn--danger" data-resolve="delete_everywhere" data-path="${esc(p.path)}">Удалить везде</button>
-        <button class="btn btn--sm" data-resolve="only_here" data-path="${esc(p.path)}">Только здесь</button>
+        <button class="btn btn--sm btn--danger" data-resolve="delete_everywhere" data-path="${esc(p.path)}">${esc(t('queue.delete'))}</button>
+        <button class="btn btn--sm" data-resolve="only_here" data-path="${esc(p.path)}">${esc(t('queue.keep'))}</button>
       </div>
       <div class="row-actions">
-        <button class="btn btn--sm btn--ghost" data-forget="${esc(p.path)}">Забыть</button>
+        <button class="btn btn--sm btn--ghost" data-forget="${esc(p.path)}">${esc(t('queue.dismiss'))}</button>
       </div>
     </div>`).join('');
 
   const conflicts = snap.conflicts.length ? `
     <section class="panel panel--flat">
       <div class="panel-head">
-        <span class="kicker">конфликты</span>
+        <span class="kicker">${esc(t('conflicts.kicker'))}</span>
         <span class="chip chip--warn">${snap.conflicts.length}</span>
       </div>
       <div class="rows">${snap.conflicts.map((path) => `
         <div class="row">
           <div class="row-top">${icon('split', '')}<span class="row-path">${esc(path)}</span></div>
-          <div class="row-meta">рядом лежит вторая версия файла</div>
+          <div class="row-meta">${esc(t('conflicts.rowMeta'))}</div>
         </div>`).join('')}</div>
-      <p class="hint">Конфликтные копии никогда не удаляются сами: выберите нужную версию в плеере и удалите лишнюю.</p>
+      <p class="hint">${esc(t('conflicts.hint'))}</p>
     </section>` : '';
 
   return `<section class="panel">
-      <div class="kicker">очередь удалений</div>
-      <h1 class="hero-title">${snap.pending.length ? 'Что делать с <em>пропавшими?</em>' : 'Очередь <em>пуста</em>'}</h1>
-      <p class="hero-hint">Файл исчез с диска, но библиотека ещё не решила его судьбу.</p>
+      <div class="kicker">${esc(t('queue.kicker'))}</div>
+      <h1 class="hero-title">${esc(snap.pending.length ? t('queue.title') : t('queue.titleEmpty'))}</h1>
+      <p class="hero-hint">${esc(t('queue.hint'))}</p>
     </section>
     <section class="panel panel--flat">
       ${snap.pending.length
         ? `<div class="rows">${rows}</div>
-           <p class="hint">«Удалить везде» уберёт трек на всех устройствах (копия 30 дней лежит в корзине). «Только здесь» оставит его в общей библиотеке.</p>`
-        : `<div class="empty">${icon('check', 'empty-ic')}<b>Ничего не ждёт</b><p>Удаления появятся здесь, когда файл пропадёт с диска.</p></div>`}
+           <p class="hint">${esc(t('queue.explain'))}</p>`
+        : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('pending.emptyTitle'))}</b><p>${esc(t('queue.emptyText'))}</p></div>`}
     </section>
     ${conflicts}`;
 }
@@ -342,22 +304,22 @@ function vaultView(snap) {
   const rows = snap.vault.map((v) => `
     <div class="row">
       <div class="row-top"><span class="row-path">${esc(v.path)}</span></div>
-      <div class="row-meta">${esc(bytes(v.size))} · удалён ${esc(ago(v.deleted_at))}</div>
+      <div class="row-meta">${esc(t('vault.rowMeta', { size: size(v.size).text, ago: ago(v.deleted_at) }))}</div>
       <div class="row-actions">
-        <button class="btn btn--sm btn--lime" data-restore="${esc(v.path)}">Вернуть</button>
+        <button class="btn btn--sm btn--lime" data-restore="${esc(v.path)}">${esc(t('vault.restore'))}</button>
       </div>
     </div>`).join('');
 
   return `<section class="panel">
-      <div class="kicker">корзина</div>
-      <h1 class="hero-title">Удаления <em>обратимы</em></h1>
-      <p class="hero-hint">Копии живут 30 дней: файл не занимает место дважды — на NTFS и APFS это hardlink.</p>
+      <div class="kicker">${esc(t('vault.kicker'))}</div>
+      <h1 class="hero-title">${esc(t('vault.title'))}</h1>
+      <p class="hero-hint">${esc(t('vault.hint'))}</p>
     </section>
     <section class="panel panel--flat">
       ${snap.vault.length
         ? `<div class="rows">${rows}</div>
-           <div class="actions"><button class="btn btn--block btn--ghost" data-act="gc">${icon('trash')}Очистить просроченное</button></div>`
-        : `<div class="empty">${icon('box', 'empty-ic')}<b>Корзина пуста</b><p>Здесь появятся удалённые файлы.</p></div>`}
+           <div class="actions"><button class="btn btn--block btn--ghost" data-act="gc">${icon('trash')}${esc(t('vault.gc'))}</button></div>`
+        : `<div class="empty">${icon('box', 'empty-ic')}<b>${esc(t('vault.emptyTitle'))}</b><p>${esc(t('vault.emptyText'))}</p></div>`}
     </section>`;
 }
 
@@ -369,51 +331,59 @@ function moreView(snap) {
     </div>`).join('');
 
   return `<section class="panel">
-      <div class="kicker">сопряжение</div>
-      <h1 class="hero-title">Одна строка — <em>и всё</em></h1>
-      <p class="hero-hint">Покажите этот код на ПК в SynctMusic → «Сопряжение». Аккаунтов и серверов нет.</p>
+      <div class="kicker">${esc(t('pair.kicker'))}</div>
+      <h1 class="hero-title">${esc(t('pair.title'))}</h1>
+      <p class="hero-hint">${esc(t('pair.hint'))}</p>
       <div class="actions">
-        <button class="btn btn--primary" data-act="pair-code">${icon('qr')}Мой код</button>
+        <button class="btn btn--primary" data-act="pair-code">${icon('qr')}${esc(t('pair.myCode'))}</button>
       </div>
       ${state.code ? `
         <div class="field">
-          <label>код этого телефона</label>
+          <label>${esc(t('pair.codeLabel'))}</label>
           <input class="input" id="my-code" value="${esc(state.code)}" readonly>
         </div>
         <div class="actions">
-          <button class="btn btn--block btn--soft" data-act="copy-code">${icon('copy')}Скопировать</button>
+          <button class="btn btn--block btn--soft" data-act="copy-code">${icon('copy')}${esc(t('pair.copy'))}</button>
         </div>` : ''}
       <div class="field">
-        <label for="pair-input">Код с другого устройства</label>
+        <label for="pair-input">${esc(t('pair.inputLabel'))}</label>
         <input class="input" id="pair-input" placeholder="syncth://pair?…" spellcheck="false" autocapitalize="off">
       </div>
       <div class="actions">
-        <button class="btn btn--block btn--soft" data-act="pair-accept">Сопрячь</button>
+        <button class="btn btn--block btn--soft" data-act="pair-accept">${esc(t('pair.submit'))}</button>
       </div>
     </section>
 
     <section class="panel panel--flat">
       <div class="panel-head">
-        <span class="kicker">устройства</span>
-        <span class="chip">${snap.known_peers.length || 'никого'}</span>
+        <span class="kicker">${esc(t('pair.devices'))}</span>
+        <span class="chip">${snap.known_peers.length || esc(t('common.none'))}</span>
       </div>
-      ${peers ? `<div class="rows">${peers}</div>` : `<div class="empty"><b>Пока никого</b><p>Сопряжённые устройства появятся здесь.</p></div>`}
+      ${peers ? `<div class="rows">${peers}</div>` : `<div class="empty"><b>${esc(t('devices.emptyTitle'))}</b><p>${esc(t('pair.noDevices'))}</p></div>`}
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><span class="kicker">библиотека</span></div>
+      <div class="panel-head"><span class="kicker">${esc(t('pair.library'))}</span></div>
       <div class="row-meta">${esc(snap.root || '')}</div>
-      <div class="row-meta">${num(snap.files)} ${plural(snap.files, 'файл', 'файла', 'файлов')} · ${esc(bytes(snap.size))}</div>
+      <div class="row-meta">${num(snap.files)} ${plural('word.files', snap.files)} · ${esc(size(snap.size).text)}</div>
       <div class="actions">
-        <button class="btn btn--block btn--ghost" data-act="change-root">Сменить папку</button>
+        <button class="btn btn--block btn--ghost" data-act="change-root">${esc(t('folder.change'))}</button>
       </div>
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><span class="kicker">о приложении</span></div>
-      <div class="row-meta">SynctMusic ${esc((state.info && state.info.version) || '')} · AGPL-3.0</div>
-      <div class="row-meta">устройство: ${esc(snap.device || '')}</div>
-      <div class="row-meta">порт синхронизации: ${esc((state.info && state.info.sync_port) || 47887)}</div>
+      <div class="panel-head"><span class="kicker">${esc(t('pair.language'))}</span></div>
+      <div class="actions">
+        <button class="btn btn--sm${I18N.locale === 'ru' ? ' btn--lime' : ' btn--ghost'}" data-act="lang" data-lang="ru">Русский</button>
+        <button class="btn btn--sm${I18N.locale === 'en' ? ' btn--lime' : ' btn--ghost'}" data-act="lang" data-lang="en">English</button>
+      </div>
+    </section>
+
+    <section class="panel panel--flat">
+      <div class="panel-head"><span class="kicker">${esc(t('pair.about'))}</span></div>
+      <div class="row-meta">${esc(t('pair.version', { v: (state.info && state.info.version) || '' }))}</div>
+      <div class="row-meta">${esc(t('pair.device', { dev: snap.device || '' }))}</div>
+      <div class="row-meta">${esc(t('pair.port', { port: (state.info && state.info.sync_port) || 47887 }))}</div>
     </section>`;
 }
 
@@ -436,15 +406,15 @@ async function run(label, work) {
 async function initLibrary() {
   const input = $('#root-input');
   const root = input ? input.value.trim() : '';
-  if (!root) { toast('Укажите папку', true); return; }
-  await run('Библиотека', async () => {
+  if (!root) { toast(t('toast.needFolder'), true); return; }
+  await run(t('run.init'), async () => {
     const result = await invoke('init_library', { root });
     state.status = result.status;
     if (state.info && state.info.info) {
       state.info.info.root = state.status.root;
       state.info.info.device = state.status.device;
     }
-    toast(`Готово: ${result.added} ${plural(result.added, 'файл', 'файла', 'файлов')} в индексе`);
+    toast(t('toast.initDone', { n: num(result.added), word: plural('word.files', result.added) }));
   });
 }
 
@@ -454,35 +424,35 @@ async function action(name, payload) {
       await initLibrary();
       break;
     case 'refresh':
-      await run('Обновление', async () => { await loadStatus(); });
+      await run(t('run.refresh'), async () => { await loadStatus(); });
       break;
     case 'scan':
-      await run('Скан', async () => {
+      await run(t('run.scan'), async () => {
         const result = await invoke('scan_now');
         state.status = result.status;
-        toast(`Скан: +${result.added}, изменено ${result.changed}, пропало ${result.missing}`);
+        toast(t('toast.scan', { added: result.added, changed: result.changed, missing: result.missing }));
       });
       break;
     case 'sync':
-      await run('Синхронизация', async () => {
+      await run(t('run.sync'), async () => {
         const result = await invoke('sync_now');
         state.status = result.status;
         if (result.errors && result.errors.length) {
-          toast(`Частично: ${result.errors[0]}`, true);
+          toast(t('toast.syncPartial', { error: result.errors[0] }), true);
         } else {
-          toast(`Обмен: отдано ${result.sent}, принято ${result.received}`);
+          toast(t('toast.sync', { sent: result.sent, received: result.received }));
         }
       });
       break;
     case 'gc':
-      await run('Корзина', async () => {
+      await run(t('run.gc'), async () => {
         const result = await invoke('vault_gc');
         state.status = result.status;
-        toast(`Убрано из корзины: ${result.removed}`);
+        toast(t('toast.gc', { n: result.removed }));
       });
       break;
     case 'pair-code':
-      await run('Код', async () => {
+      await run(t('run.code'), async () => {
         const result = await invoke('pair_code');
         state.code = result.code;
       });
@@ -493,13 +463,14 @@ async function action(name, payload) {
     case 'pair-accept':
       await pairAccept();
       break;
+    case 'lang':
+      I18N.setLocale(payload);
+      break;
     case 'change-root':
       // Смена папки — это новая библиотека: старый индекс остаётся в журнале,
       // поэтому сначала предупреждаем, а не молча сканируем другое дерево.
       if (state.status && state.status.root) {
-        const ok = window.confirm(
-          'Выбрать другую папку?\n\nИндекс прежней папки останется в журнале, а её файлы попадут в очередь удалений. Для чистой библиотеки лучше начать с нового каталога данных.',
-        );
+        const ok = window.confirm(t('confirm.changeRoot'));
         if (!ok) return;
         if (state.info) state.info.default_root = state.status.root;
       }
@@ -516,11 +487,11 @@ async function action(name, payload) {
 async function pairAccept() {
   const input = $('#pair-input');
   const code = input ? input.value.trim() : '';
-  if (!code) { toast('Вставьте код', true); return; }
-  await run('Сопряжение', async () => {
+  if (!code) { toast(t('toast.needCode'), true); return; }
+  await run(t('run.pair'), async () => {
     const result = await invoke('pair_accept', { code });
     await loadStatus();
-    toast(`Сопряжено: ${result.dev}`);
+    toast(t('toast.paired', { dev: result.dev }));
   });
 }
 
@@ -528,40 +499,40 @@ async function copy(text) {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
-    toast('Скопировано');
+    toast(t('common.copied'));
   } catch {
     const input = $('#my-code');
-    if (input) { input.select(); document.execCommand('copy'); toast('Скопировано'); }
+    if (input) { input.select(); document.execCommand('copy'); toast(t('common.copied')); }
   }
 }
 
 async function resolvePending(path, decision) {
   if (decision === 'delete_everywhere') {
-    const ok = window.confirm(`Удалить «${path}» на всех устройствах?\n\nКопия 30 дней останется в корзине.`);
+    const ok = window.confirm(t('confirm.delete', { path }));
     if (!ok) return;
   }
-  await run('Решение', async () => {
+  await run(t('run.resolve'), async () => {
     const result = await invoke('resolve_pending', { path, action: decision });
     state.status = result.status;
     if (result.failed && result.failed.length) {
-      toast(`Не удалось: ${result.failed[0][0]}`, true);
+      toast(t('toast.failed', { path: result.failed[0][0] }), true);
     } else {
-      toast(decision === 'delete_everywhere' ? 'Удалено везде' : 'Оставлено в библиотеке');
+      toast(decision === 'delete_everywhere' ? t('toast.deleted') : t('toast.kept'));
     }
   });
 }
 
 async function forgetPending(path) {
-  await run('Забыть', async () => {
+  await run(t('run.forget'), async () => {
     state.status = await invoke('forget_pending', { path });
-    toast('Запись убрана из очереди');
+    toast(t('toast.forgotten'));
   });
 }
 
 async function restorePath(path) {
-  await run('Восстановление', async () => {
+  await run(t('run.restore'), async () => {
     state.status = await invoke('restore', { path });
-    toast(`Возвращено: ${path}`);
+    toast(t('toast.restored', { path }));
   });
 }
 
@@ -611,10 +582,14 @@ document.addEventListener('click', (event) => {
 
   const act = event.target.closest('[data-act]');
   if (act) {
-    action(act.dataset.act);
+    action(act.dataset.act, act.dataset.act === 'lang' ? act.dataset.lang : undefined);
   }
 });
 
 window.__syncth = { state, boot, render, loadStatus, action };
+
+I18N.onChange(() => {
+  render();
+});
 
 boot();

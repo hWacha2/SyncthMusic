@@ -5,7 +5,7 @@ window.addEventListener('error', (event) => {
   const view = document.getElementById('view');
   if (view && !view.dataset.errorShown) {
     view.dataset.errorShown = '1';
-    view.innerHTML = `<section class="panel"><div class="empty"><b>Ошибка интерфейса</b><p>${String(event.message || event.error || '')}</p></div></section>`;
+    view.innerHTML = `<section class="panel"><div class="empty"><b>${I18N.t('err.interface')}</b><p>${String(event.message || event.error || '')}</p></div></section>`;
   }
 });
 
@@ -13,11 +13,13 @@ window.addEventListener('error', (event) => {
 
 const tauri = window.__TAURI__;
 
+const { t, tp, plural, num, ago, size: sizeParts } = I18N;
+
 // Мост ищем в момент вызова: это позволяет открыть интерфейс в браузере
 // с подставным мостом для проверки вёрстки.
 function invoke(command, args) {
   const bridge = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
-  if (!bridge) return Promise.reject(new Error('мост Tauri недоступен'));
+  if (!bridge) return Promise.reject(new Error('Tauri bridge unavailable'));
   return bridge(command, args);
 }
 
@@ -62,66 +64,7 @@ const esc = (value) =>
 
 const icon = (name, cls = '') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
 
-const num = (value) => Number(value || 0).toLocaleString('ru-RU');
-
-function plural(n, one, few, many) {
-  const abs = Math.abs(n) % 100;
-  const tail = abs % 10;
-  if (abs > 10 && abs < 20) return many;
-  if (tail > 1 && tail < 5) return few;
-  if (tail === 1) return one;
-  return many;
-}
-
-function sizeParts(bytes) {
-  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
-  let value = Number(bytes || 0);
-  let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  const shown = index === 0
-    ? String(Math.round(value))
-    : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 });
-  return { value: shown, unit: units[index] };
-}
-
-const sizeText = (bytes) => {
-  const parts = sizeParts(bytes);
-  return `${parts.value} ${parts.unit}`;
-};
-
-function toMillis(ts) {
-  if (!ts) return 0;
-  const value = Number(ts);
-  return value > 1e12 ? value : value * 1000;
-}
-
-function ago(ts) {
-  const ms = toMillis(ts);
-  if (!ms) return '—';
-  const diff = Math.max(0, Date.now() - ms);
-  const minutes = Math.floor(diff / 60000);
-  if (minutes < 1) return 'только что';
-  if (minutes < 60) return `${minutes} мин назад`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} ч назад`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} дн назад`;
-  return new Date(ms).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short' });
-}
-
-function clock(ts) {
-  const ms = toMillis(ts);
-  if (!ms) return '—';
-  return new Date(ms).toLocaleString('ru-RU', {
-    day: '2-digit',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
+const sizeText = (bytes) => sizeParts(bytes).text;
 
 const basename = (path) => {
   const parts = String(path || '').split(/[\\/]/).filter(Boolean);
@@ -143,11 +86,11 @@ const joinPath = (root, relative) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// В лог демона попадают ANSI-цвета из tracing; в интерфейсе они не нужны.
+// В лог службы попадают ANSI-цвета из tracing; в интерфейсе они не нужны.
 const stripAnsi = (text) => String(text || '').replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
 
 function errText(error) {
-  if (!error) return 'Неизвестная ошибка';
+  if (!error) return t('common.unknownError');
   if (typeof error === 'string') return error;
   return error.message || String(error);
 }
@@ -156,7 +99,7 @@ async function copyText(text) {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
-    toast('Скопировано');
+    toast(t('common.copied'));
   } catch {
     const area = document.createElement('textarea');
     area.value = text;
@@ -166,9 +109,9 @@ async function copyText(text) {
     area.select();
     try {
       document.execCommand('copy');
-      toast('Скопировано');
+      toast(t('common.copied'));
     } catch {
-      toast('Не удалось скопировать', 'bad');
+      toast(t('common.copyFailed'), 'bad');
     }
     area.remove();
   }
@@ -204,67 +147,63 @@ function stateCopy(snap) {
     return {
       tone: 'idle',
       disc: 'OFF',
-      discSub: 'демон',
-      cap: 'ожидает запуска',
-      title: snap.cfg.root ? 'Демон <em>остановлен</em>' : 'Библиотека <em>не выбрана</em>',
-      sub: snap.cfg.root
-        ? 'Файлы на месте и ничего не потеряно. Запустите демон, чтобы продолжить обмен с телефоном.'
-        : 'Выберите папку с музыкой, чтобы начать.',
+      discSub: t('state.service'),
+      cap: t('state.notRunning'),
+      title: snap.cfg.root ? t('state.stopped.title') : t('state.noRoot.title'),
+      sub: snap.cfg.root ? t('state.stopped.sub') : t('state.noRoot.sub'),
     };
   }
 
   const pending = snap.pending.length;
-  const pendingNote = pending
-    ? ` ${pending} ${plural(pending, 'удаление ждёт', 'удаления ждут', 'удалений ждут')} вашего решения.`
-    : '';
+  const pendingNote = pending ? tp('state.pendingNote', pending) : '';
 
   switch (status.state) {
     case 'syncing':
       return {
         tone: 'busy',
         disc: 'SYNC',
-        discSub: 'сверяем',
-        cap: 'идёт обмен',
-        title: 'Сверяем <em>библиотеку</em>',
-        sub: 'Смотрим, что изменилось, и переносим только разницу — без полной перекачки.',
+        discSub: t('state.syncing.disc'),
+        cap: t('state.syncing.cap'),
+        title: t('state.syncing.title'),
+        sub: t('state.syncing.sub'),
       };
     case 'paused_with_warning':
       return {
         tone: 'bad',
         disc: '!',
-        discSub: 'мало места',
-        cap: 'синхронизация на паузе',
-        title: 'Мало <em>места</em>',
-        sub: 'Чтобы не забить диск, синхронизация приостановлена. Освободите немного места и запустите проверку.',
+        discSub: t('state.lowDisk.disc'),
+        cap: t('state.lowDisk.cap'),
+        title: t('state.lowDisk.title'),
+        sub: t('state.lowDisk.sub'),
       };
     case 'paused':
       return {
         tone: 'idle',
         disc: 'PAUSE',
-        discSub: 'пауза',
-        cap: 'фоновая работа остановлена',
-        title: 'Пауза',
-        sub: `Сканирование и сеть остановлены. Файлы не меняются.${pendingNote}`,
+        discSub: t('state.paused.disc'),
+        cap: t('state.paused.cap'),
+        title: t('state.paused.title'),
+        sub: pending ? `${t('state.paused.sub')} ${pendingNote}` : t('state.paused.sub'),
       };
     case 'error':
       return {
         tone: 'bad',
         disc: 'ERR',
-        discSub: 'ошибка',
-        cap: 'нужно внимание',
-        title: 'Нужно <em>внимание</em>',
-        sub: status.last_error ? String(status.last_error) : 'Демон сообщил об ошибке.',
+        discSub: t('state.error.disc'),
+        cap: t('state.error.cap'),
+        title: t('state.error.title'),
+        sub: status.last_error ? String(status.last_error) : t('state.error.sub'),
       };
     default:
       return {
         tone: 'good',
         disc: 'OK',
-        discSub: `${num(status.files)} ф.`,
-        cap: status.last_sync ? `связь ${ago(status.last_sync)}` : 'готов к обмену',
-        title: 'Всё <em>синхронно</em>',
+        discSub: t('state.ok.disc'),
+        cap: t('state.ok.cap'),
+        title: t('state.ok.title'),
         sub: status.last_sync
-          ? `Последняя связь ${ago(status.last_sync)}.${pendingNote}`
-          : `Демон работает, файлы под наблюдением.${pendingNote}`,
+          ? `${t('state.ok.subSync', { ago: ago(status.last_sync) })}${pending ? ` ${pendingNote}` : ''}`
+          : `${t('state.ok.sub')}${pending ? ` ${pendingNote}` : ''}`,
       };
   }
 }
@@ -273,13 +212,13 @@ function stateCopy(snap) {
 
 function navHtml(snap) {
   const items = [
-    { id: 'overview', label: 'Обзор', icon: 'disc' },
-    { id: 'pending', label: 'Удаления', icon: 'clock', count: snap.pending.length },
-    { id: 'conflicts', label: 'Конфликты', icon: 'split', count: snap.conflicts.length },
-    { id: 'vault', label: 'Хранилище', icon: 'box', count: snap.vault.length },
-    { id: 'devices', label: 'Устройства', icon: 'devices', count: snap.known.length },
-    { id: 'pair', label: 'Сопряжение', icon: 'qr' },
-    { id: 'settings', label: 'Настройки', icon: 'sliders' },
+    { id: 'overview', icon: 'disc' },
+    { id: 'pending', icon: 'clock', count: snap.pending.length },
+    { id: 'conflicts', icon: 'split', count: snap.conflicts.length },
+    { id: 'vault', icon: 'box', count: snap.vault.length },
+    { id: 'devices', icon: 'devices', count: snap.known.length },
+    { id: 'pair', icon: 'qr' },
+    { id: 'settings', icon: 'sliders' },
   ];
 
   return items.map((item) => {
@@ -288,7 +227,7 @@ function navHtml(snap) {
       ? `<span class="nav-count${item.id === 'pending' || item.id === 'conflicts' ? ' hot' : ''}">${item.count}</span>`
       : '';
     return `<button class="nav-item${active}" data-view="${item.id}">
-      ${icon(item.icon, 'nav-ico')}<span class="nav-label">${item.label}</span>${count}
+      ${icon(item.icon, 'nav-ico')}<span class="nav-label">${esc(t(`nav.${item.id}`))}</span>${count}
     </button>`;
   }).join('');
 }
@@ -305,26 +244,27 @@ function chrome(snap, copy) {
   document.body.classList.toggle('is-onboarding', onboard);
 
   const stateText = onboard
-    ? 'первый запуск'
+    ? t('titlebar.firstRun')
     : !state.running
-      ? 'демон остановлен'
+      ? t('titlebar.serviceStopped')
       : snap.status && snap.status.state === 'syncing'
-        ? 'синхронизация…'
+        ? t('titlebar.syncing')
         : snap.status && snap.status.state === 'paused'
-          ? 'пауза'
+          ? t('titlebar.paused')
           : snap.status && snap.status.state === 'error'
-            ? 'ошибка'
-            : 'на связи';
+            ? t('titlebar.error')
+            : t('titlebar.online');
 
   $('#tb-ver').textContent = info ? `v${info.version}` : '';
   $('#tb-state').textContent = stateText;
   $('#tb-dev').textContent = snap.device || '';
 
-  $('#rail-dev').textContent = snap.device || '—';
+  $('#rail-dev').textContent = snap.device || t('common.dash');
   $('#rail-dev').title = snap.device || '';
-  $('#rail-root').textContent = snap.root ? basename(snap.root) : 'Библиотека не выбрана';
+  $('#rail-root').textContent = snap.root ? basename(snap.root) : t('rail.noLibrary');
   $('#rail-root').title = snap.root || '';
-  $('#rail-daemon').textContent = state.running ? 'демон работает' : 'демон остановлен';
+  $('#rail-daemon').textContent = state.running ? t('rail.serviceRunning') : t('rail.serviceStopped');
+  $('#rail-locale').textContent = I18N.locale === 'ru' ? 'English' : 'Русский';
   $('#rail-ver').textContent = info ? `v${info.version} · AGPL-3.0` : '';
   $('#nav').innerHTML = onboard ? '' : navHtml(snap);
   $('#progress').hidden = !state.busy;
@@ -358,62 +298,61 @@ function renderOverview() {
   const status = snap.status;
   const connected = snap.peers.filter((peer) => !peer.error).length;
   const peerCount = Math.max(connected, snap.known.length);
-  const rootName = snap.root ? basename(snap.root) : 'библиотека не выбрана';
+  const rootName = snap.root ? basename(snap.root) : t('rail.noLibrary');
 
   const size = sizeParts(status ? status.size : 0);
   const vaultSize = snap.vault.reduce((sum, row) => sum + Number(row.size || 0), 0);
 
   const primaryAction = !snap.running
-    ? `<button class="btn btn--primary" data-act="start-daemon">${icon('play')}Запустить демон</button>`
-    : `<button class="btn btn--primary" data-act="sync" ${status.state === 'syncing' ? 'disabled' : ''}>${icon('sync')}Синхронизировать</button>`;
+    ? `<button class="btn btn--primary" data-act="start-daemon">${icon('play')}${esc(t('act.startService'))}</button>`
+    : `<button class="btn btn--primary" data-act="sync" ${status.state === 'syncing' ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>`;
 
   const pauseAction = !snap.running
     ? ''
     : status.paused
-      ? `<button class="btn" data-act="resume">${icon('play')}Продолжить</button>`
-      : `<button class="btn btn--ghost" data-act="pause">${icon('pause')}Пауза</button>`;
+      ? `<button class="btn" data-act="resume">${icon('play')}${esc(t('act.resume'))}</button>`
+      : `<button class="btn btn--ghost" data-act="pause">${icon('pause')}${esc(t('act.pause'))}</button>`;
 
   const stats = `<div class="stats">
     <div class="stat">
-      <div class="stat-k">Файлов в индексе</div>
+      <div class="stat-k">${esc(t('stat.files'))}</div>
       <div class="stat-v">${num(status ? status.files : 0)}</div>
-      <div class="stat-n">${num(status ? status.local : 0)} есть на этом диске</div>
+      <div class="stat-n">${esc(t('stat.filesNote', { n: num(status ? status.local : 0) }))}</div>
     </div>
     <div class="stat">
-      <div class="stat-k">Объём библиотеки</div>
+      <div class="stat-k">${esc(t('stat.size'))}</div>
       <div class="stat-v">${size.value}<small>${size.unit}</small></div>
-      <div class="stat-n">Без перекодирования и копий</div>
     </div>
     <div class="stat">
-      <div class="stat-k">Записей в журнале</div>
+      <div class="stat-k">${esc(t('stat.ops'))}</div>
       <div class="stat-v">${num(status ? status.ops : 0)}</div>
-      <div class="stat-n">${status && status.last_scan ? `скан ${ago(status.last_scan)}` : 'журнал изменений'}</div>
+      ${status && status.last_scan ? `<div class="stat-n">${esc(t('stat.opsNote', { ago: ago(status.last_scan) }))}</div>` : ''}
     </div>
     <div class="stat">
-      <div class="stat-k">В хранилище</div>
+      <div class="stat-k">${esc(t('stat.vault'))}</div>
       <div class="stat-v">${snap.vault.length}</div>
-      <div class="stat-n">${vaultSize ? sizeText(vaultSize) + ' можно вернуть' : 'удаления обратимы'}</div>
+      ${vaultSize ? `<div class="stat-n">${esc(sizeText(vaultSize))}</div>` : ''}
     </div>
   </div>`;
 
   const peerTitle = peerCount
-    ? `${peerCount} ${plural(peerCount, 'устройство', 'устройства', 'устройств')}`
-    : 'Телефон';
+    ? `${peerCount} ${plural('word.devices', peerCount)}`
+    : t('peers.phone');
   const peerMeta = connected
-    ? `на связи ${ago((snap.peers.find((peer) => !peer.error) || {}).last_seen)}`
+    ? t('peers.online', { ago: ago((snap.peers.find((peer) => !peer.error) || {}).last_seen) })
     : snap.known.length
-      ? 'пока не отвечает'
-      : 'ещё не сопряжён';
+      ? t('peers.noResponse')
+      : t('peers.notPaired');
 
   const signal = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('sync')}Сигнал</div>
-      <span class="tag ${connected ? 'tag--good' : ''}">${connected ? 'LAN активен' : 'локальная сеть'}</span>
+      <div class="panel-title">${icon('sync')}${esc(t('panel.connection'))}</div>
+      <span class="tag ${connected ? 'tag--good' : ''}">${esc(connected ? t('tag.connected') : t('tag.disconnected'))}</span>
     </div>
     <div class="signal">
       <div class="node">
         <div class="node-ico hot">${icon('pc')}</div>
-        <div><b>Этот компьютер</b><span>${esc(snap.device || '—')}</span></div>
+        <div><b>${esc(t('node.thisPc'))}</b><span>${esc(snap.device || t('common.dash'))}</span></div>
       </div>
       <div class="wire ${connected ? '' : 'is-idle'}">
         <span class="pulse"></span><span class="pulse"></span><span class="pulse"></span>
@@ -426,10 +365,10 @@ function renderOverview() {
     <div class="signal-foot">
       <div class="meta">
         <span class="dot ${connected ? 'good' : 'warn'}"></span>
-        <span>${status && status.last_sync ? `Связь ${ago(status.last_sync)}` : 'Ещё не синхронизировались'}</span>
+        <span>${esc(status && status.last_sync ? t('signal.lastContact', { ago: ago(status.last_sync) }) : t('signal.never'))}</span>
       </div>
       <span class="mono">${esc((status && status.pair_addr) || snap.info.sync_addr || '')}</span>
-      <button class="btn btn--sm" data-view="pair">Код сопряжения</button>
+      <button class="btn btn--sm" data-view="pair">${esc(t('btn.pairCode'))}</button>
     </div>
   </section>`;
 
@@ -438,9 +377,9 @@ function renderOverview() {
     alerts.push({
       icon: 'warn',
       tone: 'warn',
-      title: 'Демон остановлен',
-      text: 'Запустите его, чтобы возобновить наблюдение за папкой и обмен с телефоном.',
-      action: `<button class="btn btn--sm" data-act="start-daemon">Запустить</button>`,
+      title: t('alert.serviceStopped.title'),
+      text: t('alert.serviceStopped.text'),
+      action: `<button class="btn btn--sm" data-act="start-daemon">${esc(t('act.start'))}</button>`,
     });
   }
   if (status && status.disk && status.disk.low) {
@@ -450,45 +389,45 @@ function renderOverview() {
     alerts.push({
       icon: 'warn',
       tone: 'bad',
-      title: 'Мало свободного места',
-      text: `Осталось ${percent} — синхронизация на паузе, чтобы не забить диск.`,
-      action: `<button class="btn btn--sm" data-act="disk-check">Проверить</button>`,
+      title: t('alert.lowDisk.title'),
+      text: t('alert.lowDisk.text', { percent }),
+      action: `<button class="btn btn--sm" data-act="disk-check">${esc(t('alert.lowDisk.action'))}</button>`,
     });
   }
   if (snap.pending.length) {
     alerts.push({
       icon: 'clock',
       tone: '',
-      title: `${snap.pending.length} ${plural(snap.pending.length, 'удаление', 'удаления', 'удалений')} без решения`,
-      text: 'Файл исчез с диска. Удалить его везде, оставить только здесь или забыть — выбор за вами.',
-      action: `<button class="btn btn--sm" data-view="pending">Открыть</button>`,
+      title: tp('alert.pending.title', snap.pending.length),
+      text: t('alert.pending.text'),
+      action: `<button class="btn btn--sm" data-view="pending">${esc(t('alert.pending.action'))}</button>`,
     });
   }
   if (snap.conflicts.length) {
     alerts.push({
       icon: 'split',
       tone: 'bad',
-      title: `${snap.conflicts.length} ${plural(snap.conflicts.length, 'конфликт', 'конфликта', 'конфликтов')}`,
-      text: 'Один и тот же трек изменён с двух сторон. Ничего не перезаписано молча.',
-      action: `<button class="btn btn--sm" data-view="conflicts">Разобрать</button>`,
+      title: tp('alert.conflicts.title', snap.conflicts.length),
+      text: t('alert.conflicts.text'),
+      action: `<button class="btn btn--sm" data-view="conflicts">${esc(t('alert.pending.action'))}</button>`,
     });
   }
   if (snap.running && status.last_error) {
     alerts.push({
       icon: 'alert',
       tone: 'bad',
-      title: 'Последняя ошибка',
+      title: t('alert.error.title'),
       text: String(status.last_error).slice(0, 180),
-      action: `<button class="btn btn--sm" data-view="settings">Лог</button>`,
+      action: `<button class="btn btn--sm" data-view="settings">${esc(t('alert.error.action'))}</button>`,
     });
   }
   if (!snap.daemonBin) {
     alerts.push({
       icon: 'alert',
       tone: 'warn',
-      title: 'Не найден syncthd',
-      text: 'Соберите демон командой cargo build --release -p syncth-daemon.',
-      action: `<button class="btn btn--sm" data-view="settings">Подробнее</button>`,
+      title: t('alert.noBinary.title'),
+      text: t('alert.noBinary.text'),
+      action: `<button class="btn btn--sm" data-view="settings">${esc(t('alert.noBinary.action'))}</button>`,
     });
   }
 
@@ -500,12 +439,12 @@ function renderOverview() {
 
   const attention = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('alert')}Требует решения</div>
-      <span class="tag ${alerts.length ? 'tag--warn' : 'tag--good'}">${alerts.length ? alerts.length + ' ' + plural(alerts.length, 'пункт', 'пункта', 'пунктов') : 'чисто'}</span>
+      <div class="panel-title">${icon('alert')}${esc(t('panel.attention'))}</div>
+      <span class="tag ${alerts.length ? 'tag--warn' : 'tag--good'}">${esc(alerts.length ? tp('attention.count', alerts.length) : t('attention.clean'))}</span>
     </div>
     ${alerts.length
-      ? `<div class="alert-list">${attentionRows}</div>${alerts.length > 4 ? `<div class="row-meta" style="margin-top:12px">и ещё ${alerts.length - 4}</div>` : ''}`
-      : `<div class="calm">${icon('check')}<span>Все решения приняты. SynctMusic не трогает файлы без вас.</span></div>`}
+      ? `<div class="alert-list">${attentionRows}</div>${alerts.length > 4 ? `<div class="row-meta" style="margin-top:12px">${esc(t('attention.more', { n: alerts.length - 4 }))}</div>` : ''}`
+      : `<div class="calm">${icon('check')}<span>${esc(t('attention.empty'))}</span></div>`}
   </section>`;
 
   const peerRows = [];
@@ -516,59 +455,50 @@ function renderOverview() {
     peerRows.push(`<div class="row">
       <span class="dot ${live ? (live.error ? 'bad' : 'good') : ''}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || 'устройство')}</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || t('device.unknown'))}</div>
         <div class="row-meta mono">${esc(known.addr)}</div>
       </div>
-      <div class="row-meta" style="margin:0">${live ? (live.error ? 'ошибка' : ago(live.last_seen)) : 'нет ответа'}</div>
+      <div class="row-meta" style="margin:0">${esc(live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer'))}</div>
     </div>`);
   });
   [...seen.values()].slice(0, 2).forEach((live) => {
     peerRows.push(`<div class="row">
       <span class="dot ${live.error ? 'bad' : 'good'}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">новое устройство</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(t('device.nearby'))}</div>
         <div class="row-meta mono">${esc(live.addr)}</div>
       </div>
-      <div class="row-meta" style="margin:0">${live.error ? 'ошибка' : ago(live.last_seen)}</div>
+      <div class="row-meta" style="margin:0">${esc(live.error ? t('common.error') : ago(live.last_seen))}</div>
     </div>`);
   });
 
   const peers = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('devices')}Устройства</div>
-      <span class="tag">${snap.known.length + snap.peers.length ? 'знакомые и рядом' : 'пока никого'}</span>
+      <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+      <span class="tag">${esc(snap.known.length + snap.peers.length ? t('devices.tag', { n: snap.known.length + snap.peers.length }) : t('devices.tagEmpty'))}</span>
     </div>
     ${peerRows.length
       ? `<div class="rows">${peerRows.join('')}</div>
-         <div class="settings-actions"><button class="btn btn--sm" data-view="pair">Подключить телефон</button><button class="btn btn--sm btn--ghost" data-view="devices">Все устройства</button></div>`
-      : emptyState('phone', 'Телефон ещё не подключён', 'Покажите код сопряжения на телефоне — устройства найдут друг друга в локальной сети.', `<button class="btn btn--sm" data-view="pair">Сопряжение</button>`)}
-  </section>`;
-
-  const rules = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('check')}Правила игры</div><span class="tag">без облака</span></div>
-    <div class="principles" style="border-top:0;max-width:none">
-      <div class="principle" style="padding-top:0"><span class="num">01</span><div><b>Файлы остаются на месте</b>Индексация только читает папку. Никаких переименований и «правильной структуры».</div></div>
-      <div class="principle"><span class="num">02</span><div><b>Удаления обратимы</b>Копия живёт в хранилище 30 дней. Восстановить можно в один клик.</div></div>
-      <div class="principle" style="padding-bottom:0"><span class="num">03</span><div><b>Никаких аккаунтов</b>Только ваши устройства в локальной сети. Нет сервера — нет подписки.</div></div>
-    </div>
+         <div class="settings-actions"><button class="btn btn--sm" data-view="pair">${esc(t('devices.connect'))}</button><button class="btn btn--sm btn--ghost" data-view="devices">${esc(t('devices.all'))}</button></div>`
+      : emptyState('phone', t('devices.emptyTitle'), t('devices.emptyText'), `<button class="btn btn--sm" data-view="pair">${esc(t('devices.emptyAction'))}</button>`)}
   </section>`;
 
   return `<div class="hero">
       <div>
-        <div class="eyebrow">Библиотека <span class="path">${esc(rootName)}</span></div>
+        <div class="eyebrow">${esc(t('nav.overview'))} <span class="path">${esc(rootName)}</span></div>
         <h1 class="state-title">${copy.title}</h1>
         <p class="state-sub">${esc(copy.sub)}</p>
         <div class="hero-actions">
           ${primaryAction}
-          <button class="btn" data-act="scan" ${!snap.running || (status && status.state === 'syncing') ? 'disabled' : ''}>${icon('scan')}Сканировать</button>
+          <button class="btn" data-act="scan" ${!snap.running || (status && status.state === 'syncing') ? 'disabled' : ''}>${icon('scan')}${esc(t('act.scan'))}</button>
           ${pauseAction}
-          <button class="icon-btn" data-act="open-root" title="Открыть папку с музыкой" ${snap.root ? '' : 'disabled'}>${icon('folder')}</button>
+          <button class="icon-btn" data-act="open-root" title="${esc(t('act.openFolder'))}" ${snap.root ? '' : 'disabled'}>${icon('folder')}</button>
         </div>
       </div>
       <div class="disc-block">
         <div class="disc ${status && status.state === 'syncing' ? 'is-spinning' : ''}" data-tone="${copy.tone}">
           <div class="disc-label">
-            <small>статус</small>
+            <small>${esc(t('state.service'))}</small>
             <b>${esc(copy.disc)}</b>
             <span>${esc(copy.discSub)}</span>
           </div>
@@ -578,7 +508,7 @@ function renderOverview() {
     </div>
     ${stats}
     <div class="grid grid-2">${signal}${attention}</div>
-    <div class="grid grid-2">${peers}${rules}</div>`;
+    <div class="grid">${peers}</div>`;
 }
 
 // ------------------------------------------------------------------ удаления
@@ -588,26 +518,26 @@ function renderPending() {
   const rows = snap.pending.map((pending) => `<div class="row">
       <div class="row-body">
         <div class="row-path">${esc(pending.path)}</div>
-        <div class="row-meta"><span class="dot warn"></span>Исчез с диска ${ago(pending.detected_at)} · решение за вами</div>
+        <div class="row-meta"><span class="dot warn"></span>${esc(t('pending.rowMeta', { ago: ago(pending.detected_at) }))}</div>
       </div>
       <div class="row-side">
-        <button class="btn btn--sm" data-act="pending-only" data-path="${esc(pending.path)}">Только здесь</button>
-        <button class="btn btn--sm btn--danger" data-act="pending-everywhere" data-path="${esc(pending.path)}">Удалить везде</button>
-        <button class="btn btn--sm btn--ghost" data-act="pending-forget" data-path="${esc(pending.path)}">Забыть</button>
+        <button class="btn btn--sm" data-act="pending-only" data-path="${esc(pending.path)}">${esc(t('pending.keep'))}</button>
+        <button class="btn btn--sm btn--danger" data-act="pending-everywhere" data-path="${esc(pending.path)}">${esc(t('pending.delete'))}</button>
+        <button class="btn btn--sm btn--ghost" data-act="pending-forget" data-path="${esc(pending.path)}">${esc(t('pending.dismiss'))}</button>
       </div>
     </div>`).join('');
 
   const content = snap.pending.length
-    ? `<div class="rows">${rows}</div>`
-    : emptyState('check', 'Очередь пуста', 'Ни один файл не исчез незаметно. Когда удаление появится, оно будет ждать вашего решения здесь.');
+    ? `<div class="rows">${rows}</div><p class="view-sub" style="margin-top:14px">${esc(t('pending.hint'))}</p>`
+    : emptyState('check', t('pending.emptyTitle'), t('pending.emptyText'));
 
   return viewHead(
-    'Очередь решений',
-    'Удаления',
-    'Файл исчез с диска — SynctMusic не удаляет его на других устройствах сам. Выберите, что сделать: удалить везде (копия останется в хранилище 30 дней), оставить только здесь или забыть запись.',
-    snap.pending.length ? `<button class="btn btn--sm" data-view="vault">${icon('box')}Хранилище</button>` : '',
+    t('pending.kicker'),
+    t('pending.title'),
+    t('pending.sub'),
+    snap.pending.length ? `<button class="btn btn--sm" data-view="vault">${icon('box')}${esc(t('nav.vault'))}</button>` : '',
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('clock')}Ждут решения</div><span class="tag ${snap.pending.length ? 'tag--warn' : 'tag--good'}">${snap.pending.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('clock')}${esc(t('panel.waiting'))}</div><span class="tag ${snap.pending.length ? 'tag--warn' : 'tag--good'}">${snap.pending.length}</span></div>
     ${content}
   </section>`;
 }
@@ -619,24 +549,24 @@ function renderConflicts() {
   const rows = snap.conflicts.map((path) => `<div class="row">
       <div class="row-body">
         <div class="row-path">${esc(path)}</div>
-        <div class="row-meta"><span class="dot bad"></span>Изменён с двух сторон — автоматически не перезаписываем</div>
+        <div class="row-meta"><span class="dot bad"></span>${esc(t('conflicts.rowMeta'))}</div>
       </div>
       <div class="row-side">
-        <button class="btn btn--sm" data-act="open-conflict" data-path="${esc(path)}">${icon('folder')}Открыть папку</button>
+        <button class="btn btn--sm" data-act="open-conflict" data-path="${esc(path)}">${icon('folder')}${esc(t('conflicts.open'))}</button>
       </div>
     </div>`).join('');
 
   const content = snap.conflicts.length
     ? `<div class="rows">${rows}</div>`
-    : emptyState('check', 'Конфликтов нет', 'Одинаковых путей с разным содержимым не обнаружено.');
+    : emptyState('check', t('conflicts.emptyTitle'), t('conflicts.emptyText'));
 
   return viewHead(
-    'Одинаковые имена',
-    'Конфликты',
-    'Один и тот же путь изменён на двух устройствах. SynctMusic не выбирает победителя молча: проверьте файлы в плеере и оставьте нужную версию. Лишнее можно убрать вручную — копия попадёт в хранилище.',
-    `<button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}Открыть библиотеку</button>`,
+    t('conflicts.kicker'),
+    t('nav.conflicts'),
+    t('conflicts.sub'),
+    `<button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('conflicts.openLibrary'))}</button>`,
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('split')}Требуют разбора</div><span class="tag ${snap.conflicts.length ? 'tag--bad' : 'tag--good'}">${snap.conflicts.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('split')}${esc(t('panel.conflicts'))}</div><span class="tag ${snap.conflicts.length ? 'tag--bad' : 'tag--good'}">${snap.conflicts.length}</span></div>
     ${content}
   </section>`;
 }
@@ -648,24 +578,24 @@ function renderVault() {
   const rows = snap.vault.map((row) => `<div class="row">
       <div class="row-body">
         <div class="row-path">${esc(row.path)}</div>
-        <div class="row-meta"><span class="dot"></span>${sizeText(row.size)} · удалён ${ago(row.deleted_at)}</div>
+        <div class="row-meta"><span class="dot"></span>${esc(t('vault.rowMeta', { size: sizeText(row.size), ago: ago(row.deleted_at) }))}</div>
       </div>
       <div class="row-side">
-        <button class="btn btn--sm" data-act="restore" data-path="${esc(row.path)}">${icon('refresh')}Вернуть</button>
+        <button class="btn btn--sm" data-act="restore" data-path="${esc(row.path)}">${icon('refresh')}${esc(t('vault.restore'))}</button>
       </div>
     </div>`).join('');
 
   const content = snap.vault.length
     ? `<div class="rows">${rows}</div>`
-    : emptyState('box', 'Хранилище пусто', 'Сюда попадают удалённые файлы и заменённые версии. Они живут 30 дней — этого хватает, чтобы передумать.');
+    : emptyState('box', t('vault.emptyTitle'), t('vault.emptyText'));
 
   return viewHead(
-    'Обратимые удаления',
-    'Хранилище',
-    'Каждый удалённый файл сохраняется на 30 дней. Верните его в библиотеку или дождитесь автоматической очистки.',
-    `<button class="btn btn--sm" data-act="gc">${icon('refresh')}Очистить просроченное</button>`,
+    t('vault.kicker'),
+    t('nav.vault'),
+    t('vault.sub'),
+    `<button class="btn btn--sm" data-act="gc">${icon('refresh')}${esc(t('vault.gc'))}</button>`,
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('box')}Можно вернуть</div><span class="tag ${snap.vault.length ? 'tag--warn' : ''}">${snap.vault.length} ${plural(snap.vault.length, 'файл', 'файла', 'файлов')}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('box')}${esc(t('panel.restorable'))}</div><span class="tag ${snap.vault.length ? 'tag--warn' : ''}">${esc(tp('vault.count', snap.vault.length))}</span></div>
     ${content}
   </section>`;
 }
@@ -677,14 +607,14 @@ function renderDevices() {
   const status = snap.status;
 
   const current = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('pc')}Этот компьютер</div><span class="tag ${snap.running ? 'tag--good' : ''}">${snap.running ? 'в сети' : 'остановлен'}</span></div>
-    <div class="kv"><span class="kv-k">Идентификатор</span><span class="kv-v">${esc(snap.device || '—')}</span></div>
-    <div class="kv"><span class="kv-k">Библиотека</span><span class="kv-v">${esc(snap.root || 'не выбрана')}</span></div>
-    <div class="kv"><span class="kv-k">Адрес для синхронизации</span><span class="kv-v">${esc((status && status.pair_addr) || snap.info.sync_addr || '—')}</span></div>
-    <div class="kv"><span class="kv-k">Файлов на диске</span><span class="kv-v">${num(status ? status.local : 0)}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('pc')}${esc(t('node.thisPc'))}</div><span class="tag ${snap.running ? 'tag--good' : ''}">${esc(snap.running ? t('devices.tagOnline') : t('devices.tagOffline'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.id'))}</span><span class="kv-v">${esc(snap.device || t('common.dash'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.library'))}</span><span class="kv-v">${esc(snap.root || t('common.notSelected'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.syncAddr'))}</span><span class="kv-v">${esc((status && status.pair_addr) || snap.info.sync_addr || t('common.dash'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.filesOnDisk'))}</span><span class="kv-v">${num(status ? status.local : 0)}</span></div>
     <div class="settings-actions">
-      <button class="btn btn--sm" data-act="copy-device" ${snap.device ? '' : 'disabled'}>${icon('copy')}Копировать ID</button>
-      <button class="btn btn--sm btn--ghost" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}Папка</button>
+      <button class="btn btn--sm" data-act="copy-device" ${snap.device ? '' : 'disabled'}>${icon('copy')}${esc(t('devices.copyId'))}</button>
+      <button class="btn btn--sm btn--ghost" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('devices.folder'))}</button>
     </div>
   </section>`;
 
@@ -696,35 +626,35 @@ function renderDevices() {
     rows.push(`<div class="row">
       <span class="dot ${live ? (live.error ? 'bad' : 'good') : ''}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || 'устройство')}</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || t('device.unknown'))}</div>
         <div class="row-meta mono">${esc(known.addr)}${live && live.error ? ' · ' + esc(live.error) : ''}</div>
       </div>
-      <div class="row-meta" style="margin:0">${live ? (live.error ? 'ошибка' : ago(live.last_seen)) : 'нет ответа'}</div>
+      <div class="row-meta" style="margin:0">${esc(live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer'))}</div>
     </div>`);
   });
   [...seen.values()].forEach((live) => {
     rows.push(`<div class="row">
       <span class="dot ${live.error ? 'bad' : 'good'}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">Устройство рядом</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(t('device.nearby'))}</div>
         <div class="row-meta mono">${esc(live.addr)}${live.error ? ' · ' + esc(live.error) : ''}</div>
       </div>
-      <div class="row-meta" style="margin:0">${live.error ? 'ошибка' : ago(live.last_seen)}</div>
+      <div class="row-meta" style="margin:0">${esc(live.error ? t('common.error') : ago(live.last_seen))}</div>
     </div>`);
   });
 
   const known = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('devices')}Знакомые устройства</div><span class="tag">${snap.known.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('devices')}${esc(t('devices.known'))}</div><span class="tag">${snap.known.length}</span></div>
     ${rows.length
       ? `<div class="rows">${rows.join('')}</div>`
-      : emptyState('phone', 'Пока только этот компьютер', 'Подключите телефон по коду сопряжения — после этого он появится здесь и будет находиться сам в локальной сети.')}
-    <div class="settings-actions"><button class="btn btn--sm" data-view="pair">${icon('qr')}Сопряжение</button></div>
+      : emptyState('phone', t('devices.otherEmptyTitle'), t('devices.otherEmptyText'))}
+    <div class="settings-actions"><button class="btn btn--sm" data-view="pair">${icon('qr')}${esc(t('nav.pair'))}</button></div>
   </section>`;
 
   return viewHead(
-    'Локальная сеть',
-    'Устройства',
-    'Никакого облака: устройства обмениваются изменениями напрямую, когда оказываются в одной сети. Идентификатор — имя, а ключ подписи закрепляется при первом контакте.',
+    t('devices.kicker'),
+    t('nav.devices'),
+    t('devices.sub'),
   ) + `<div class="grid grid-2">${current}${known}</div>`;
 }
 
@@ -733,51 +663,51 @@ function renderDevices() {
 function renderPair() {
   const snap = snapshot();
   const head = viewHead(
-    'Один код',
-    'Сопряжение',
-    'Код содержит адрес, идентификатор и общий секрет библиотеки. Покажите QR на телефоне или вставьте код с другого устройства — сеть и аккаунты не нужны.',
-    `<button class="btn btn--sm" data-act="pair-refresh" ${!snap.running ? 'disabled' : ''}>${icon('refresh')}Новый код</button>`,
+    t('pair.kicker'),
+    t('nav.pair'),
+    t('pair.sub'),
+    `<button class="btn btn--sm" data-act="pair-refresh" ${!snap.running ? 'disabled' : ''}>${icon('refresh')}${esc(t('pair.newCode'))}</button>`,
   );
 
   if (!snap.running) {
-    return head + `<section class="panel">${emptyState('warn', 'Демон остановлен', 'Сопряжение доступно, когда демон запущен: именно он держит секрет библиотеки.', `<button class="btn btn--sm" data-act="start-daemon">Запустить демон</button>`)}</section>`;
+    return head + `<section class="panel">${emptyState('warn', t('pair.serviceStoppedTitle'), t('pair.serviceStoppedText'), `<button class="btn btn--sm" data-act="start-daemon">${esc(t('act.startService'))}</button>`)}</section>`;
   }
 
   if (state.pairError) {
-    return head + `<section class="panel"><div class="alert"><div class="alert-ico bad">${icon('alert')}</div><div class="alert-body"><b>Не удалось получить код</b><p>${esc(state.pairError)}</p></div></div></section>`;
+    return head + `<section class="panel"><div class="alert"><div class="alert-ico bad">${icon('alert')}</div><div class="alert-body"><b>${esc(t('pair.codeError'))}</b><p>${esc(state.pairError)}</p></div></div></section>`;
   }
 
   if (!state.pair) {
-    return head + `<section class="panel"><div class="empty"><span class="spinner"></span><b>Готовим код…</b><p>Демон создаёт QR и строку сопряжения.</p></div></section>`;
+    return head + `<section class="panel"><div class="empty"><span class="spinner"></span><b>${esc(t('pair.loading'))}</b><p>${esc(t('pair.loadingText'))}</p></div></section>`;
   }
 
   const pair = state.pair;
   const qr = pair.svg
     ? pair.svg
-    : '<div class="qr-empty">QR недоступен<br>используйте код</div>';
+    : `<div class="qr-empty">${esc(t('pair.qrMissing'))}<br>${esc(t('pair.qrMissingHint'))}</div>`;
 
   return head + `<div class="pair-grid">
     <section class="panel">
-      <div class="panel-head"><div class="panel-title">${icon('qr')}Код библиотеки</div><span class="tag">${esc(pair.dev || snap.device || '')}</span></div>
+      <div class="panel-head"><div class="panel-title">${icon('qr')}${esc(t('pair.panelCode'))}</div><span class="tag">${esc(pair.dev || snap.device || '')}</span></div>
       <div class="code-box">${esc(pair.code)}</div>
       <div class="settings-actions">
-        <button class="btn btn--sm" data-act="copy-code">${icon('copy')}Копировать код</button>
+        <button class="btn btn--sm" data-act="copy-code">${icon('copy')}${esc(t('pair.copy'))}</button>
         <span class="tag">${esc(pair.addr || '')}</span>
       </div>
       <div class="steps">
-        <div class="step">Откройте SynctMusic на телефоне и выберите «Сопряжение».</div>
-        <div class="step">Отсканируйте QR или вставьте код строкой — устройства обменяются ключами.</div>
-        <div class="step">После первого контакта телефон запомнится и будет находиться сам.</div>
+        <div class="step">${esc(t('pair.step1'))}</div>
+        <div class="step">${esc(t('pair.step2'))}</div>
+        <div class="step">${esc(t('pair.step3'))}</div>
       </div>
       <form class="field" data-form="pair">
-        <input class="input" name="code" placeholder="Вставить код с другого устройства" autocomplete="off" spellcheck="false">
-        <button class="btn" type="submit">Сопрячь</button>
+        <input class="input" name="code" placeholder="${esc(t('pair.placeholder'))}" autocomplete="off" spellcheck="false">
+        <button class="btn" type="submit">${esc(t('pair.submit'))}</button>
       </form>
     </section>
     <section class="panel">
-      <div class="panel-head"><div class="panel-title">${icon('qr')}QR-код</div><span class="tag">наведите камеру</span></div>
+      <div class="panel-head"><div class="panel-title">${icon('qr')}${esc(t('pair.qrPanel'))}</div><span class="tag">${esc(t('pair.qrTag'))}</span></div>
       <div class="qr-card">${qr}</div>
-      <p class="view-sub" style="margin-top:12px">Код действует, пока не создан новый. Он не покидает вашу сеть.</p>
+      <p class="view-sub" style="margin-top:12px">${esc(t('pair.qrNote'))}</p>
     </section>
   </div>`;
 }
@@ -789,64 +719,71 @@ function renderSettings() {
   const info = snap.info;
   const log = state.log;
   const labels = {
-    idle: 'на связи',
-    syncing: 'синхронизация',
-    paused: 'пауза',
-    paused_with_warning: 'пауза: мало места',
-    error: 'ошибка',
+    idle: t('stateLabel.idle'),
+    syncing: t('stateLabel.syncing'),
+    paused: t('stateLabel.paused'),
+    paused_with_warning: t('stateLabel.pausedWarning'),
+    error: t('stateLabel.error'),
   };
   const rawState = snap.status ? snap.status.state : null;
-  const stateLabel = state.running ? (labels[rawState] || rawState || 'работает') : 'остановлен';
+  const stateLabel = state.running ? (labels[rawState] || rawState || t('settings.running')) : t('stateLabel.stopped');
 
   const paths = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('folder')}Папки</div><span class="tag">на месте</span></div>
-    <div class="kv"><span class="kv-k">Музыка</span><span class="kv-v">${esc(snap.root || 'не выбрана')}</span></div>
-    <div class="kv"><span class="kv-k">Служебные данные</span><span class="kv-v">${esc(info.data_dir)}</span></div>
-    <div class="kv"><span class="kv-k">Настройки клиента</span><span class="kv-v">${esc(info.config_path)}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('settings.paths'))}</div></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.music'))}</span><span class="kv-v">${esc(snap.root || t('common.notSelected'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.data'))}</span><span class="kv-v">${esc(info.data_dir)}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.config'))}</span><span class="kv-v">${esc(info.config_path)}</span></div>
     <div class="settings-actions">
-      <button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}Открыть музыку</button>
-      <button class="btn btn--sm" data-act="open-data">${icon('folder')}Данные</button>
-      <button class="btn btn--sm btn--ghost" data-act="change-library">Сменить папку</button>
+      <button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('settings.openMusic'))}</button>
+      <button class="btn btn--sm" data-act="open-data">${icon('folder')}${esc(t('settings.data'))}</button>
+      <button class="btn btn--sm btn--ghost" data-act="change-library">${esc(t('settings.changeFolder'))}</button>
     </div>
-    <p class="view-sub" style="margin-top:12px">SynctMusic не переименовывает и не перемещает треки. Индекс и хранилище лежат отдельно от библиотеки.</p>
   </section>`;
 
   const daemon = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('sync')}Демон</div><span class="tag ${state.running ? 'tag--good' : ''}">${state.running ? 'работает' : 'остановлен'}</span></div>
-    <div class="kv"><span class="kv-k">Состояние</span><span class="kv-v">${esc(stateLabel)}</span></div>
-    <div class="kv"><span class="kv-k">Бинарник</span><span class="kv-v">${esc(snap.daemonBin || 'не найден')}</span></div>
-    <div class="kv"><span class="kv-k">Порт синхронизации</span><span class="kv-v">${esc(snap.info.sync_addr || '')}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('sync')}${esc(t('settings.service'))}</div><span class="tag ${state.running ? 'tag--good' : ''}">${esc(state.running ? t('settings.running') : t('settings.stopped'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.state'))}</span><span class="kv-v">${esc(stateLabel)}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.binary'))}</span><span class="kv-v">${esc(snap.daemonBin || t('common.none'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.port'))}</span><span class="kv-v">${esc(snap.info.sync_addr || '')}</span></div>
     <div class="settings-actions">
       ${state.running
-        ? `<button class="btn btn--sm btn--danger" data-act="stop-daemon">Остановить</button>`
-        : `<button class="btn btn--sm btn--primary" data-act="start-daemon">Запустить</button>`}
-      <button class="btn btn--sm" data-act="open-web" ${state.running ? '' : 'disabled'}>${icon('external')}Веб-интерфейс</button>
-      <button class="btn btn--sm btn--ghost" data-act="log-refresh">${icon('refresh')}Обновить лог</button>
+        ? `<button class="btn btn--sm btn--danger" data-act="stop-daemon">${esc(t('act.stop'))}</button>`
+        : `<button class="btn btn--sm btn--primary" data-act="start-daemon">${esc(t('act.start'))}</button>`}
+      <button class="btn btn--sm" data-act="open-web" ${state.running ? '' : 'disabled'}>${icon('external')}${esc(t('settings.web'))}</button>
+      <button class="btn btn--sm btn--ghost" data-act="log-refresh">${icon('refresh')}${esc(t('settings.refreshLog'))}</button>
     </div>
-    <div class="log" id="daemon-log">${esc(log ? (stripAnsi(log.text) || 'Лог пуст.') : 'Нажмите «Обновить лог», чтобы прочитать daemon.log.')}</div>
+    <div class="log" id="daemon-log">${esc(log ? (stripAnsi(log.text) || t('settings.logEmpty')) : t('settings.logHint'))}</div>
     <div class="row-meta mono" style="margin-top:8px">${esc(log ? log.path : info.app_data_dir + '\\daemon.log')}</div>
   </section>`;
 
   const about = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('disc')}О программе</div><span class="tag">AGPL-3.0</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('disc')}${esc(t('settings.about'))}</div><span class="tag">AGPL-3.0</span></div>
     <div class="grid grid-2b" style="margin:0;gap:0">
       <div>
-        <div class="kv"><span class="kv-k">Версия</span><span class="kv-v">${esc(info.version)}</span></div>
-        <div class="kv"><span class="kv-k">Платформа</span><span class="kv-v">${esc(info.platform)}</span></div>
+        <div class="kv"><span class="kv-k">${esc(t('kv.version'))}</span><span class="kv-v">${esc(info.version)}</span></div>
+        <div class="kv"><span class="kv-k">${esc(t('kv.platform'))}</span><span class="kv-v">${esc(info.platform)}</span></div>
       </div>
       <div>
-        <div class="kv"><span class="kv-k">Устройство</span><span class="kv-v">${esc(snap.device || '—')}</span></div>
-        <div class="kv"><span class="kv-k">Протокол</span><span class="kv-v">LAN · HLC · Ed25519</span></div>
+        <div class="kv"><span class="kv-k">${esc(t('kv.device'))}</span><span class="kv-v">${esc(snap.device || t('common.dash'))}</span></div>
+        <div class="kv"><span class="kv-k">${esc(t('kv.protocol'))}</span><span class="kv-v">LAN · HLC · Ed25519</span></div>
       </div>
     </div>
-    <p class="view-sub" style="margin-top:14px">Свободное ПО без серверов, аккаунтов и подписок. Ваша музыка остаётся вашей: локальные файлы — источник истины, удаления проходят через хранилище.</p>
+    <p class="view-sub" style="margin-top:14px">${esc(t('settings.aboutNote'))}</p>
+  </section>`;
+
+  const language = `<section class="panel">
+    <div class="panel-head"><div class="panel-title">${icon('sliders')}${esc(t('settings.language'))}</div></div>
+    <div class="settings-actions">
+      <button class="btn btn--sm${I18N.locale === 'ru' ? ' btn--primary' : ''}" data-act="lang" data-lang="ru">Русский</button>
+      <button class="btn btn--sm${I18N.locale === 'en' ? ' btn--primary' : ''}" data-act="lang" data-lang="en">English</button>
+    </div>
   </section>`;
 
   return viewHead(
-    'Пульт',
-    'Настройки',
-    'Клиент — тонкая оболочка над демоном syncthd. Здесь видно, где лежат данные и что происходит внутри.',
-  ) + `<div class="settings-grid">${paths}${daemon}</div><div style="margin-top:18px">${about}</div>`;
+    t('settings.kicker'),
+    t('nav.settings'),
+    t('settings.sub'),
+  ) + `<div class="settings-grid">${paths}${daemon}${language}</div><div style="margin-top:18px">${about}</div>`;
 }
 
 // ------------------------------------------------------------------ первый запуск
@@ -859,29 +796,29 @@ function renderOnboarding() {
 
   return `<div class="onboard">
     <div>
-      <div class="onboard-kicker">SynctMusic · локальная синхронизация</div>
-      <h1 class="onboard-title">Музыка живёт<br>там, где вы её<br><em>оставили</em>.</h1>
-      <p class="onboard-lead">Одна и та же библиотека на телефоне и компьютере. Без аккаунтов, облака и подписок — только ваши файлы и локальная сеть.</p>
+      <div class="onboard-kicker">SynctMusic</div>
+      <h1 class="onboard-title">${esc(t('onboard.title'))}</h1>
+      <p class="onboard-lead">${esc(t('onboard.lead'))}</p>
       <div class="principles">
-        <div class="principle"><span class="num">01</span><div><b>Файлы не переезжают</b>SynctMusic читает папку на месте и не меняет структуру коллекции.</div></div>
-        <div class="principle"><span class="num">02</span><div><b>Удаления обратимы</b>Копия живёт в хранилище 30 дней, решение всегда за вами.</div></div>
-        <div class="principle"><span class="num">03</span><div><b>Обложки и теги — вместе с файлами</b>Правки из AIMP и Poweramp доезжают до второго устройства.</div></div>
+        <div class="principle"><span class="num">01</span><div><b>${esc(t('onboard.p1.title'))}</b>${esc(t('onboard.p1.text'))}</div></div>
+        <div class="principle"><span class="num">02</span><div><b>${esc(t('onboard.p2.title'))}</b>${esc(t('onboard.p2.text'))}</div></div>
+        <div class="principle"><span class="num">03</span><div><b>${esc(t('onboard.p3.title'))}</b>${esc(t('onboard.p3.text'))}</div></div>
       </div>
     </div>
     <div class="setup-card">
-      <h2>Начнём с папки</h2>
-      <p class="hint">Выберите каталог, где уже лежит музыка. Первый проход считает хеши и ничего не записывает в файлы.</p>
-      <div class="picked ${root ? '' : 'is-empty'}">${icon('folder')}<span>${esc(root || 'Папка не выбрана')}</span></div>
-      <button class="btn" data-act="pick-root" ${busy ? 'disabled' : ''}>Выбрать папку</button>
+      <h2>${esc(t('onboard.card'))}</h2>
+      <p class="hint">${esc(t('onboard.hint'))}</p>
+      <div class="picked ${root ? '' : 'is-empty'}">${icon('folder')}<span>${esc(root || t('onboard.noFolder'))}</span></div>
+      <button class="btn" data-act="pick-root" ${busy ? 'disabled' : ''}>${esc(t('onboard.pick'))}</button>
 
-      <div class="picked" style="margin-top:12px">${icon('box')}<span>${esc(dataDir || 'Папка данных по умолчанию')}</span></div>
-      <button class="btn btn--ghost btn--sm" data-act="pick-data" ${busy ? 'disabled' : ''}>Изменить служебную папку</button>
+      <div class="picked" style="margin-top:12px">${icon('box')}<span>${esc(dataDir || t('onboard.dataDefault'))}</span></div>
+      <button class="btn btn--ghost btn--sm" data-act="pick-data" ${busy ? 'disabled' : ''}>${esc(t('onboard.pickData'))}</button>
 
       <div class="setup-foot">
-        <div class="setup-note">Здесь будут индекс и хранилище удалённого. Музыку не трогаем.</div>
-        <button class="btn btn--primary" data-act="init" ${!root || busy ? 'disabled' : ''}>${busy ? 'Индексация…' : 'Начать'}</button>
+ 
+        <button class="btn btn--primary" data-act="init" ${!root || busy ? 'disabled' : ''}>${esc(busy ? t('onboard.indexing') : t('onboard.start'))}</button>
       </div>
-      ${busy ? `<div class="setup-progress"><span class="spinner"></span>Читаем файлы и считаем хеши. Большая библиотека может занять несколько минут.</div>` : `<div class="setup-progress">${icon('phone')}<span>Телефон подключите следующим шагом — код появится в разделе «Сопряжение».</span></div>`}
+      ${busy ? `<div class="setup-progress"><span class="spinner"></span>${esc(t('onboard.busy'))}</div>` : `<div class="setup-progress">${icon('phone')}<span>${esc(t('onboard.footer'))}</span></div>`}
     </div>
   </div>`;
 }
@@ -940,8 +877,8 @@ function renderModal() {
     <p>${esc(modal.text)}</p>
     ${modal.path ? `<div class="modal-path">${esc(modal.path)}</div>` : ''}
     <div class="modal-actions">
-      <button class="btn btn--ghost" data-modal="cancel">Отмена</button>
-      <button class="btn ${modal.danger ? 'btn--danger' : 'btn--primary'}" data-modal="confirm">${esc(modal.label || 'Подтвердить')}</button>
+      <button class="btn btn--ghost" data-modal="cancel">${esc(t('common.cancel'))}</button>
+      <button class="btn ${modal.danger ? 'btn--danger' : 'btn--primary'}" data-modal="confirm">${esc(modal.label || t('common.confirm'))}</button>
     </div>
   </div>`;
 }
@@ -1021,13 +958,13 @@ async function loadLog(force = false) {
   }
 }
 
-async function runBusy(task, fallback = 'Готово') {
+async function runBusy(task, fallback = null) {
   state.busy = true;
   render();
   try {
     const message = await task();
     await refreshStatus();
-    toast(message || fallback);
+    toast(message || fallback || t('toast.done'));
   } catch (error) {
     toast(errText(error), 'bad');
   } finally {
@@ -1038,7 +975,8 @@ async function runBusy(task, fallback = 'Готово') {
 
 const daemonCommand = (name, payload, fallback) => runBusy(async () => {
   const result = await invoke('daemon_action', { name, payload: payload || null });
-  return (result && result.message) || fallback;
+  // Сообщения службы — на русском; в английском интерфейсе берём свой текст.
+  return (result && result.message && I18N.locale === 'ru') ? result.message : fallback;
 }, fallback);
 
 async function startAndWait() {
@@ -1048,7 +986,7 @@ async function startAndWait() {
     await refreshStatus();
     if (state.running) return started;
   }
-  throw new Error('демон не ответил за 5 секунд — посмотрите лог в настройках');
+  throw new Error(t('toast.serviceNoAnswer'));
 }
 
 function navigate(view) {
@@ -1078,10 +1016,10 @@ async function initializeLibrary() {
     state.view = 'overview';
     state.lastHtml = '';
     render();
-    toast(`Библиотека проиндексирована: ${num(result.files)} ${plural(result.files, 'файл', 'файла', 'файлов')}`);
+    toast(t('toast.indexed', { n: num(result.files), word: plural('word.files', result.files) }));
     try {
       await startAndWait();
-      toast('Демон запущен, папка под наблюдением');
+      toast(t('toast.serviceStarted'));
     } catch (error) {
       toast(errText(error), 'warn');
     }
@@ -1096,14 +1034,14 @@ async function initializeLibrary() {
 async function changeLibraryFlow() {
   if (state.running) {
     openConfirm({
-      title: 'Остановить демон?',
-      text: 'Чтобы сменить папку, демон нужно остановить — он держит библиотеку открытой. Текущая папка и журнал останутся на месте.',
-      label: 'Остановить и выбрать',
+      title: t('modal.changeRoot.title'),
+      text: t('modal.changeRoot.text'),
+      label: t('modal.changeRoot.label'),
       danger: false,
       run: async () => {
         await runBusy(async () => {
           const result = await invoke('stop_daemon');
-          return (result && result.message) || 'Демон остановлен';
+          return (result && result.message) || t('toast.serviceStopped');
         });
         await pickNewLibrary();
       },
@@ -1114,17 +1052,17 @@ async function changeLibraryFlow() {
 }
 
 async function pickNewLibrary() {
-  const folder = await invoke('pick_folder', { title: 'Новая папка с музыкой' });
+  const folder = await invoke('pick_folder', { title: t('dialog.pickNewMusic') });
   if (!folder) return;
   await runBusy(async () => {
     await invoke('change_library', { folder });
     await refreshInfo();
     state.lastHtml = '';
-    return 'Библиотека переключена';
+    return t('toast.librarySwitched');
   });
   try {
     await startAndWait();
-    toast('Демон запущен с новой папкой');
+    toast(t('toast.serviceStarted'));
   } catch (error) {
     toast(errText(error), 'warn');
   }
@@ -1134,64 +1072,64 @@ async function handleAction(action, dataset) {
   const path = dataset.path;
   switch (action) {
     case 'sync':
-      await daemonCommand('sync', null, 'Синхронизация завершена');
+      await daemonCommand('sync', null, t('toast.syncDone'));
       break;
     case 'scan':
-      await daemonCommand('scan', null, 'Сканирование завершено');
+      await daemonCommand('scan', null, t('toast.scanDone'));
       break;
     case 'pause':
-      await daemonCommand('pause', { paused: true }, 'Пауза включена');
+      await daemonCommand('pause', { paused: true }, t('toast.paused'));
       break;
     case 'resume':
-      await daemonCommand('pause', { paused: false }, 'Синхронизация возобновлена');
+      await daemonCommand('pause', { paused: false }, t('toast.resumed'));
       break;
     case 'disk-check':
-      await daemonCommand('disk_check', null, 'Проверка диска завершена');
+      await daemonCommand('disk_check', null, t('toast.diskChecked'));
       break;
     case 'gc':
       openConfirm({
-        title: 'Очистить хранилище?',
-        text: 'Будут удалены только копии, срок хранения которых истёк. Недавние удаления останутся доступными.',
-        label: 'Очистить',
+        title: t('modal.gc.title'),
+        text: t('modal.gc.text'),
+        label: t('modal.gc.label'),
         danger: true,
-        run: () => daemonCommand('gc', null, 'Хранилище очищено'),
+        run: () => daemonCommand('gc', null, t('toast.vaultCleaned')),
       });
       break;
     case 'pending-only':
-      await daemonCommand('pending_resolve', { path, action: 'only_here' }, 'Файл останется только здесь');
+      await daemonCommand('pending_resolve', { path, action: 'only_here' }, t('toast.keptHere'));
       break;
     case 'pending-forget':
-      await daemonCommand('pending_forget', { path }, 'Запись убрана из очереди');
+      await daemonCommand('pending_forget', { path }, t('toast.dismissed'));
       break;
     case 'pending-everywhere':
       openConfirm({
-        title: 'Удалить на всех устройствах?',
-        text: 'Файл уже исчез с этого диска. Подтвердите удаление везде — копия останется в хранилище 30 дней и её можно будет вернуть.',
+        title: t('modal.delete.title'),
+        text: t('modal.delete.text'),
         path,
-        label: 'Удалить везде',
+        label: t('modal.delete.label'),
         danger: true,
-        run: () => daemonCommand('pending_resolve', { path, action: 'delete_everywhere' }, 'Удаление подтверждено'),
+        run: () => daemonCommand('pending_resolve', { path, action: 'delete_everywhere' }, t('toast.deleteConfirmed')),
       });
       break;
     case 'restore':
-      await daemonCommand('restore', { path }, 'Файл восстановлен');
+      await daemonCommand('restore', { path }, t('toast.restored'));
       break;
     case 'start-daemon':
       await runBusy(async () => {
         const result = await startAndWait();
-        return (result && result.started) ? 'Демон запущен' : ((result && result.message) || 'Демон уже работает');
+        return (result && result.started) ? t('toast.serviceStarted') : ((result && result.message) || t('toast.serviceAlready'));
       });
       break;
     case 'stop-daemon':
       openConfirm({
-        title: 'Остановить демон?',
-        text: 'Наблюдение за папкой и синхронизация прекратятся, пока вы снова не запустите SynctMusic. Файлы не пострадают.',
-        label: 'Остановить',
+        title: t('modal.stop.title'),
+        text: t('modal.stop.text'),
+        label: t('act.stop'),
         danger: true,
         run: async () => {
           await runBusy(async () => {
             const result = await invoke('stop_daemon');
-            return (result && result.message) || 'Демон остановлен';
+            return (result && result.message) || t('toast.serviceStopped');
           });
         },
       });
@@ -1200,7 +1138,7 @@ async function handleAction(action, dataset) {
       state.pair = null;
       await loadPair(true);
       render();
-      if (!state.pairError) toast('Код обновлён');
+      if (!state.pairError) toast(t('toast.codeUpdated'));
       break;
     case 'copy-code':
       if (state.pair) await copyText(state.pair.code);
@@ -1210,6 +1148,9 @@ async function handleAction(action, dataset) {
       if (snap.device) await copyText(snap.device);
       break;
     }
+    case 'lang':
+      I18N.setLocale(dataset.lang);
+      break;
     case 'open-web':
       await invoke('open_url', { url: 'http://127.0.0.1:47889' }).catch((error) => toast(errText(error), 'bad'));
       break;
@@ -1236,7 +1177,7 @@ async function handleAction(action, dataset) {
       await changeLibraryFlow();
       break;
     case 'pick-root': {
-      const folder = await invoke('pick_folder', { title: 'Папка с музыкой' });
+      const folder = await invoke('pick_folder', { title: t('dialog.pickMusic') });
       if (folder) {
         state.onboarding.root = folder;
         render();
@@ -1318,7 +1259,7 @@ document.addEventListener('submit', async (event) => {
   const code = String(data.get('code') || '').trim();
   if (!code) return;
   form.reset();
-  await daemonCommand('pair', { code }, 'Сопряжение запущено');
+  await daemonCommand('pair', { code }, t('toast.paired'));
 });
 
 document.addEventListener('keydown', (event) => {
@@ -1335,8 +1276,9 @@ async function poll() {
 
 async function boot() {
   if (state.started) return;
+  I18N.apply();
   if (!hasBridge()) {
-    $('#view').innerHTML = `<section class="panel">${emptyState('alert', 'Нет доступа к ядру Tauri', 'Запустите приложение через собранный бинарник SynctMusic, а не как обычную веб-страницу.')}</section>`;
+    $('#view').innerHTML = `<section class="panel">${emptyState('alert', t('err.bridge'), t('err.bridgeText'))}</section>`;
     return;
   }
   state.started = true;
@@ -1344,7 +1286,7 @@ async function boot() {
   try {
     await refreshInfo();
   } catch (error) {
-    $('#view').innerHTML = `<section class="panel">${emptyState('alert', 'Не удалось прочитать настройки', errText(error))}</section>`;
+    $('#view').innerHTML = `<section class="panel">${emptyState('alert', t('err.settings'), errText(error))}</section>`;
     return;
   }
 
@@ -1357,7 +1299,7 @@ async function boot() {
     try {
       await startAndWait();
     } catch {
-      // Ничего страшного: покажем состояние «демон остановлен» и кнопку запуска.
+      // Ничего страшного: покажем состояние «служба остановлена» и кнопку запуска.
     }
   }
 
@@ -1369,5 +1311,10 @@ async function boot() {
 // Небольшой внутренний хук: через него удобно проверять состояние и
 // переключать разделы при отладке (в том числе из scripts/).
 window.__syncth = { state, boot, render, navigate, refreshStatus, handleAction };
+
+I18N.onChange(() => {
+  state.lastHtml = '';
+  render();
+});
 
 boot();
