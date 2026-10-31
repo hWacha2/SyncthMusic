@@ -67,29 +67,45 @@ Syncthing синхронизирует **файлы**. Музыкальная б
 - **Собственного редактора тегов.** Правишь в AIMP/Poweramp — мы синхронизируем
   изменённый файл. Пакетные правки («год из имени папки») — позже.
 
-## Быстрый старт (Phase 0, CLI без UI)
+## Быстрый старт (CLI без UI)
 
 ```powershell
 cargo build --release
 
-# устройство A
+# устройство A (ПК)
 .\target\release\syncth.exe --data-dir .\data-a init --root "F:\Music"
 .\target\release\syncth.exe --data-dir .\data-a scan
-.\target\release\syncth.exe --data-dir .\data-a status
+.\target\release\syncth.exe --data-dir .\data-a token
 
-# устройство B (на другой машине — свой data-dir и свой корень)
+# устройство B (телефон/ноутбук, в той же Wi-Fi)
 .\target\release\syncth.exe --data-dir .\data-b init --root "D:\Music"
-.\target\release\syncth.exe --data-dir .\data-b scan
 
-# обмен манифестом через любую папку (Syncthing, Nextcloud, флешка)
-.\target\release\syncth.exe --data-dir .\data-a export --dir .\pipe
-.\target\release\syncth.exe --data-dir .\data-b import --dir .\pipe
-.\target\release\syncth.exe --data-dir .\data-b export --dir .\pipe
-.\target\release\syncth.exe --data-dir .\data-a import --dir .\pipe
+# B слушает, A подключается (или наоборот — сторона не важна)
+.\target\release\syncth.exe --data-dir .\data-b serve --bind 0.0.0.0:47890 --token <токен>
+.\target\release\syncth.exe --data-dir .\data-a sync --addr 192.168.1.42:47890 --token <токен>
 ```
 
-Что уже работает: скан, хеширование, дедуп по содержимому, обмен операциями,
-восстановление `mtime`, детект пропавших файлов **без** их удаления.
+`sync` сам сканирует перед обменом. Устройства можно найти без знания IP:
+
+```powershell
+.\target\release\syncth.exe --data-dir .\data-a discover
+```
+
+Удаления не уезжают сами:
+
+```powershell
+.\target\release\syncth.exe --data-dir .\data-b scan
+.\target\release\syncth.exe --data-dir .\data-b pending list
+.\target\release\syncth.exe --data-dir .\data-b pending resolve "Album/01.flac" --delete-everywhere
+.\target\release\syncth.exe --data-dir .\data-b pending resolve "Album/02.flac" --only-here
+```
+
+Если LAN недоступна, манифест можно возить через любую папку
+(Syncthing, Nextcloud, флешка): `export --dir` / `import --dir`.
+
+Что уже работает: скан, BLAKE3, дедуп, передача файлов по LAN, восстановление
+`mtime`, очередь удалений с решением по блобу, конфликтные копии, селективная
+синхронизация («только здесь»), обмен через каталог.
 
 Проверка с нуля:
 
@@ -98,7 +114,10 @@ cargo test --workspace
 powershell -ExecutionPolicy Bypass -File scripts\demo.ps1
 ```
 
-Чего ещё нет: передачи самих файлов (Phase 0.1), LAN, UI.
+Чего ещё нет: UI, снапшотов лога, подписей, Android-приложения.
+
+Все пограничные случаи (удаление + перенос, одновременная правка, первый контакт,
+битый блоб, занятый файл) разобраны в [docs/sync-situations.md](docs/sync-situations.md).
 
 ## Лицензия
 

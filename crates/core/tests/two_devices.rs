@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use syncth_core::{pipe, scan, Hlc, Replica};
+use syncth_core::{pipe, scan, Replica};
 use tempfile::TempDir;
 
 struct Ctx {
@@ -59,19 +59,17 @@ fn two_devices_converge_and_deletions_stay_local() {
 
     let mut a = Replica::open(&data_a, "dev-a").unwrap();
     a.set_root(&ctx.root_a).unwrap();
-    let mut clock_a = Hlc::default();
-    let report = scan::scan(&ctx.root_a, &mut a, &mut clock_a).unwrap();
+    let report = scan::scan(&ctx.root_a, &mut a).unwrap();
     assert_eq!(report.added, 2);
     assert_eq!(a.live_entries().unwrap().len(), 2);
 
     let mut b = Replica::open(&data_b, "dev-b").unwrap();
     b.set_root(&ctx.root_b).unwrap();
-    let mut clock_b = Hlc::default();
 
     // Манифест приезжает раньше файлов: «ещё не скачано» ≠ «удалено».
     sync_via_pipe(&mut a, &mut b, &ctx.pipe_dir);
     assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
-    let empty_scan = scan::scan(&ctx.root_b, &mut b, &mut clock_b).unwrap();
+    let empty_scan = scan::scan(&ctx.root_b, &mut b).unwrap();
     assert_eq!(
         empty_scan.missing.len(),
         0,
@@ -81,7 +79,7 @@ fn two_devices_converge_and_deletions_stay_local() {
 
     // Файлы доехали.
     copy_tree(&ctx.root_a, &ctx.root_b);
-    scan::scan(&ctx.root_b, &mut b, &mut clock_b).unwrap();
+    scan::scan(&ctx.root_b, &mut b).unwrap();
     sync_via_pipe(&mut a, &mut b, &ctx.pipe_dir);
 
     assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
@@ -100,7 +98,7 @@ fn two_devices_converge_and_deletions_stay_local() {
         b"second-track-bytes-edited",
     )
     .unwrap();
-    let changed = scan::scan(&ctx.root_b, &mut b, &mut clock_b).unwrap();
+    let changed = scan::scan(&ctx.root_b, &mut b).unwrap();
     assert_eq!(changed.changed, 1);
 
     sync_via_pipe(&mut a, &mut b, &ctx.pipe_dir);
@@ -113,7 +111,7 @@ fn two_devices_converge_and_deletions_stay_local() {
     // Удаление на B: не создаёт операций и не трогает A.
     let ops_before = b.op_count().unwrap();
     fs::remove_file(ctx.root_b.join("Album/01.flac")).unwrap();
-    let report = scan::scan(&ctx.root_b, &mut b, &mut clock_b).unwrap();
+    let report = scan::scan(&ctx.root_b, &mut b).unwrap();
     assert_eq!(report.missing.len(), 1);
     assert_eq!(
         b.op_count().unwrap(),
@@ -131,13 +129,12 @@ fn two_devices_converge_and_deletions_stay_local() {
 fn rescan_is_cheap_and_stable() {
     let ctx = setup();
     let mut a = Replica::open(&ctx.tmp.path().join("data"), "dev-a").unwrap();
-    let mut clock = Hlc::default();
 
-    let first = scan::scan(&ctx.root_a, &mut a, &mut clock).unwrap();
+    let first = scan::scan(&ctx.root_a, &mut a).unwrap();
     assert_eq!(first.added, 2);
     let ops_after_first = a.op_count().unwrap();
 
-    let second = scan::scan(&ctx.root_a, &mut a, &mut clock).unwrap();
+    let second = scan::scan(&ctx.root_a, &mut a).unwrap();
     assert_eq!(second.unchanged, 2);
     assert_eq!(second.ops_emitted, 0);
     assert_eq!(

@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
-use syncth_core::{pipe, scan, Hlc, Replica};
+use std::time::Duration;
+use syncth_core::{net, pipe, resolve, scan, Action, Replica};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +46,60 @@ enum Command {
     },
     /// Проверить, что файлы на диске соответствуют хешам в БД.
     Verify,
+    /// Ожидающие удаления: решения принимает человек.
+    Pending {
+        #[command(subcommand)]
+        action: PendingCmd,
+    },
+    /// Не держать файл на этом устройстве (остаётся в общей библиотеке).
+    Ignore { path: String },
+    /// Снова держать файл здесь (докачается при обмене).
+    Unignore { path: String },
+    /// Показать или перевыпустить общий токен библиотеки.
+    Token {
+        /// Выпустить новый токен (придётся обновить на всех устройствах).
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Слушать LAN и обслуживать подключения.
+    Serve {
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Синхронизироваться с устройством по адресу.
+    Sync {
+        #[arg(long)]
+        addr: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Найти устройства в локальной сети.
+    Discover {
+        #[arg(long, default_value_t = 2)]
+        seconds: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PendingCmd {
+    /// Список ожидающих удалений.
+    List,
+    /// Решить судьбу одного удаления.
+    Resolve {
+        path: String,
+        /// Удалить трек из библиотеки на всех устройствах (необратимо).
+        #[arg(long, conflicts_with = "only_here")]
+        delete_everywhere: bool,
+        /// Убрать только с этого устройства, в общей библиотеке оставить.
+        #[arg(long)]
+        only_here: bool,
+    },
+    /// Вернуть файл на это устройство (докачается при обмене).
+    Restore { path: String },
+    /// Снять ожидания, ничего не удаляя (например, файлы вернули вручную).
+    Forget { path: Option<String> },
 }
 
 fn main() {
@@ -70,7 +125,6 @@ fn run() -> Result<()> {
 
     let mut replica = Replica::open(&cli.data_dir, &dev)?;
     let dev = replica.device_id().to_string();
-    let mut clock = Hlc::default();
 
     match cli.command {
         Command::Init { root } => {
@@ -83,17 +137,21 @@ fn run() -> Result<()> {
             }
             replica.set_root(&root)?;
             replica.set_meta("device_id", &dev)?;
+            let token = replica.ensure_token()?;
             println!("инициализировано");
             println!("  устройство: {}", dev);
             println!("  корень:     {}", root.display());
             println!("  данные:     {}", absolute(&cli.data_dir)?.display());
+            println!("  токен:      {token}");
+            println!();
+            println!("Тот же токен нужен второму устройству: syncth token --rotate");
         }
 
         Command::Scan => {
             let root = replica
                 .root()?
                 .context("сначала выполните: syncth init --root <путь>")?;
-            let report = scan::scan(&root, &mut replica, &mut clock)?;
+            let report = scan::scan(&root, &mut replica)?;
             println!("скан завершён");
             println!("  новых:      {}", report.added);
             println!("  изменённых: {}", report.changed);
@@ -110,7 +168,9 @@ fn run() -> Result<()> {
                     println!("  ... и ещё {}", report.missing.len() - 20);
                 }
                 println!();
-                println!("Удаление НЕ применено. Решение — за вами (см. docs §5.5).");
+                println!("Удаление НЕ применено. Решение — за вами:");
+                println!("  syncth pending list");
+                println!("  syncth pending resolve \"<путь>\" --delete-everywhere | --only-here");
             }
         }
 
@@ -122,6 +182,7 @@ fn run() -> Result<()> {
             }
             println!("операций:   {}", replica.op_count()?);
             println!("файлов:     {}", replica.live_entries()?.len());
+            println!("здесь:      {}", replica.local_entries()?.len());
             println!("размер:     {}", human(replica.total_live_bytes()?));
             println!("state:      {}", replica.state_hash()?);
             let pending = replica.pending_deletes()?;
@@ -133,6 +194,13 @@ fn run() -> Result<()> {
                     println!("  - {}", p.path);
                 }
             }
+            let ignored = replica.ignored_paths()?;
+            if !ignored.is_empty() {
+                println!(
+                    "исключено:  {} (есть в библиотеке, нет здесь)",
+                    ignored.len()
+                );
+            }
         }
 
         Command::Export { dir } => {
@@ -143,6 +211,15 @@ fn run() -> Result<()> {
         Command::Import { dir } => {
             let n = pipe::import_ops(&mut replica, &dir)?;
             println!("применено операций: {n}");
+            if let Some(root) = replica.root()? {
+                let saved = resolve::prune_deleted_files(&mut replica, &root)?;
+                if !saved.is_empty() {
+                    println!("сохранено конфликтных копий: {}", saved.len());
+                    for p in saved {
+                        println!("  + {p}");
+                    }
+                }
+            }
             println!("state: {}", replica.state_hash()?);
         }
 
@@ -152,7 +229,10 @@ fn run() -> Result<()> {
             let mut bad = 0usize;
             let mut missing = 0usize;
             for e in replica.live_entries()? {
-                let abs = root.join(e.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                if replica.is_ignored(&e.path)? {
+                    continue;
+                }
+                let abs = resolve::disk_path(&root, &e.path);
                 if !abs.is_file() {
                     missing += 1;
                     println!("нет файла: {}", e.path);
@@ -175,8 +255,162 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
         }
+
+        Command::Pending { action } => {
+            match action {
+                PendingCmd::List => {
+                    let pending = replica.pending_deletes()?;
+                    if pending.is_empty() {
+                        println!("нет ожидающих удалений");
+                    } else {
+                        println!("{} ожидает решения:", pending.len());
+                        for p in pending {
+                            let copies = replica.live_paths_by_blob(&p.blob)?;
+                            println!("  {}", p.path);
+                            if copies.len() > 1 {
+                                println!("    тот же трек ещё здесь:");
+                                for c in copies.iter().filter(|c| **c != p.path) {
+                                    println!("      {c}");
+                                }
+                            }
+                        }
+                        println!();
+                        println!("Решения:");
+                        println!("  syncth pending resolve \"<путь>\" --delete-everywhere");
+                        println!("  syncth pending resolve \"<путь>\" --only-here");
+                    }
+                }
+                PendingCmd::Resolve {
+                    path,
+                    delete_everywhere,
+                    only_here,
+                } => {
+                    let action = match (delete_everywhere, only_here) {
+                        (true, false) => Action::DeleteEverywhere,
+                        (false, true) => Action::OnlyHere,
+                        _ => bail!("укажите --delete-everywhere или --only-here"),
+                    };
+                    let out = resolve::resolve(&mut replica, &path, action)?;
+                    match action {
+                        Action::DeleteEverywhere => {
+                            println!("удалено из библиотеки: {}", out.deleted_paths.len());
+                            for p in &out.deleted_paths {
+                                println!("  - {p}");
+                            }
+                            println!("файлов удалено здесь: {}", out.files_removed);
+                            println!("операций: {}", out.ops_emitted);
+                            println!("Удаление уедет на другие устройства при следующем обмене.");
+                        }
+                        Action::OnlyHere => {
+                            println!("убрано только с этого устройства: {path}");
+                            println!("В общей библиотеке файл остался, другие устройства его не потеряют.");
+                            println!("Вернуть: syncth pending restore \"{path}\"");
+                        }
+                    }
+                    if !out.failed.is_empty() {
+                        println!("не удалось удалить:");
+                        for (p, e) in out.failed {
+                            println!("  - {p}: {e}");
+                        }
+                        std::process::exit(2);
+                    }
+                }
+                PendingCmd::Restore { path } => {
+                    resolve::restore(&mut replica, &path)?;
+                    println!("«{path}» снова в локальной библиотеке; файл докачается при обмене.");
+                }
+                PendingCmd::Forget { path } => match path {
+                    Some(p) => {
+                        replica.clear_pending_delete(&p)?;
+                        println!("ожидание для {p} снято (файл не удалён)");
+                    }
+                    None => {
+                        let n = replica.pending_deletes()?.len();
+                        for p in replica.pending_deletes()? {
+                            replica.clear_pending_delete(&p.path)?;
+                        }
+                        println!("снято ожиданий: {n} (ничего не удалено)");
+                    }
+                },
+            }
+        }
+
+        Command::Ignore { path } => {
+            ensure_entry(&replica, &path)?;
+            replica.set_ignored(&path, true)?;
+            replica.clear_pending_delete(&path)?;
+            println!("«{path}» исключён на этом устройстве; в общей библиотеке остался.");
+        }
+        Command::Unignore { path } => {
+            ensure_entry(&replica, &path)?;
+            replica.set_ignored(&path, false)?;
+            replica.mark_absent(&path)?;
+            println!("«{path}» снова ожидается здесь; докачается при обмене.");
+        }
+
+        Command::Token { rotate } => {
+            let token = if rotate {
+                replica.rotate_token()?
+            } else {
+                replica.ensure_token()?
+            };
+            println!("{token}");
+        }
+
+        Command::Serve { bind, token } => {
+            let token = match token {
+                Some(t) => t,
+                None => replica.ensure_token()?,
+            };
+            println!("токен: syncth token");
+            net::serve(&mut replica, &bind, &token, |_stats| {})?;
+        }
+
+        Command::Sync { addr, token } => {
+            let token = token.or_else(|| std::env::var("SYNCTH_TOKEN").ok());
+            let token = match token {
+                Some(t) => t,
+                None => replica.ensure_token()?,
+            };
+            // Свежий скан перед обменом: без него телефон отправит устаревший манифест.
+            if let Some(root) = replica.root()? {
+                let report = scan::scan(&root, &mut replica)?;
+                if report.ops_emitted > 0 {
+                    println!("перед синхронизацией: +{} изменений", report.ops_emitted);
+                }
+            }
+            let stats = net::sync_with_peer(&mut replica, &addr, &token)?;
+            println!("синхронизировано с {addr}");
+            println!("  {}", stats.summary());
+            println!("  state: {}", replica.state_hash()?);
+            if !replica.pending_deletes()?.is_empty() {
+                println!();
+                println!(
+                    "ожидает решения об удалении: {} — syncth pending list",
+                    replica.pending_deletes()?.len()
+                );
+            }
+        }
+
+        Command::Discover { seconds } => {
+            let found = net::discover(Duration::from_secs(seconds))?;
+            if found.is_empty() {
+                println!("никого не нашли (оба устройства в одной сети? сервер запущен?)");
+            } else {
+                for (dev, addr) in found {
+                    println!("{dev}\t{addr}");
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn ensure_entry(replica: &Replica, path: &str) -> Result<()> {
+    if replica.entry(path)?.is_none() {
+        bail!("путь не найден в библиотеке: {path}");
+    }
     Ok(())
 }
 

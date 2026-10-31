@@ -731,6 +731,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "filetime",
+ "getrandom",
  "proptest",
  "rusqlite",
  "serde",

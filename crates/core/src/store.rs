@@ -39,7 +39,14 @@ CREATE TABLE IF NOT EXISTS entries (
     dev         TEXT NOT NULL,
     -- Локальное (не реплицируемое) знание: файл реально лежит здесь.
     -- Нужно, чтобы «ещё не скачано» не путалось с «удалено».
-    local_present INTEGER NOT NULL DEFAULT 0
+    local_present INTEGER NOT NULL DEFAULT 0,
+    -- Локальное исключение: «не хочу это здесь, но в общей библиотеке пусть
+    -- останется». Не реплицируется, не влияет на state_hash.
+    local_ignored INTEGER NOT NULL DEFAULT 0,
+    -- Последний блоб, про который это устройство знает, что он согласован
+    -- с пиром. Нужен, чтобы отличить последовательную правку тега от
+    -- одновременной правки на двух устройствах. Локальное, не реплицируется.
+    synced_blob TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_blob ON entries(blob);
@@ -111,7 +118,20 @@ impl Replica {
 
     fn migrate(&mut self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
-        self.set_meta("schema_version", "1")?;
+        // БД, созданные до появления локальных исключений.
+        if !self.has_column("entries", "local_ignored")? {
+            self.conn.execute(
+                "ALTER TABLE entries ADD COLUMN local_ignored INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !self.has_column("entries", "synced_blob")? {
+            self.conn.execute(
+                "ALTER TABLE entries ADD COLUMN synced_blob TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        self.set_meta("schema_version", "3")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
                 // Идентичность устройства стабильна: она важнее аргумента CLI.
@@ -128,6 +148,18 @@ impl Replica {
 
     pub fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // ---------------------------------------------------------------- meta
@@ -158,12 +190,65 @@ impl Replica {
         Ok(self.get_meta("root")?.map(PathBuf::from))
     }
 
+    // ---------------------------------------------------------------- token
+
+    /// Общий секрет библиотеки. Хранится локально, передаётся второму
+    /// устройству один раз при сопряжении.
+    pub fn ensure_token(&self) -> Result<String> {
+        match self.get_meta("token")? {
+            Some(t) if !t.is_empty() => Ok(t),
+            _ => self.rotate_token(),
+        }
+    }
+
+    pub fn rotate_token(&self) -> Result<String> {
+        let mut buf = [0u8; 32];
+        getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("нет источника случайности: {e}"))?;
+        let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        self.set_meta("token", &token)?;
+        Ok(token)
+    }
+
+    // ---------------------------------------------------------------- clock
+
+    /// Часы реплики. Хранятся в БД, иначе перезапуск процесса с «уехавшими
+    /// назад» системными часами выпустил бы операции со старым HLC.
+    fn load_hlc(&self) -> Result<Hlc> {
+        Ok(match self.get_meta("hlc")? {
+            Some(s) => match s.split_once('.') {
+                Some((ms, c)) => Hlc::new(ms.parse().unwrap_or(0), c.parse().unwrap_or(0)),
+                None => Hlc::default(),
+            },
+            None => Hlc::default(),
+        })
+    }
+
+    fn save_hlc(&self, hlc: &Hlc) -> Result<()> {
+        self.set_meta("hlc", &format!("{}.{}", hlc.ms, hlc.counter))
+    }
+
+    /// Следующая метка для локальной операции.
+    pub fn next_hlc(&mut self) -> Result<Hlc> {
+        let mut clock = self.load_hlc()?;
+        let ticked = clock.tick();
+        self.save_hlc(&ticked)?;
+        Ok(ticked)
+    }
+
+    /// Подтянуть часы после чужой операции: причинность важнее настенных часов.
+    pub fn observe_hlc(&mut self, remote: Hlc) -> Result<()> {
+        let mut clock = self.load_hlc()?;
+        clock.observe(remote);
+        self.save_hlc(&clock)
+    }
+
     // ---------------------------------------------------------------- apply
 
     /// Применяет операцию. Возвращает `true`, если состояние изменилось.
     /// Идемпотентно: повторное применение того же `id` — no-op.
     pub fn apply(&mut self, op: &Op) -> Result<bool> {
         anyhow::ensure!(op.is_intact(), "операция повреждена: {}", op.id);
+        self.observe_hlc(op.hlc)?;
 
         let tx = self.conn.transaction()?;
         let known: Option<i64> = tx
@@ -317,6 +402,83 @@ impl Replica {
             params![path],
         )?;
         Ok(())
+    }
+
+    /// Локальное исключение: запись остаётся в общей библиотеке, но на этом
+    /// устройстве её не хотят видеть и не будут докачивать.
+    pub fn set_ignored(&self, path: &str, ignored: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET local_ignored = ?2, local_present = 0 WHERE path = ?1",
+            params![path, ignored as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_ignored(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT local_ignored FROM entries WHERE path = ?1",
+                params![path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v != 0)
+            .unwrap_or(false))
+    }
+
+    /// Последнее состояние, про которое известно, что оно есть у пира.
+    /// Пустая строка — базы ещё нет (файл никогда не синхронизировался).
+    pub fn synced_blob(&self, path: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT synced_blob FROM entries WHERE path = ?1",
+                params![path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Вызывается в конце успешного сеанса: обе стороны обменялись операциями
+    /// и всеми нужными блобами, значит текущее содержимое — согласованная база.
+    pub fn confirm_synced(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE entries SET synced_blob = blob
+             WHERE deleted = 0 AND local_present = 1 AND synced_blob <> blob",
+            [],
+        )?)
+    }
+
+    pub fn ignored_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM entries WHERE local_ignored = 1 ORDER BY path")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Все живые пути, ссылающиеся на блоб. Нужно, чтобы «удалить навсегда»
+    /// не оставило копию под другим именем после переноса.
+    pub fn live_paths_by_blob(&self, blob: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM entries WHERE blob = ?1 AND deleted = 0 ORDER BY path")?;
+        let rows = stmt.query_map(params![blob], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Пары (путь, блоб) для подтверждённых удалений, которые ещё лежат на
+    /// диске. Блоб здесь не нормализуется: по нему проверяется локальная копия.
+    pub fn deleted_present(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, blob FROM entries
+             WHERE deleted = 1 AND local_present = 1 AND blob <> ''
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn entry(&self, path: &str) -> Result<Option<EntryRow>> {
@@ -473,10 +635,13 @@ fn delete_entry(tx: &Transaction<'_>, op: &Op, path: &str) -> Result<bool> {
         return Ok(false);
     }
     tx.execute(
-        "INSERT INTO entries(path, blob, size, mtime_ns, added_at, deleted, hlc_ms, hlc_counter, dev)
-         VALUES (?1, '', 0, 0, 0, 1, ?2, ?3, ?4)
+        "INSERT INTO entries(path, blob, size, mtime_ns, added_at, deleted, hlc_ms, hlc_counter, dev, local_present, local_ignored)
+         VALUES (?1, '', 0, 0, 0, 1, ?2, ?3, ?4, 0, 0)
          ON CONFLICT(path) DO UPDATE SET
              deleted = 1,
+             -- local_present не трогаем: файл ещё лежит на диске и должен быть
+             -- удалён в prune_deleted_files (или спасён как conflict-copy).
+             local_ignored = 0,
              hlc_ms = excluded.hlc_ms,
              hlc_counter = excluded.hlc_counter,
              dev = excluded.dev",

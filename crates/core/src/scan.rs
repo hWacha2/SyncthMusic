@@ -26,7 +26,7 @@ pub struct ScanReport {
     pub ops_emitted: usize,
 }
 
-pub fn scan(root: &Path, replica: &mut Replica, clock: &mut Hlc) -> Result<ScanReport> {
+pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
     anyhow::ensure!(
         root.is_dir(),
         "корень библиотеки не найден: {}",
@@ -113,7 +113,7 @@ pub fn scan(root: &Path, replica: &mut Replica, clock: &mut Hlc) -> Result<ScanR
                         mtime_ns: mtime_before,
                         added_at: e.added_at,
                     };
-                    let op = Op::new(dev.clone(), clock.tick(), Op::canonicalize(kind)?);
+                    let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
                     replica.apply(&op)?;
                     report.changed += 1;
                     report.ops_emitted += 1;
@@ -133,7 +133,7 @@ pub fn scan(root: &Path, replica: &mut Replica, clock: &mut Hlc) -> Result<ScanR
             mtime_ns: mtime_before,
             added_at,
         };
-        let op = Op::new(dev.clone(), clock.tick(), Op::canonicalize(kind)?);
+        let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
         replica.apply(&op)?;
         if is_new {
             report.added += 1;
@@ -143,16 +143,21 @@ pub fn scan(root: &Path, replica: &mut Replica, clock: &mut Hlc) -> Result<ScanR
         report.ops_emitted += 1;
     }
 
-    // Всё, что реально лежит на диске, помечаем как присутствующее локально.
+    // Всё, что реально лежит на диске: локально присутствует, ожидание
+    // удаления снимается, ручное исключение снимается (файл вернули).
     for rel in &seen {
+        if replica.is_ignored(rel)? {
+            replica.set_ignored(rel, false)?;
+        }
+        replica.clear_pending_delete(rel)?;
         replica.mark_present(rel)?;
     }
 
-    // Пропавшие файлы: только те, что раньше были здесь. «Ещё не скачано»
-    // удалением не считается. Ничего не удаляем — только фиксируем.
-    let now = Hlc::wall_ms();
+    // Пропавшие файлы: только те, что раньше были здесь. «Ещё не скачано» и
+    // «намеренно не держим здесь» удалением не считается. Ничего не удаляем.
+    let now = replica.next_hlc()?.ms;
     for e in replica.local_entries()? {
-        if e.deleted || seen.contains(&e.path) {
+        if e.deleted || seen.contains(&e.path) || replica.is_ignored(&e.path)? {
             continue;
         }
         replica.record_pending_delete(&e.path, &e.blob, now)?;
@@ -166,6 +171,8 @@ pub fn scan(root: &Path, replica: &mut Replica, clock: &mut Hlc) -> Result<ScanR
 fn is_ignored(p: &Path) -> bool {
     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
     name.starts_with(".syncth")
+        || name.ends_with(".syncth-part")
+        || name.ends_with(".syncth-conflict")
         || name.eq_ignore_ascii_case("$recycle.bin")
         || name.eq_ignore_ascii_case("system volume information")
         || name == ".git"
@@ -179,6 +186,11 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
         },
         Err(_) => 0,
     }
+}
+
+/// Для конфликтных копий и приёмника файлов.
+pub fn mtime_ns_public(meta: &std::fs::Metadata) -> i64 {
+    mtime_ns(meta)
 }
 
 pub fn hash_file(path: &Path) -> Result<String> {
