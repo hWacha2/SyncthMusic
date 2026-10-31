@@ -927,6 +927,15 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
                 reply,
             })
         }
+        // Аккуратная остановка из десктопного клиента: ответ успевает уйти,
+        // после чего процесс завершается. WAL это переживает.
+        "/api/quit" => {
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                std::process::exit(0);
+            });
+            Ok("демон остановлен".to_string())
+        }
         other => Err(format!("неизвестный запрос: {other}")),
     }
 }

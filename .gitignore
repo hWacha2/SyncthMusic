@@ -7,3 +7,6 @@
 *.db-shm
 *.proptest-regressions
 .e2e/
+/data-a/
+/data-b/
+/crates/desktop/src-tauri/gen/
