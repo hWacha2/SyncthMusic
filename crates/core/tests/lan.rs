@@ -83,6 +83,10 @@ fn transfers_manifest_and_blobs_over_loopback() {
     assert_eq!(again.received_blobs, 0);
     assert_eq!(again.sent_blobs, 0);
     assert_eq!(again.applied_remote_ops, 0, "{}", again.summary());
+    // Дельта-синк: журнал уже синхронизирован, значит в сокет не ушло ни одной
+    // операции — даже если в логе их тысячи.
+    assert_eq!(again.sent_remote_ops, 0, "{}", again.summary());
+    assert_eq!(again.received_remote_ops, 0, "{}", again.summary());
 }
 
 #[test]

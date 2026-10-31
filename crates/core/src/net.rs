@@ -8,16 +8,19 @@
 //! упёрся бы в буфер сокета и обе зависли):
 //!
 //! ```text
-//! C: Hello                     S: HelloAck
-//! C: Ops(мои)                  S: Ops(мои)          ← обе стороны применяют
+//! C: Hello(have)              S: HelloAck(have)
+//! C: Ops(мои — только то, чего нет у S)   S: Ops(мои — только то, чего нет у C)
 //!                              S: Want(что нужно S)
 //! C: BlobHead + байты ...      C: Done
 //! C: Want(что нужно C)         S: BlobHead + байты ...  S: Done
 //! ```
+//!
+//! `have` — верхние HLC по каждому автору. Так каждый сеанс передаёт только
+//! хвост журнала, а не весь лог целиком.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -32,7 +35,7 @@ use crate::store::{EntryRow, Replica};
 
 const MAX_MSG: usize = 256 * 1024 * 1024;
 const DISCOVERY_PORT: u16 = 47_888;
-const PROTO: u32 = 1;
+const PROTO: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -41,10 +44,12 @@ enum Msg {
         dev: String,
         token: String,
         proto: u32,
+        have: HashMap<String, (i64, i64)>,
     },
     HelloAck {
         dev: String,
         proto: u32,
+        have: HashMap<String, (i64, i64)>,
     },
     Ops {
         ops: Vec<Op>,
@@ -65,6 +70,10 @@ enum Msg {
 #[derive(Debug, Default, Clone)]
 pub struct SyncStats {
     pub applied_remote_ops: usize,
+    /// Сколько операций реально ушло в сокет (после дельта-фильтра).
+    pub sent_remote_ops: usize,
+    /// Сколько операций пришло от пира (до идемпотентной проверки).
+    pub received_remote_ops: usize,
     pub sent_blobs: usize,
     pub received_blobs: usize,
     pub sent_bytes: u64,
@@ -76,8 +85,10 @@ pub struct SyncStats {
 impl SyncStats {
     pub fn summary(&self) -> String {
         format!(
-            "операций: +{}, блобов: принято {} ({}), отдано {} ({}), копий-конфликтов: {}",
+            "операций: принято {}, применено {}, передано {}; блобов: принято {} ({}), отдано {} ({}), копий-конфликтов: {}",
+            self.received_remote_ops,
             self.applied_remote_ops,
+            self.sent_remote_ops,
             self.received_blobs,
             human(self.received_bytes),
             self.sent_blobs,
@@ -319,6 +330,7 @@ fn disk_path(root: &Path, rel: &str) -> PathBuf {
 
 /// Применяет чужие операции и сразу доводит их до диска.
 fn absorb_ops(replica: &mut Replica, root: &Path, ops: &[Op], stats: &mut SyncStats) -> Result<()> {
+    stats.received_remote_ops += ops.len();
     let before: HashSet<String> = replica
         .live_entries()?
         .into_iter()
@@ -547,27 +559,26 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
             dev: replica.device_id().to_string(),
             token: token.to_string(),
             proto: PROTO,
+            have: replica.watermarks()?,
         },
     )?;
-    match recv_msg(&mut r)? {
-        Msg::HelloAck { dev, .. } => {
+    let peer_have = match recv_msg(&mut r)? {
+        Msg::HelloAck { dev, have, .. } => {
             anyhow::ensure!(
                 dev != replica.device_id(),
                 "подключились к самому себе — проверьте адрес"
             );
             tracing::info!("подключено к {dev}");
+            have
         }
         Msg::Error { message } => bail!("пир отказал: {message}"),
         other => bail!("неожиданный ответ: {other:?}"),
-    }
+    };
 
-    // 1. Наши операции — пиру.
-    send_msg(
-        &mut w,
-        &Msg::Ops {
-            ops: replica.ops()?,
-        },
-    )?;
+    // 1. Наши операции — пиру, только те, которых у него ещё нет.
+    let ops = replica.ops_since(&peer_have)?;
+    stats.sent_remote_ops += ops.len();
+    send_msg(&mut w, &Msg::Ops { ops })?;
     // 2. Его операции — нам.
     match recv_msg(&mut r)? {
         Msg::Ops { ops } => absorb_ops(replica, &root, &ops, &mut stats)?,
@@ -599,11 +610,12 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
     let mut r = BufReader::new(stream);
     let mut stats = SyncStats::default();
 
-    match recv_msg(&mut r)? {
+    let peer_have = match recv_msg(&mut r)? {
         Msg::Hello {
             token: got,
             proto,
             dev,
+            have,
         } => {
             if token.is_empty() || got != token {
                 send_msg(
@@ -632,14 +644,16 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
                 )?;
                 bail!("клиент представился нашим же device id");
             }
+            have
         }
         other => bail!("ожидали hello, получили {other:?}"),
-    }
+    };
     send_msg(
         &mut w,
         &Msg::HelloAck {
             dev: replica.device_id().to_string(),
             proto: PROTO,
+            have: replica.watermarks()?,
         },
     )?;
 
@@ -648,13 +662,10 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
         Msg::Ops { ops } => absorb_ops(replica, &root, &ops, &mut stats)?,
         other => bail!("ожидали операции, получили {other:?}"),
     }
-    // 2. Отдаём свои.
-    send_msg(
-        &mut w,
-        &Msg::Ops {
-            ops: replica.ops()?,
-        },
-    )?;
+    // 2. Отдаём свои — только то, чего у клиента ещё нет.
+    let ops = replica.ops_since(&peer_have)?;
+    stats.sent_remote_ops += ops.len();
+    send_msg(&mut w, &Msg::Ops { ops })?;
 
     // 3. Просим своё, 4. отдаём чужое.
     request_wants(&mut r, &mut w, replica, &root, &mut stats)?;

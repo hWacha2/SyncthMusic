@@ -4,7 +4,9 @@
 //! материализованное состояние (путь → блоб + метаданные).
 
 use anyhow::{Context, Result};
+use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::hlc::Hlc;
@@ -26,6 +28,9 @@ CREATE TABLE IF NOT EXISTS ops (
     dev         TEXT NOT NULL,
     kind        TEXT NOT NULL
 );
+
+-- Для дельта-синка: «что у пира уже есть» по каждому устройству-автору.
+CREATE INDEX IF NOT EXISTS ops_by_dev_hlc ON ops(dev, hlc_ms, hlc_counter);
 
 CREATE TABLE IF NOT EXISTS entries (
     path        TEXT PRIMARY KEY,
@@ -389,6 +394,59 @@ impl Replica {
 
     pub fn ops(&self) -> Result<Vec<Op>> {
         self.ops_json()?.iter().map(|s| Op::from_json(s)).collect()
+    }
+
+    /// Верхняя граница журнала по каждому устройству-автору.
+    ///
+    /// Журнал одного автора строго упорядочен его HLC, поэтому пары
+    /// `(dev → последний HLC)` достаточно, чтобы описать «что у меня уже есть»
+    /// и попросить только хвост. Глобального максимума мало: устройство может
+    /// создать операцию с большим HLC, не увидев чужую с меньшим.
+    pub fn watermarks(&self) -> Result<HashMap<String, (i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dev, hlc_ms, hlc_counter FROM ops
+             ORDER BY dev, hlc_ms, hlc_counter",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut map = HashMap::new();
+        while let Some(row) = rows.next()? {
+            map.insert(row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?));
+        }
+        Ok(map)
+    }
+
+    /// Операции, которых нет у пира согласно его `watermarks`.
+    pub fn ops_since(&self, known: &HashMap<String, (i64, i64)>) -> Result<Vec<Op>> {
+        if known.is_empty() {
+            return self.ops();
+        }
+
+        // `dev NOT IN (...)` — авторы, о которых пир вообще не знает;
+        // дальше по каждому известному автору берём строго больший HLC.
+        let mut clauses = Vec::with_capacity(known.len() + 1);
+        clauses.push(format!("dev NOT IN ({})", vec!["?"; known.len()].join(",")));
+        let mut args: Vec<Value> = known.keys().cloned().map(Value::Text).collect();
+        for (dev, (ms, counter)) in known {
+            clauses.push("(dev = ? AND (hlc_ms > ? OR (hlc_ms = ? AND hlc_counter > ?)))".into());
+            args.push(Value::Text(dev.clone()));
+            args.push(Value::Integer(*ms));
+            args.push(Value::Integer(*ms));
+            args.push(Value::Integer(*counter));
+        }
+
+        let sql = format!(
+            "SELECT op_json FROM ops WHERE {} ORDER BY rowid",
+            clauses.join(" OR ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut ops = Vec::new();
+        for json in rows {
+            ops.push(Op::from_json(&json?)?);
+        }
+        Ok(ops)
     }
 
     pub fn op_count(&self) -> Result<u64> {
