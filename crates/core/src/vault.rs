@@ -1,4 +1,4 @@
-//! Корзина: удалённые треки остаются на диске как hardlink'и.
+﻿//! Корзина: удалённые треки остаются на диске как hardlink'и.
 //!
 //! На NTFS hardlink не занимает места: файл и его «копия» в корзине — это два
 //! имени одного и того же inode. Поэтому «удалить везде» становится обратимым
@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::hlc::Hlc;
-use crate::op::{Op, OpKind};
+use crate::op::OpKind;
 use crate::resolve::{disk_path, prune_empty_dirs};
 use crate::scan;
 use crate::store::{Replica, VaultRow};
@@ -139,11 +139,7 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
         mtime_ns: row.mtime_ns,
         added_at: row.added_at,
     };
-    let op = Op::new(
-        replica.device_id().to_string(),
-        replica.next_hlc()?,
-        Op::canonicalize(kind)?,
-    );
+    let op = replica.make_op(kind)?;
     replica.apply(&op)?;
     replica.set_ignored(path, false)?;
     replica.mark_present(path)?;

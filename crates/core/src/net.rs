@@ -311,11 +311,7 @@ fn save_conflict_copy(
         mtime_ns: old_mtime,
         added_at: replica.next_hlc()?.ms,
     };
-    let op = Op::new(
-        replica.device_id().to_string(),
-        replica.next_hlc()?,
-        Op::canonicalize(kind)?,
-    );
+    let op = replica.make_op(kind)?;
     replica.apply(&op)?;
     // Файл уже лежит на диске под новым именем.
     replica.mark_present(&conflict_rel)?;

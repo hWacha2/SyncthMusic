@@ -1,10 +1,10 @@
-//! Сканирование корня библиотеки: хеширование, diff с БД, порождение операций.
+﻿//! Сканирование корня библиотеки: хеширование, diff с БД, порождение операций.
 //!
 //! Файлы не перемещаются и не переименовываются (ADR-002). Сканер только
 //! наблюдает и создаёт операции.
 
 use crate::hlc::Hlc;
-use crate::op::{Op, OpKind};
+use crate::op::OpKind;
 use crate::path;
 use crate::store::{EntryRow, Replica};
 use anyhow::{Context, Result};
@@ -36,7 +36,6 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
     );
 
     let mut report = ScanReport::default();
-    let dev = replica.device_id().to_string();
 
     // Сначала собираем список файлов. Иначе нельзя отличить переименование
     // `Foo.flac → foo.flac` от двух реально существующих файлов, различающихся
@@ -131,7 +130,7 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
                     mtime_ns: mtime_before,
                     added_at: cand.added_at,
                 };
-                let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
+                let op = replica.make_op(kind)?;
                 replica.apply(&op)?;
                 moved_from.insert(cand.path.clone());
                 report.renamed += 1;
@@ -168,7 +167,7 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
                         mtime_ns: mtime_before,
                         added_at: e.added_at,
                     };
-                    let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
+                    let op = replica.make_op(kind)?;
                     replica.apply(&op)?;
                     report.changed += 1;
                     report.ops_emitted += 1;
@@ -188,7 +187,7 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
             mtime_ns: mtime_before,
             added_at,
         };
-        let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
+        let op = replica.make_op(kind)?;
         replica.apply(&op)?;
         if is_new {
             report.added += 1;

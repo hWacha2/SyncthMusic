@@ -5,6 +5,7 @@
 
 use crate::hlc::Hlc;
 use crate::path;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +53,11 @@ pub struct Op {
     pub dev: String,
     pub hlc: Hlc,
     pub kind: OpKind,
-    /// Зарезервировано под Ed25519. В Phase 0 подписи не проверяются.
+    /// Публичный ключ автора (hex Ed25519), если операция подписана.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pk: Option<String>,
+    /// Подпись канонического `id`. Старые операции без подписи принимаются
+    /// ради совместимости; новые всегда подписываются.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
 }
@@ -67,7 +72,45 @@ impl Op {
             dev,
             hlc,
             kind,
+            pk: None,
             sig: None,
+        }
+    }
+
+    /// Подписывает операцию ключом устройства. Публичный ключ едет вместе с
+    /// операцией: проверяющая сторона не обязана знать пира заранее.
+    pub fn sign(&mut self, key: &SigningKey) {
+        let sig = key.sign(self.id.as_bytes());
+        self.pk = Some(hex::encode(key.verifying_key().to_bytes()));
+        self.sig = Some(hex::encode(sig.to_bytes()));
+    }
+
+    /// Криптографическая проверка подписи. Операции без подписи считаются
+    /// совместимыми со старым форматом (но не «доверенными» — это решает
+    /// хранилище через TOFU-таблицу ключей).
+    pub fn verify_signature(&self) -> bool {
+        match (&self.pk, &self.sig) {
+            (None, None) => true,
+            (Some(pk), Some(sig)) => {
+                let Ok(pk_bytes) = hex::decode(pk) else {
+                    return false;
+                };
+                let Ok(pk_bytes) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else {
+                    return false;
+                };
+                let Ok(vk) = VerifyingKey::from_bytes(&pk_bytes) else {
+                    return false;
+                };
+                let Ok(sig_bytes) = hex::decode(sig) else {
+                    return false;
+                };
+                let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+                    return false;
+                };
+                let sig = Signature::from_bytes(&sig_bytes);
+                vk.verify_strict(self.id.as_bytes(), &sig).is_ok()
+            }
+            _ => false,
         }
     }
 
@@ -101,6 +144,7 @@ impl Op {
             op.is_intact(),
             "операция повреждена: id не совпадает с телом"
         );
+        anyhow::ensure!(op.verify_signature(), "неверная подпись операции {}", op.id);
         Ok(op)
     }
 }

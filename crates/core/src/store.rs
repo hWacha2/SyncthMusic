@@ -4,9 +4,11 @@
 //! материализованное состояние (путь → блоб + метаданные).
 
 use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::hlc::Hlc;
@@ -31,6 +33,13 @@ CREATE TABLE IF NOT EXISTS ops (
 
 -- Для дельта-синка: «что у пира уже есть» по каждому устройству-автору.
 CREATE INDEX IF NOT EXISTS ops_by_dev_hlc ON ops(dev, hlc_ms, hlc_counter);
+
+-- TOFU: первый подписанный ключ устройства запоминается. Смена ключа у того же
+-- `dev` отклоняется — иначе подпись не защищает от подмены автора.
+CREATE TABLE IF NOT EXISTS dev_keys (
+    dev TEXT PRIMARY KEY,
+    pk  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS entries (
     path        TEXT PRIMARY KEY,
@@ -121,6 +130,7 @@ pub struct Replica {
     conn: Connection,
     dev: String,
     data_dir: Option<PathBuf>,
+    key: SigningKey,
 }
 
 impl Replica {
@@ -132,6 +142,7 @@ impl Replica {
             conn,
             dev: dev.to_string(),
             data_dir: None,
+            key: load_or_create_key(None)?,
         };
         replica.migrate()?;
         Ok(replica)
@@ -149,6 +160,7 @@ impl Replica {
             conn,
             dev: dev.to_string(),
             data_dir: Some(data_dir.to_path_buf()),
+            key: load_or_create_key(Some(data_dir))?,
         };
         replica.migrate()?;
         Ok(replica)
@@ -299,6 +311,20 @@ impl Replica {
         Ok(ticked)
     }
 
+    /// Новая локальная операция: канонический путь, свежий HLC, подпись.
+    /// Единственный правильный способ порождать `entry_*` на этом устройстве.
+    pub fn make_op(&mut self, kind: OpKind) -> Result<Op> {
+        let kind = Op::canonicalize(kind)?;
+        let mut op = Op::new(self.dev.clone(), self.next_hlc()?, kind);
+        op.sign(&self.key);
+        Ok(op)
+    }
+
+    /// Публичный ключ этого устройства (hex).
+    pub fn public_key(&self) -> String {
+        hex::encode(self.key.verifying_key().to_bytes())
+    }
+
     /// Подтянуть часы после чужой операции: причинность важнее настенных часов.
     pub fn observe_hlc(&mut self, remote: Hlc) -> Result<()> {
         let mut clock = self.load_hlc()?;
@@ -308,10 +334,41 @@ impl Replica {
 
     // ---------------------------------------------------------------- apply
 
+    /// TOFU-проверка автора: у одного `dev` не может появиться второй ключ.
+    fn check_author_key(&self, op: &Op) -> Result<()> {
+        let Some(pk) = &op.pk else {
+            return Ok(());
+        };
+        let known: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pk FROM dev_keys WHERE dev = ?1",
+                params![op.dev],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match known {
+            Some(known) => anyhow::ensure!(
+                known == *pk,
+                "устройство {} уже подписано другим ключом",
+                op.dev
+            ),
+            None => {
+                self.conn.execute(
+                    "INSERT INTO dev_keys(dev, pk) VALUES (?1, ?2)",
+                    params![op.dev, pk],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Применяет операцию. Возвращает `true`, если состояние изменилось.
     /// Идемпотентно: повторное применение того же `id` — no-op.
     pub fn apply(&mut self, op: &Op) -> Result<bool> {
         anyhow::ensure!(op.is_intact(), "операция повреждена: {}", op.id);
+        anyhow::ensure!(op.verify_signature(), "неверная подпись операции {}", op.id);
+        self.check_author_key(op)?;
         self.observe_hlc(op.hlc)?;
 
         let tx = self.conn.transaction()?;
@@ -899,6 +956,36 @@ pub fn exchange(a: &mut Replica, b: &mut Replica) -> Result<(usize, usize)> {
     let applied_in_b = b.apply_all(&from_a)?;
     let applied_in_a = a.apply_all(&from_b)?;
     Ok((applied_in_a, applied_in_b))
+}
+
+/// Ключ устройства: `data_dir/device.key` (32 байта). Создаётся один раз.
+/// Для тестовых реплик в памяти ключ эфемерный.
+fn load_or_create_key(data_dir: Option<&Path>) -> Result<SigningKey> {
+    let Some(dir) = data_dir else {
+        return random_key();
+    };
+    let path = dir.join("device.key");
+    if path.is_file() {
+        let raw = fs::read(&path).with_context(|| format!("чтение {}", path.display()))?;
+        let bytes = <[u8; 32]>::try_from(raw.as_slice())
+            .map_err(|_| anyhow::anyhow!("повреждён ключ устройства: {}", path.display()))?;
+        return Ok(SigningKey::from_bytes(&bytes));
+    }
+    let key = random_key()?;
+    fs::write(&path, key.to_bytes()).with_context(|| format!("запись {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("права на {}", path.display()))?;
+    }
+    Ok(key)
+}
+
+fn random_key() -> Result<SigningKey> {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("нет доступа к генератору: {e}"))?;
+    Ok(SigningKey::from_bytes(&buf))
 }
 
 pub fn now_ms() -> u64 {

@@ -1,4 +1,4 @@
-//! Разрешение ожидающих удалений — единственное место, где рождается `entry_del`.
+﻿//! Разрешение ожидающих удалений — единственное место, где рождается `entry_del`.
 //!
 //! Удаление файла на устройстве ничего не реплицирует: сканер кладёт запись в
 //! `pending_deletes`. Операция удаления появляется только после явного решения
@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::op::{Op, OpKind};
+use crate::op::OpKind;
 use crate::scan;
 use crate::store::Replica;
 
@@ -68,11 +68,7 @@ fn delete_everywhere(replica: &mut Replica, root: &Path, blob: &str) -> Result<O
         }
 
         let kind = OpKind::EntryDel { path: path.clone() };
-        let op = Op::new(
-            replica.device_id().to_string(),
-            replica.next_hlc()?,
-            Op::canonicalize(kind)?,
-        );
+        let op = replica.make_op(kind)?;
         replica.apply(&op)?;
         replica.clear_pending_delete(&path)?;
         out.deleted_paths.push(path.clone());
@@ -228,11 +224,7 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
                     mtime_ns: scan::mtime_ns_public(&meta),
                     added_at: replica.next_hlc()?.ms,
                 };
-                let op = Op::new(
-                    replica.device_id().to_string(),
-                    replica.next_hlc()?,
-                    Op::canonicalize(kind)?,
-                );
+                let op = replica.make_op(kind)?;
                 replica.apply(&op)?;
                 replica.mark_absent(&path)?;
                 saved.push(conflict);
