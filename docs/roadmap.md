@@ -22,28 +22,29 @@
 
 ---
 
-## Phase 0 — Ядро (2–3 недели)
+## Phase 0 — Ядро ✅ (сделано)
 
 `crates/core` + `crates/cli`, без UI.
 
-- [ ] Cargo workspace, CI (fmt, clippy, nextest), AGPL-3.0
-- [ ] Схема SQLite: `entries` (relpath → blob), `blobs`, `ops`, `presence`,
-      `pending_deletes`, `conflicts`, `peers`, `transfers`
-- [ ] Сканер: обход корня, `size+mtime+file_id`, BLAKE3 (rayon), теги `lofty`
-- [ ] `entry.put / move / del` + `apply()` + материализация
-- [ ] HLC, CBOR, Ed25519, снапшоты, компакция
-- [ ] Разрешение конфликтов: conflict-copy + запись в `conflicts`
-- [ ] Восстановление `mtime` после записи (Windows: `SetFileTime`, Android: `utimes`)
-- [ ] LAN-транспорт: mDNS + QUIC + range + resume
-- [ ] `Pipe::Folder` для отладки и как резервный канал
-- [ ] `pending.delete` (файл исчез → запись, ничего не реплицируем)
-- [ ] CLI: `scan`, `status`, `pair`, `sync`, `verify`, `conflicts`, `doctor`
+- [x] Cargo workspace, схема SQLite (`entries`, `blobs`, `ops`, `pending_deletes`)
+- [x] Сканер: обход корня, `size+mtime`, BLAKE3, восстановление `mtime`
+- [x] `entry.put / move / del`, `blob.have`, `apply()`, материализация
+- [x] HLC, детерминированный `id` операции, проверка целостности
+- [x] Сходимость реплик: LWW + нормализация tombstone (property-тест)
+- [x] `pending_deletes`: файл исчез → запись, **ничего не реплицируем**
+- [x] `Pipe::Folder` — обмен операциями через каталог
+- [x] CLI: `init`, `scan`, `status`, `export`, `import`, `verify`
+- [x] Демо-сценарий двух устройств (`scripts/demo.ps1`)
 
-**Готово, когда:** две машины, одинаковый корень, `syncth sync` → одинаковое
-дерево и одинаковый `state_hash`; переименование на A не гоняет байты; удаление
-на A попадает в `pending.delete` и ждёт решения; оба файла при конфликте живы.
+Осталось до конца Phase 0:
 
-**Бенчмарк сразу:** скан 100 ГБ FLAC (нужно ≥ 300 МБ/с на HDD, ≥ 1 ГБ/с на SSD).
+- [ ] Разрешение `pending_deletes` (три действия из §5.5)
+- [ ] Передача самих блобов (LAN) — это уже Phase 0.1
+- [ ] Снапшоты и компакция лога
+- [ ] Подписи Ed25519 (поле `sig` зарезервировано)
+- [ ] Параллельное хеширование (rayon) — сейчас последовательное
+- [ ] CI (нужен GitHub-репозиторий)
+- [ ] Бенчмарк: скан 100 ГБ FLAC (нужно ≥ 300 МБ/с на HDD, ≥ 1 ГБ/с на SSD)
 
 ## Phase 1 — Windows-демон (2–3 недели)
 

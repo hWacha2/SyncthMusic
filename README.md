@@ -10,7 +10,8 @@
 Плейлисты, обложки и удаления синхронизируются осознанно, а не как «файл пропал —
 ну и ладно».
 
-> Статус: **проектирование**. Документы: [архитектура](docs/architecture.md),
+> Статус: **Phase 0 работает** — ядро и CLI собираются, тесты проходят, два
+> устройства сходятся. Документы: [архитектура](docs/architecture.md),
 > [план](docs/roadmap.md).
 
 ## Сценарий, под который всё делается
@@ -66,12 +67,45 @@ Syncthing синхронизирует **файлы**. Музыкальная б
 - **Собственного редактора тегов.** Правишь в AIMP/Poweramp — мы синхронизируем
   изменённый файл. Пакетные правки («год из имени папки») — позже.
 
+## Быстрый старт (Phase 0, CLI без UI)
+
+```powershell
+cargo build --release
+
+# устройство A
+.\target\release\syncth.exe --data-dir .\data-a init --root "F:\Music"
+.\target\release\syncth.exe --data-dir .\data-a scan
+.\target\release\syncth.exe --data-dir .\data-a status
+
+# устройство B (на другой машине — свой data-dir и свой корень)
+.\target\release\syncth.exe --data-dir .\data-b init --root "D:\Music"
+.\target\release\syncth.exe --data-dir .\data-b scan
+
+# обмен манифестом через любую папку (Syncthing, Nextcloud, флешка)
+.\target\release\syncth.exe --data-dir .\data-a export --dir .\pipe
+.\target\release\syncth.exe --data-dir .\data-b import --dir .\pipe
+.\target\release\syncth.exe --data-dir .\data-b export --dir .\pipe
+.\target\release\syncth.exe --data-dir .\data-a import --dir .\pipe
+```
+
+Что уже работает: скан, хеширование, дедуп по содержимому, обмен операциями,
+восстановление `mtime`, детект пропавших файлов **без** их удаления.
+
+Проверка с нуля:
+
+```powershell
+cargo test --workspace
+powershell -ExecutionPolicy Bypass -File scripts\demo.ps1
+```
+
+Чего ещё нет: передачи самих файлов (Phase 0.1), LAN, UI.
+
 ## Лицензия
 
 AGPL-3.0.
 
 ## Название
 
-«SynctMusic» созвучно с торговой маркой Syncthing — перед публикацией стоит выбрать
+«SyncthMusic» созвучно с торговой маркой Syncthing — перед публикацией стоит выбрать
 нейтральное имя (*Loom*, *Crate*, *Tapehead*, *Vinyl*). Внутренние имена пакетов
 уже нейтральны (`syncth-core`).

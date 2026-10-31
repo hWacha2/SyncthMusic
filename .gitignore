@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.syncth-data/
+.demo/
+*.db
+*.db-wal
+*.db-shm
+*.proptest-regressions
