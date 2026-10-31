@@ -135,6 +135,24 @@ if ($stateA -ne $stateB) { throw "правка не доехала" }
 Write-Host ""
 Write-Host "OK: правка доехала, конфликтной копии нет (это обновление, а не конфликт)" -ForegroundColor DarkGray
 
+# ---------------------------------------------------------------- переименование
+Write-Host ""
+Write-Host "=== Переименование: это entry_move, а не удаление + добавление ===" -ForegroundColor Green
+$oldRel = 'Boards of Canada\1998 - Music Has the Right to Children\02 - An Eagle in Your Mind.flac'
+$newRel = 'Boards of Canada\1998 - Music Has the Right to Children\02 - Eagle (remastered).flac'
+Move-Item (Join-Path $musicB $oldRel) (Join-Path $musicB $newRel)
+Run-Syncth $dataB 'scan (переименование)' @('scan')
+$pendingB = (& $exe --data-dir $dataB pending list) -join "`n"
+if ($pendingB -notmatch 'нет ожидающих') { throw "переименование попало в очередь удалений: $pendingB" }
+Sync-Pair $dataB $dataA 47891 $token
+if (-not (Test-Path (Join-Path $musicA $newRel))) { throw "новое имя не доехало на телефон" }
+if (Test-Path (Join-Path $musicA $oldRel)) { throw "старое имя осталось на телефоне" }
+$stateA = Get-State $dataA
+$stateB = Get-State $dataB
+if ($stateA -ne $stateB) { throw "после переименования состояние разошлось" }
+Write-Host ""
+Write-Host "OK: файл перенесён по новому пути, без pending delete и без повторной передачи байт" -ForegroundColor DarkGray
+
 # ---------------------------------------------------------------- удаление
 Write-Host ""
 Write-Host "=== Удаление файла на телефоне ===" -ForegroundColor Green
@@ -154,7 +172,7 @@ Sync-Pair $dataA $dataB 47892 $token
 
 $onPC = Join-Path $musicB 'БГ\2008 - Русский альбом\01 - Поезд в огне.flac'
 if (Test-Path $onPC) { throw "подтверждённое удаление не доехало до ПК" }
-if (-not (Test-Path (Join-Path $musicB 'Boards of Canada\1998 - Music Has the Right to Children\02 - An Eagle in Your Mind.flac'))) {
+if (-not (Test-Path (Join-Path $musicB 'Boards of Canada\1998 - Music Has the Right to Children\02 - Eagle (remastered).flac'))) {
     throw "удалили не тот файл"
 }
 $stateA = Get-State $dataA

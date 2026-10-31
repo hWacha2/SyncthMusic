@@ -185,6 +185,7 @@ fn run() -> Result<()> {
             println!("скан завершён");
             println!("  новых:      {}", report.added);
             println!("  изменённых: {}", report.changed);
+            println!("  перенесено: {}", report.renamed);
             println!("  без изм.:   {}", report.unchanged);
             println!("  занятых:    {}", report.skipped_busy);
             println!("  операций:   {}", report.ops_emitted);

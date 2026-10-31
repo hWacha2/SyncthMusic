@@ -543,9 +543,10 @@ fn do_scan(replica: &mut Replica, root: &Path, runtime: &Shared, notify: bool) -
     }
     drop(rt);
     tracing::info!(
-        "скан: +{} новых, ~{} изменённых, {} без изменений, пропало {}",
+        "скан: +{} новых, ~{} изменённых, {} перенесено, {} без изменений, пропало {}",
         report.added,
         report.changed,
+        report.renamed,
         report.unchanged,
         report.missing.len()
     );

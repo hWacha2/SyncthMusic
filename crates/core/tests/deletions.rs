@@ -107,7 +107,8 @@ fn resolving_delete_everywhere_removes_it_on_all_devices() {
 fn delete_everywhere_follows_the_track_after_a_move_elsewhere() {
     let (ctx, mut a, mut b) = pair();
 
-    // На ПК (B) трек перенесли в другую папку, на телефоне (A) — удалили.
+    // На ПК (B) трек перенесли в другую папку, а на телефоне (A) в это же
+    // время удалили старый путь. Обмен ещё не прошёл — намерения конкурентны.
     fs::create_dir_all(ctx.root_b.join("Compilations")).unwrap();
     fs::rename(
         ctx.root_b.join("Album/01.flac"),
@@ -115,19 +116,16 @@ fn delete_everywhere_follows_the_track_after_a_move_elsewhere() {
     )
     .unwrap();
     scan::scan(&ctx.root_b, &mut b).unwrap();
-    sync(&mut a, &mut b, &ctx.pipe);
 
     fs::remove_file(ctx.root_a.join("Album/01.flac")).unwrap();
     scan::scan(&ctx.root_a, &mut a).unwrap();
 
+    sync(&mut a, &mut b, &ctx.pipe);
+
     // Удаление по блобу, а не по пути: «удалить везде» находит и перенесённую
     // копию. Иначе трек остался бы жить под другим именем.
     let out = resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
-    assert!(out
-        .deleted_paths
-        .iter()
-        .any(|p| p == "Compilations/01.flac"));
-    assert_eq!(out.deleted_paths.len(), 2);
+    assert_eq!(out.deleted_paths, vec!["Compilations/01.flac"]);
 
     sync(&mut a, &mut b, &ctx.pipe);
     resolve::prune_deleted_files(&mut b, &ctx.root_b).unwrap();

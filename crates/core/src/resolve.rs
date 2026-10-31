@@ -10,6 +10,7 @@
 //! удалит все его копии, а «только здесь» не тронет общую библиотеку.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::op::{Op, OpKind};
@@ -167,9 +168,29 @@ pub(crate) fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
 pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<String>> {
     let mut saved = Vec::new();
 
+    // Пути, которые сейчас реально лежат здесь. Нужны, чтобы не удалить файл,
+    // переименованный только по регистру/Unicode: на Windows/macOS старый путь
+    // указывает на тот же самый файл, что и новый.
+    let live_keys: HashMap<String, String> = replica
+        .live_entries()?
+        .into_iter()
+        .filter(|e| replica.is_present(&e.path).unwrap_or(false))
+        .map(|e| (crate::path::key(&e.path), e.path))
+        .collect();
+
     let rows = replica.deleted_present()?;
 
     for (path, blob) in rows {
+        if let Some(other) = live_keys.get(&crate::path::key(&path)) {
+            if other != &path {
+                tracing::warn!(
+                    "не удаляю «{path}»: это тот же файл, что живой «{other}» \
+                     (различие только в регистре/Unicode)"
+                );
+                replica.mark_absent(&path)?;
+                continue;
+            }
+        }
         let abs = disk_path(root, &path);
         if !abs.is_file() {
             replica.mark_absent(&path)?;

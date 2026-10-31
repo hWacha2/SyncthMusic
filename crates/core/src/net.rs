@@ -327,6 +327,7 @@ fn absorb_ops(replica: &mut Replica, root: &Path, ops: &[Op], stats: &mut SyncSt
     let touched = touched_paths(ops);
 
     stats.applied_remote_ops += replica.apply_all(ops)?;
+    stats.placed_local += apply_moves(replica, root, ops)?;
     invalidate_mismatched(replica, root, &touched)?;
     stats.conflicts_saved += resolve::prune_deleted_files(replica, root)?.len();
     // Подтверждённые удаления могли забрать блоб — пересчитываем цели.
@@ -338,6 +339,76 @@ fn absorb_ops(replica: &mut Replica, root: &Path, ops: &[Op], stats: &mut SyncSt
         stats.placed_local += place_from_local(replica, root, &e)?;
     }
     Ok(())
+}
+
+/// Физически переносит локальный файл вслед за `entry_move`.
+///
+/// Без этого принимающая сторона сначала отправила бы старый файл в корзину,
+/// а потом скачала тот же блоб по новому пути. Если локальная версия отличается
+/// (её правили здесь), ничего не трогаем: конфликт разберёт `prune_deleted_files`.
+fn apply_moves(replica: &mut Replica, root: &Path, ops: &[Op]) -> Result<usize> {
+    let mut moved = 0;
+    for op in ops {
+        let OpKind::EntryMove {
+            from,
+            to,
+            blob,
+            mtime_ns,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let src = disk_path(root, from);
+        let dst = disk_path(root, to);
+        let same_key = path::key(from) == path::key(to);
+
+        if !src.is_file() {
+            // Перенос уже сделан (или файл только предстоит скачать).
+            if dst.is_file() && scan::hash_file(&dst).ok().as_deref() == Some(blob.as_str()) {
+                replica.mark_present(to)?;
+                replica.mark_absent(from)?;
+            }
+            continue;
+        }
+        // Занятый destination не перезаписываем: это может быть чужая правка.
+        if !same_key && dst.exists() {
+            continue;
+        }
+        match scan::hash_file(&src) {
+            Ok(h) if &h == blob => {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => {
+                        scan::restore_mtime(&dst, *mtime_ns)?;
+                        replica.mark_present(to)?;
+                        replica.mark_absent(from)?;
+                        moved += 1;
+                    }
+                    Err(e) if same_key => {
+                        // На регистронезависимой ФС src и dst — один и тот же файл;
+                        // rename мог не понадобиться. Главное — проверить содержимое.
+                        if dst.is_file()
+                            && scan::hash_file(&dst).ok().as_deref() == Some(blob.as_str())
+                        {
+                            replica.mark_present(to)?;
+                            replica.mark_absent(from)?;
+                        } else {
+                            tracing::warn!("не удалось перенести {from} → {to}: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("не удалось перенести {from} → {to}: {e}"),
+                }
+            }
+            Ok(_) => {
+                tracing::debug!("локальная версия {from} отличается — оставляю для конфликта");
+            }
+            Err(e) => tracing::warn!("не читается {from} при переносе: {e:#}"),
+        }
+    }
+    Ok(moved)
 }
 
 /// Пути, которых коснулись операции.
@@ -844,5 +915,43 @@ mod tests {
         assert!(parse_pair_code("https://example.com").is_err());
         assert!(parse_pair_code("syncth://pair?dev=x&token=zz&addr=1.2.3.4:5").is_err());
         assert!(parse_pair_code("syncth://pair?dev=x&token=abcd&addr=localhost").is_err());
+    }
+
+    #[test]
+    fn applying_a_move_renames_the_local_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        std::fs::create_dir_all(root_a.join("Album")).unwrap();
+        std::fs::create_dir_all(root_b.join("Album")).unwrap();
+        std::fs::write(root_a.join("Album/01.flac"), b"one").unwrap();
+        std::fs::write(root_b.join("Album/01.flac"), b"one").unwrap();
+
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        a.set_root(&root_a).unwrap();
+        scan::scan(&root_a, &mut a).unwrap();
+
+        std::fs::create_dir_all(root_a.join("Compilations")).unwrap();
+        std::fs::rename(
+            root_a.join("Album/01.flac"),
+            root_a.join("Compilations/01.flac"),
+        )
+        .unwrap();
+        scan::scan(&root_a, &mut a).unwrap();
+
+        // B получает операции и должен перенести свой файл, а не качать заново.
+        let mut b = Replica::in_memory("dev-b").unwrap();
+        b.set_root(&root_b).unwrap();
+        let ops = a.ops().unwrap();
+        b.apply_all(&ops).unwrap();
+        let moved = apply_moves(&mut b, &root_b, &ops).unwrap();
+
+        assert_eq!(moved, 1);
+        assert!(!root_b.join("Album/01.flac").exists());
+        assert_eq!(
+            std::fs::read(root_b.join("Compilations/01.flac")).unwrap(),
+            b"one"
+        );
+        assert!(b.is_present("Compilations/01.flac").unwrap());
     }
 }

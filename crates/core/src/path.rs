@@ -4,6 +4,17 @@
 //! каноническим: одинаковые байты на всех платформах и никаких `..`.
 
 use anyhow::{bail, Result};
+use unicode_normalization::UnicodeNormalization;
+
+/// Ключ пути для сравнения между платформами.
+///
+/// Сам путь на диске не меняем: Windows/macOS могут отдавать другое написание,
+/// а переименовывать чужие файлы инструмент не должен. Ключ нужен только для
+/// того, чтобы узнать «это тот же путь с точностью до регистра/NFC» и не
+/// превратить переименование `Foo.flac → foo.flac` в удаление + добавление.
+pub fn key(rel: &str) -> String {
+    rel.nfc().collect::<String>().to_lowercase()
+}
 
 /// Приводит путь к виду `a/b/c.ext` (прямые слэши, без `.` и `..`).
 pub fn normalize(rel: &str) -> Result<String> {
@@ -134,6 +145,15 @@ mod tests {
         assert!(is_service_path(".syncth/ops/x.json"));
         assert!(is_service_path("a/.syncth/x"));
         assert!(!is_service_path("Rock/.hidden/x.flac"));
+    }
+
+    #[test]
+    fn comparison_key_folds_case_and_nfc() {
+        assert_eq!(key("Rock/Album/Й.flac"), key("rock/album/й.flac"));
+        // «й» в NFD: и + combining breve.
+        assert_eq!(key("Й"), key("И\u{0306}"));
+        // Разные буквы не должны склеиваться.
+        assert_ne!(key("Й"), key("И"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ rusqlite.workspace = true
 walkdir.workspace = true
 filetime.workspace = true
 tracing.workspace = true
+unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 proptest.workspace = true

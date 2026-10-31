@@ -6,9 +6,9 @@
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::Replica;
+use crate::store::{EntryRow, Replica};
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -19,6 +19,8 @@ pub struct ScanReport {
     pub added: usize,
     pub changed: usize,
     pub unchanged: usize,
+    /// Переименования/переносы, распознанные по блобу.
+    pub renamed: usize,
     /// Пути, которые были в БД, но пропали с диска. В операции не превращаются —
     /// только в `pending_deletes`.
     pub missing: Vec<String>,
@@ -34,9 +36,13 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
     );
 
     let mut report = ScanReport::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
     let dev = replica.device_id().to_string();
 
+    // Сначала собираем список файлов. Иначе нельзя отличить переименование
+    // `Foo.flac → foo.flac` от двух реально существующих файлов, различающихся
+    // только регистром: к моменту обработки второго первый мог быть ещё не
+    // встречен обходом.
+    let mut files: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -52,21 +58,29 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
         if !entry.file_type().is_file() {
             continue;
         }
-
-        let abs = entry.path();
+        let abs = entry.into_path();
         let rel_raw = match abs.strip_prefix(root) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue,
         };
-        let rel = match path::normalize(&rel_raw) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("некорректный путь {rel_raw}: {e}");
-                continue;
-            }
-        };
-        seen.insert(rel.clone());
+        match path::normalize(&rel_raw) {
+            Ok(rel) => files.push((abs, rel)),
+            Err(e) => tracing::warn!("некорректный путь {rel_raw}: {e}"),
+        }
+    }
 
+    let seen: BTreeSet<String> = files.iter().map(|(_, rel)| rel.clone()).collect();
+
+    // Живые локальные записи по блобу — кандидаты в «старое имя» переименования.
+    let mut by_blob: HashMap<String, Vec<EntryRow>> = HashMap::new();
+    let mut by_key: HashMap<String, Vec<EntryRow>> = HashMap::new();
+    for e in replica.local_entries()? {
+        by_blob.entry(e.blob.clone()).or_default().push(e.clone());
+        by_key.entry(path::key(&e.path)).or_default().push(e);
+    }
+    let mut moved_from: HashSet<String> = HashSet::new();
+
+    for (abs, rel) in files {
         let before = match abs.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -82,7 +96,7 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
             }
         }
 
-        let blob = match hash_file(abs) {
+        let blob = match hash_file(&abs) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("не удалось прочитать {}: {e}", abs.display());
@@ -102,6 +116,47 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
         }
 
         let is_new = existing.as_ref().map(|e| e.deleted).unwrap_or(true);
+
+        // Переименование/перенос: блоб тот же, старого пути больше нет на диске.
+        // Проверяем до добавления записи и только для нового/удалённого пути —
+        // иначе это была бы обычная правка содержимого.
+        if is_new {
+            if let Some(cand) = rename_candidate(&rel, &blob, &seen, &by_blob, &by_key, &moved_from)
+            {
+                let kind = OpKind::EntryMove {
+                    from: cand.path.clone(),
+                    to: rel.clone(),
+                    blob: blob.clone(),
+                    size,
+                    mtime_ns: mtime_before,
+                    added_at: cand.added_at,
+                };
+                let op = Op::new(dev.clone(), replica.next_hlc()?, Op::canonicalize(kind)?);
+                replica.apply(&op)?;
+                moved_from.insert(cand.path.clone());
+                report.renamed += 1;
+                report.ops_emitted += 1;
+                continue;
+            }
+            // Тот же ключ, но оба файла реально лежат на диске — это не перенос,
+            // а коллизия регистра/Unicode. Не склеиваем и не теряем данные.
+            if let Some(other) = by_blob
+                .get(&blob)
+                .into_iter()
+                .flatten()
+                .find(|e| e.path != rel && path::key(&e.path) == path::key(&rel))
+            {
+                if seen.contains(&other.path) {
+                    tracing::warn!(
+                        "коллизия путей: «{}» и «{}» различаются только регистром/Unicode; \
+                         на Windows/macOS это один файл",
+                        other.path,
+                        rel
+                    );
+                }
+            }
+        }
+
         if !is_new {
             if let Some(e) = &existing {
                 if e.blob == blob {
@@ -166,6 +221,47 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
     }
 
     Ok(report)
+}
+
+/// Ищет живой локальный путь с тем же блобом, которого больше нет в `seen`.
+/// Приоритет — путь, совпадающий по регистру/Unicode: на Windows/macOS это
+/// типичное переименование `Foo.flac → foo.flac`, и старый путь физически
+/// указывает на тот же файл.
+fn rename_candidate<'a>(
+    new_path: &str,
+    blob: &str,
+    seen: &BTreeSet<String>,
+    by_blob: &'a HashMap<String, Vec<EntryRow>>,
+    by_key: &'a HashMap<String, Vec<EntryRow>>,
+    moved_from: &HashSet<String>,
+) -> Option<&'a EntryRow> {
+    let new_key = path::key(new_path);
+
+    // Сначала путь, совпадающий с точностью до регистра/NFC. Он не должен
+    // лежать в `seen`: иначе на case-sensitive ФС это два разных файла.
+    if let Some(cand) =
+        by_key.get(&new_key).into_iter().flatten().find(|c| {
+            c.path != new_path && !moved_from.contains(&c.path) && !seen.contains(&c.path)
+        })
+    {
+        return Some(cand);
+    }
+
+    // Затем перенос в другую папку: содержимое обязано совпасть, иначе это
+    // скорее удаление + добавление, и решение должен принять человек.
+    let mut fallback = None;
+    for cand in by_blob.get(blob).into_iter().flatten() {
+        if cand.path == new_path || moved_from.contains(&cand.path) || seen.contains(&cand.path) {
+            continue;
+        }
+        if path::key(&cand.path) == new_key {
+            return Some(cand);
+        }
+        if fallback.is_none() {
+            fallback = Some(cand);
+        }
+    }
+    fallback
 }
 
 fn is_ignored(p: &Path) -> bool {
