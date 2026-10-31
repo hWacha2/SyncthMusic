@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Права окна SynctMusic на телефоне",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

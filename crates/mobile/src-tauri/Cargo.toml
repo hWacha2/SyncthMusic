@@ -1,0 +1,23 @@
+[package]
+name = "syncth-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SynctMusic Android client (Tauri)"
+
+[lib]
+name = "syncth_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+syncth-core = { path = "../../core" }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

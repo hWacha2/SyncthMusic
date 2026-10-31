@@ -10,3 +10,6 @@
 /data-a/
 /data-b/
 /crates/desktop/src-tauri/gen/
+/crates/mobile/src-tauri/gen/schemas/
+/crates/mobile/src-tauri/gen/android/app/src/main/jniLibs/
+/crates/mobile/src-tauri/gen/android/.kotlin/

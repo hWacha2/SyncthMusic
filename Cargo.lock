@@ -4155,6 +4155,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syncth-mobile"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "syncth-core",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
