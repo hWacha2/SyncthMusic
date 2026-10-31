@@ -1,5 +1,11 @@
 /target
 **/*.rs.bk
+
+# IDE
+.idea/
+*.iml
+.fleet/
+
 .syncth-data/
 .demo/
 *.db
