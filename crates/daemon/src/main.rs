@@ -368,7 +368,7 @@ fn worker(
         match commands.recv_timeout(Duration::from_millis(200)) {
             Ok(Cmd::Scan(reply)) => {
                 let res = do_scan(&mut replica, &root, &runtime, cfg.notify)
-                    .map(|_| "скан завершён".to_string());
+                    .map(|_| "Сканирование завершено".to_string());
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Sync(reply)) => {

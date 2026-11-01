@@ -161,11 +161,7 @@ function overviewView(snap) {
   const pending = snap.pending.length;
   const conflicts = snap.conflicts.length;
   const peers = snap.known_peers.length;
-  const tone = pending || conflicts ? 'var(--warn)' : 'var(--lime)';
-  const progress = pending || conflicts ? 0.38 : 1;
-  const title = pending || conflicts
-    ? t('overview.title.attention')
-    : t('overview.title.ok');
+  const title = t('overview.title.ok');
   const hint = pending
     ? tp('overview.hint.pending', pending)
     : conflicts
@@ -173,15 +169,25 @@ function overviewView(snap) {
       : t('overview.hint.ok');
   const root = snap.root || '';
 
-  const pendingRow = pending
-    ? `<div class="rows">${snap.pending.slice(0, 3).map((p) => `
-        <div class="row">
-          <div class="row-top"><span class="row-path">${esc(p.path)}</span></div>
-          <div class="row-meta">${esc(t('pending.rowMeta', { ago: ago(p.detected_at) }))}</div>
-        </div>`).join('')}</div>
-      ${pending > 3 ? `<p class="hint">${esc(t('attention.more', { n: pending - 3 }))}</p>` : ''}
-      <div class="actions"><button class="btn btn--block btn--soft" data-tab-jump="pending">${esc(t('pending.toQueue'))}</button></div>`
-    : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('pending.emptyTitle'))}</b><p>${esc(t('pending.emptyText'))}</p></div>`;
+  const alerts = [];
+  if (pending) {
+    alerts.push({
+      icon: 'alert',
+      tone: 'bad',
+      title: tp('alert.pending.title', pending),
+      text: t('alert.pending.text'),
+      action: `<button class="btn btn--sm" data-tab-jump="pending">${esc(t('alert.pending.action'))}</button>`,
+    });
+  }
+  if (conflicts) {
+    alerts.push({
+      icon: 'split',
+      tone: 'bad',
+      title: tp('alert.conflicts.title', conflicts),
+      text: t('alert.conflicts.text'),
+      action: `<button class="btn btn--sm" data-tab-jump="pending">${esc(t('alert.pending.action'))}</button>`,
+    });
+  }
 
   return `
   <section class="panel">
@@ -191,9 +197,9 @@ function overviewView(snap) {
         <h1 class="hero-title">${esc(title)}</h1>
         <p class="hero-hint">${esc(hint)}</p>
       </div>
-      <div class="dial" style="--p:${progress};--tone:${tone}">
+      <div class="dial" style="--p:1;--tone:var(--lime)">
         <div class="dial-inner">
-          <span class="dial-num">${pending || conflicts ? '!' : 'OK'}</span>
+          <span class="dial-num">OK</span>
           <span class="dial-sub">${num(snap.files)}</span>
         </div>
       </div>
@@ -227,16 +233,23 @@ function overviewView(snap) {
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <span class="kicker">${esc(t('section.deletions'))}</span>
-      <span class="chip ${pending ? 'chip--warn' : 'chip--ok'}">${esc(pending ? t('chip.hasPending') : t('chip.clean'))}</span>
+      <div class="panel-title">${icon('alert')}${esc(t('panel.attention'))}</div>
+      <span class="tag ${alerts.length ? 'tag--warn' : 'tag--good'}">${esc(alerts.length ? tp('attention.count', alerts.length) : t('attention.clean'))}</span>
     </div>
-    ${pendingRow}
+    ${alerts.length
+      ? `<div class="alert-list">${alerts.map((alert) => `
+          <div class="alert">
+            <div class="alert-ico ${alert.tone}">${icon(alert.icon)}</div>
+            <div class="alert-body"><b>${esc(alert.title)}</b><p>${esc(alert.text)}</p></div>
+            ${alert.action}
+          </div>`).join('')}</div>`
+      : `<div class="calm">${icon('check')}<span>${esc(t('attention.empty'))}</span></div>`}
   </section>
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <span class="kicker">${esc(t('section.devices'))}</span>
-      <span class="chip">${peers ? num(peers) : esc(t('common.none'))}</span>
+      <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+      <span class="tag">${esc(peers ? t('devices.tag', { n: num(peers) }) : t('devices.tagEmpty'))}</span>
     </div>
     ${peers
       ? `<div class="rows">${snap.known_peers.map((p) => `
@@ -252,7 +265,7 @@ function overviewView(snap) {
   </section>
 
   <section class="panel panel--flat">
-    <div class="panel-head"><span class="kicker">${esc(t('section.folder'))}</span></div>
+    <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('panel.folder'))}</div></div>
     <div class="row-meta">${esc(root || t('folder.notSelected'))}</div>
     <div class="actions"><button class="btn btn--block btn--ghost" data-act="change-root">${esc(t('folder.change'))}</button></div>
   </section>`;
@@ -275,8 +288,8 @@ function pendingView(snap) {
   const conflicts = snap.conflicts.length ? `
     <section class="panel panel--flat">
       <div class="panel-head">
-        <span class="kicker">${esc(t('conflicts.kicker'))}</span>
-        <span class="chip chip--warn">${snap.conflicts.length}</span>
+        <div class="panel-title">${icon('split')}${esc(t('conflicts.kicker'))}</div>
+        <span class="tag tag--warn">${snap.conflicts.length}</span>
       </div>
       <div class="rows">${snap.conflicts.map((path) => `
         <div class="row">
@@ -356,14 +369,14 @@ function moreView(snap) {
 
     <section class="panel panel--flat">
       <div class="panel-head">
-        <span class="kicker">${esc(t('pair.devices'))}</span>
-        <span class="chip">${snap.known_peers.length || esc(t('common.none'))}</span>
+        <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+        <span class="tag">${snap.known_peers.length ? esc(t('devices.tag', { n: num(snap.known_peers.length) })) : esc(t('devices.tagEmpty'))}</span>
       </div>
       ${peers ? `<div class="rows">${peers}</div>` : `<div class="empty"><b>${esc(t('devices.emptyTitle'))}</b><p>${esc(t('pair.noDevices'))}</p></div>`}
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><span class="kicker">${esc(t('pair.library'))}</span></div>
+      <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('panel.folder'))}</div></div>
       <div class="row-meta">${esc(snap.root || '')}</div>
       <div class="row-meta">${num(snap.files)} ${plural('word.files', snap.files)} · ${esc(size(snap.size).text)}</div>
       <div class="actions">
@@ -372,7 +385,7 @@ function moreView(snap) {
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><span class="kicker">${esc(t('pair.language'))}</span></div>
+      <div class="panel-head"><div class="panel-title">${esc(t('pair.language'))}</div></div>
       <div class="actions">
         <button class="btn btn--sm${I18N.locale === 'ru' ? ' btn--lime' : ' btn--ghost'}" data-act="lang" data-lang="ru">Русский</button>
         <button class="btn btn--sm${I18N.locale === 'en' ? ' btn--lime' : ' btn--ghost'}" data-act="lang" data-lang="en">English</button>

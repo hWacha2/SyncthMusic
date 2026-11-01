@@ -192,7 +192,7 @@ function stateCopy(snap) {
         discSub: t('state.error.disc'),
         cap: t('state.error.cap'),
         title: t('state.error.title'),
-        sub: status.last_error ? String(status.last_error) : t('state.error.sub'),
+        sub: status.last_error && I18N.locale === 'ru' ? String(status.last_error) : t('state.error.sub'),
       };
     default:
       return {
@@ -417,7 +417,7 @@ function renderOverview() {
       icon: 'alert',
       tone: 'bad',
       title: t('alert.error.title'),
-      text: String(status.last_error).slice(0, 180),
+      text: I18N.locale === 'ru' ? String(status.last_error).slice(0, 180) : t('alert.error.text'),
       action: `<button class="btn btn--sm" data-view="settings">${esc(t('alert.error.action'))}</button>`,
     });
   }
