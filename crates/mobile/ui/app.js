@@ -206,7 +206,7 @@ function overviewView(snap) {
     </div>
     <div class="actions">
       <button class="btn btn--primary" data-act="sync" ${state.busy ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>
-      <button class="btn btn--soft" data-act="scan" ${state.busy ? 'disabled' : ''}>${icon('scan')}${esc(t('act.scan'))}</button>
+      <button class="btn btn--soft" data-act="scan" ${state.busy ? 'disabled' : ''}>${icon('rescan')}${esc(t('act.scan'))}</button>
     </div>
   </section>
 
@@ -349,6 +349,7 @@ function moreView(snap) {
       <p class="hero-hint">${esc(t('pair.hint'))}</p>
       <div class="actions">
         <button class="btn btn--primary" data-act="pair-code">${icon('qr')}${esc(t('pair.myCode'))}</button>
+        <button class="btn btn--soft" data-act="pair-scan">${icon('camera')}${esc(t('pair.scan'))}</button>
       </div>
       ${state.code ? `
         <div class="field">
@@ -476,6 +477,9 @@ async function action(name, payload) {
     case 'pair-accept':
       await pairAccept();
       break;
+    case 'pair-scan':
+      await scanQr();
+      break;
     case 'lang':
       I18N.setLocale(payload);
       break;
@@ -501,11 +505,99 @@ async function pairAccept() {
   const input = $('#pair-input');
   const code = input ? input.value.trim() : '';
   if (!code) { toast(t('toast.needCode'), true); return; }
+  await pairAcceptCode(code);
+}
+
+async function pairAcceptCode(code) {
   await run(t('run.pair'), async () => {
     const result = await invoke('pair_accept', { code });
     await loadStatus();
     toast(t('toast.paired', { dev: result.dev }));
   });
+}
+
+// ------------------------------------------------------------------ QR-сканер
+
+let qrScan = null;
+
+async function scanQr() {
+  if (qrScan) return;
+  if (!('BarcodeDetector' in window) || !navigator.mediaDevices) {
+    toast(t('pair.scanUnsupported'), true);
+    return;
+  }
+
+  const host = document.createElement('div');
+  host.className = 'qr-scan';
+  host.innerHTML = `
+    <video id="qr-video" playsinline muted autoplay></video>
+    <div class="qr-frame" aria-hidden="true"></div>
+    <div class="qr-scan-bar">
+      <p class="qr-scan-hint">${esc(t('pair.scanHint'))}</p>
+      <button class="btn btn--block btn--soft" data-qr-close>${esc(t('pair.scanCancel'))}</button>
+    </div>`;
+  document.body.append(host);
+
+  const session = { host, stream: null, timer: null };
+  qrScan = session;
+  host.querySelector('[data-qr-close]').addEventListener('click', stopQrScan);
+
+  try {
+    const formats = await BarcodeDetector.getSupportedFormats().catch(() => []);
+    if (!formats.includes('qr_code')) {
+      stopQrScan();
+      toast(t('pair.scanUnsupported'), true);
+      return;
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' } },
+    });
+    if (qrScan !== session) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    session.stream = stream;
+
+    const video = host.querySelector('video');
+    video.srcObject = stream;
+    await video.play();
+
+    const detector = new BarcodeDetector({ formats: ['qr_code'] });
+    const tick = async () => {
+      if (qrScan !== session) return;
+      try {
+        const found = await detector.detect(video);
+        const code = found
+          .map((item) => item.rawValue)
+          .find((value) => value && value.startsWith('syncth://pair'));
+        if (code) {
+          stopQrScan();
+          await pairAcceptCode(code);
+          return;
+        }
+      } catch {
+        // Кадр без кода — просто пробуем следующий.
+      }
+      if (qrScan === session) session.timer = setTimeout(tick, 250);
+    };
+    session.timer = setTimeout(tick, 250);
+  } catch (error) {
+    stopQrScan();
+    toast(error && error.name === 'NotAllowedError' ? t('pair.scanDenied') : errText(error), true);
+  }
+}
+
+function stopQrScan() {
+  if (!qrScan) return;
+  const session = qrScan;
+  qrScan = null;
+  clearTimeout(session.timer);
+  if (session.stream) session.stream.getTracks().forEach((track) => track.stop());
+  const video = session.host.querySelector('video');
+  if (video) video.srcObject = null;
+  session.host.remove();
 }
 
 async function copy(text) {

@@ -490,7 +490,7 @@ function renderOverview() {
         <p class="state-sub">${esc(copy.sub)}</p>
         <div class="hero-actions">
           ${primaryAction}
-          <button class="btn" data-act="scan" ${!snap.running || (status && status.state === 'syncing') ? 'disabled' : ''}>${icon('scan')}${esc(t('act.scan'))}</button>
+          <button class="btn" data-act="scan" ${!snap.running || (status && status.state === 'syncing') ? 'disabled' : ''}>${icon('rescan')}${esc(t('act.scan'))}</button>
           ${pauseAction}
           <button class="icon-btn" data-act="open-root" title="${esc(t('act.openFolder'))}" ${snap.root ? '' : 'disabled'}>${icon('folder')}</button>
         </div>
