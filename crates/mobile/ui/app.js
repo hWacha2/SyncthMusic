@@ -94,6 +94,8 @@ function render() {
 
   const led = $('#app-led');
   const stateText = $('#app-state');
+  const progress = $('#progress');
+  if (progress) progress.hidden = !state.busy;
   const problems = snap.pending.length + snap.conflicts.length;
   led.className = 'led ' + (state.busy ? 'led--warn' : problems ? 'led--warn' : state.status ? 'led--ok' : '');
   stateText.textContent = state.busy
@@ -108,6 +110,10 @@ function render() {
   badge.textContent = String(snap.pending.length);
   badge.hidden = !snap.pending.length;
 
+  const conflictBadge = $('#badge-conflicts');
+  conflictBadge.textContent = String(snap.conflicts.length);
+  conflictBadge.hidden = !snap.conflicts.length;
+
   for (const tab of document.querySelectorAll('.tab')) {
     tab.classList.toggle('is-on', tab.dataset.tab === state.tab);
     const label = tab.querySelector('span[data-i18n]');
@@ -120,6 +126,7 @@ function render() {
     return;
   }
   if (state.tab === 'pending') view.innerHTML = pendingView(snap);
+  else if (state.tab === 'conflicts') view.innerHTML = conflictsView(snap);
   else if (state.tab === 'vault') view.innerHTML = vaultView(snap);
   else if (state.tab === 'more') view.innerHTML = moreView(snap);
   else view.innerHTML = overviewView(snap);
@@ -185,7 +192,7 @@ function overviewView(snap) {
       tone: 'bad',
       title: tp('alert.conflicts.title', conflicts),
       text: t('alert.conflicts.text'),
-      action: `<button class="btn btn--sm" data-tab-jump="pending">${esc(t('alert.pending.action'))}</button>`,
+      action: `<button class="btn btn--sm" data-tab-jump="conflicts">${esc(t('alert.conflicts.action'))}</button>`,
     });
   }
 
@@ -233,7 +240,7 @@ function overviewView(snap) {
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <div class="panel-title">${icon('alert')}${esc(t('panel.attention'))}</div>
+      <div class="panel-title">${esc(t('panel.attention'))}</div>
       <span class="tag ${alerts.length ? 'tag--warn' : 'tag--good'}">${esc(alerts.length ? tp('attention.count', alerts.length) : t('attention.clean'))}</span>
     </div>
     ${alerts.length
@@ -248,7 +255,7 @@ function overviewView(snap) {
 
   <section class="panel panel--flat">
     <div class="panel-head">
-      <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+      <div class="panel-title">${esc(t('panel.devices'))}</div>
       <span class="tag">${esc(peers ? t('devices.tag', { n: num(peers) }) : t('devices.tagEmpty'))}</span>
     </div>
     ${peers
@@ -265,7 +272,7 @@ function overviewView(snap) {
   </section>
 
   <section class="panel panel--flat">
-    <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('panel.folder'))}</div></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('panel.folder'))}</div></div>
     <div class="row-meta">${esc(root || t('folder.notSelected'))}</div>
     <div class="actions"><button class="btn btn--block btn--ghost" data-act="change-root">${esc(t('folder.change'))}</button></div>
   </section>`;
@@ -285,20 +292,6 @@ function pendingView(snap) {
       </div>
     </div>`).join('');
 
-  const conflicts = snap.conflicts.length ? `
-    <section class="panel panel--flat">
-      <div class="panel-head">
-        <div class="panel-title">${icon('split')}${esc(t('conflicts.kicker'))}</div>
-        <span class="tag tag--warn">${snap.conflicts.length}</span>
-      </div>
-      <div class="rows">${snap.conflicts.map((path) => `
-        <div class="row">
-          <div class="row-top">${icon('split', '')}<span class="row-path">${esc(path)}</span></div>
-          <div class="row-meta">${esc(t('conflicts.rowMeta'))}</div>
-        </div>`).join('')}</div>
-      <p class="hint">${esc(t('conflicts.hint'))}</p>
-    </section>` : '';
-
   return `<section class="panel">
       <div class="kicker">${esc(t('queue.kicker'))}</div>
       <h1 class="hero-title">${esc(snap.pending.length ? t('queue.title') : t('queue.titleEmpty'))}</h1>
@@ -309,8 +302,26 @@ function pendingView(snap) {
         ? `<div class="rows">${rows}</div>
            <p class="hint">${esc(t('queue.explain'))}</p>`
         : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('pending.emptyTitle'))}</b><p>${esc(t('queue.emptyText'))}</p></div>`}
+    </section>`;
+}
+
+function conflictsView(snap) {
+  const rows = snap.conflicts.map((path) => `
+    <div class="row">
+      <div class="row-top">${icon('split', '')}<span class="row-path">${esc(path)}</span></div>
+      <div class="row-meta">${esc(t('conflicts.rowMeta'))}</div>
+    </div>`).join('');
+
+  return `<section class="panel">
+      <h1 class="hero-title">${esc(t('conflicts.title'))}</h1>
+      <p class="hero-hint">${esc(t('conflicts.sub'))}</p>
     </section>
-    ${conflicts}`;
+    <section class="panel panel--flat">
+      ${snap.conflicts.length
+        ? `<div class="rows">${rows}</div>
+           <p class="hint">${esc(t('conflicts.hint'))}</p>`
+        : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('conflicts.emptyTitle'))}</b><p>${esc(t('conflicts.emptyText'))}</p></div>`}
+    </section>`;
 }
 
 function vaultView(snap) {
@@ -324,7 +335,6 @@ function vaultView(snap) {
     </div>`).join('');
 
   return `<section class="panel">
-      <div class="kicker">${esc(t('vault.kicker'))}</div>
       <h1 class="hero-title">${esc(t('vault.title'))}</h1>
       <p class="hero-hint">${esc(t('vault.hint'))}</p>
     </section>
@@ -344,7 +354,6 @@ function moreView(snap) {
     </div>`).join('');
 
   return `<section class="panel">
-      <div class="kicker">${esc(t('pair.kicker'))}</div>
       <h1 class="hero-title">${esc(t('pair.title'))}</h1>
       <p class="hero-hint">${esc(t('pair.hint'))}</p>
       <div class="actions">
@@ -370,14 +379,14 @@ function moreView(snap) {
 
     <section class="panel panel--flat">
       <div class="panel-head">
-        <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+        <div class="panel-title">${esc(t('panel.devices'))}</div>
         <span class="tag">${snap.known_peers.length ? esc(t('devices.tag', { n: num(snap.known_peers.length) })) : esc(t('devices.tagEmpty'))}</span>
       </div>
       ${peers ? `<div class="rows">${peers}</div>` : `<div class="empty"><b>${esc(t('devices.emptyTitle'))}</b><p>${esc(t('pair.noDevices'))}</p></div>`}
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('panel.folder'))}</div></div>
+      <div class="panel-head"><div class="panel-title">${esc(t('panel.folder'))}</div></div>
       <div class="row-meta">${esc(snap.root || '')}</div>
       <div class="row-meta">${num(snap.files)} ${plural('word.files', snap.files)} · ${esc(size(snap.size).text)}</div>
       <div class="actions">

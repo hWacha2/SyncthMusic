@@ -92,6 +92,30 @@ body {
 
 .appbar-right { display: flex; align-items: center; gap: 7px; flex: none; }
 
+.progress {
+  position: relative;
+  z-index: 3;
+  flex: none;
+  height: 3px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.progress[hidden] { display: none; }
+
+.progress span {
+  display: block;
+  width: 38%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--ember), var(--lime), transparent);
+  animation: progress-sweep 1.15s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(320%); }
+}
+
 .appbar-state { font-size: 12px; color: var(--muted); letter-spacing: 0.02em; }
 
 .led {
@@ -175,10 +199,10 @@ body {
   font: 600 10.5px/1 var(--mono);
   letter-spacing: 0.18em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--ember-2);
 }
 
-.panel-title svg { width: 15px; height: 15px; color: var(--ember); flex: none; }
+.panel-title svg { width: 15px; height: 15px; color: var(--ember-2); flex: none; }
 
 .chip {
   font: 600 10.5px/1 var(--mono);
@@ -447,7 +471,7 @@ body {
   z-index: 4;
   flex: none;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 2px;
   padding: 6px 8px calc(8px + var(--safe-bottom));
   border-top: 1px solid var(--line-soft);

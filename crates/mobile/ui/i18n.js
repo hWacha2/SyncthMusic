@@ -28,6 +28,7 @@ const I18N = (() => {
     'alert.conflicts.title.few': '{n} конфликта',
     'alert.conflicts.title.many': '{n} конфликтов',
     'alert.conflicts.text': 'Один путь изменён на двух устройствах. Обе версии на диске.',
+    'alert.conflicts.action': 'Открыть',
     'devices.tag': 'всего {n}',
     'devices.tagEmpty': 'нет',
 
@@ -40,6 +41,7 @@ const I18N = (() => {
 
     'tab.overview': 'Обзор',
     'tab.pending': 'Удаления',
+    'tab.conflicts': 'Конфликты',
     'tab.vault': 'Хранилище',
     'tab.more': 'Ещё',
 
@@ -109,8 +111,12 @@ const I18N = (() => {
     'queue.emptyText': 'Файлы, исчезнувшие с диска, появятся здесь.',
 
     'conflicts.kicker': 'Конфликты',
+    'conflicts.title': 'Конфликты',
+    'conflicts.sub': 'Один путь изменён на двух устройствах. Обе версии остаются на диске.',
     'conflicts.rowMeta': 'две версии файла',
     'conflicts.hint': 'Версию выбирает пользователь, приложение файлы не перезаписывает.',
+    'conflicts.emptyTitle': 'Конфликтов нет',
+    'conflicts.emptyText': 'Нет файлов с одним путём и разным содержимым.',
 
     'vault.kicker': 'Хранилище',
     'vault.title': 'Хранилище',
@@ -194,6 +200,7 @@ const I18N = (() => {
     'alert.conflicts.title.one': '{n} conflict',
     'alert.conflicts.title.other': '{n} conflicts',
     'alert.conflicts.text': 'One path changed on two devices. Both versions are on disk.',
+    'alert.conflicts.action': 'Open',
     'devices.tag': '{n} total',
     'devices.tagEmpty': 'none',
 
@@ -206,6 +213,7 @@ const I18N = (() => {
 
     'tab.overview': 'Overview',
     'tab.pending': 'Deletions',
+    'tab.conflicts': 'Conflicts',
     'tab.vault': 'Vault',
     'tab.more': 'More',
 
@@ -274,8 +282,12 @@ const I18N = (() => {
     'queue.emptyText': 'Files that disappear from disk will appear here.',
 
     'conflicts.kicker': 'Conflicts',
+    'conflicts.title': 'Conflicts',
+    'conflicts.sub': 'One path changed on two devices. Both versions stay on disk.',
     'conflicts.rowMeta': 'two versions of the file',
     'conflicts.hint': 'The user chooses the version; the app does not overwrite files.',
+    'conflicts.emptyTitle': 'No conflicts',
+    'conflicts.emptyText': 'No files with the same path and different content.',
 
     'vault.kicker': 'Vault',
     'vault.title': 'Vault',

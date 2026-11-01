@@ -34,6 +34,8 @@
   </div>
 </header>
 
+<div class="progress" id="progress" hidden><span></span></div>
+
 <main class="scroll" id="view">
   <section class="panel"><div class="empty"><b data-i18n="boot.loadingTitle">Загрузка</b><p data-i18n="boot.loadingText">Читаем библиотеку…</p></div></section>
 </main>
@@ -41,6 +43,7 @@
 <nav class="tabs" id="tabs">
   <button class="tab" data-tab="overview"><svg><use href="#i-disc"/></svg><span data-i18n="tab.overview">Обзор</span></button>
   <button class="tab" data-tab="pending"><svg><use href="#i-clock"/></svg><span data-i18n="tab.pending">Удаления</span><i class="badge" id="badge-pending" hidden></i></button>
+  <button class="tab" data-tab="conflicts"><svg><use href="#i-split"/></svg><span data-i18n="tab.conflicts">Конфликты</span><i class="badge" id="badge-conflicts" hidden></i></button>
   <button class="tab" data-tab="vault"><svg><use href="#i-box"/></svg><span data-i18n="tab.vault">Хранилище</span></button>
   <button class="tab" data-tab="more"><svg><use href="#i-devices"/></svg><span data-i18n="tab.more">Ещё</span></button>
 </nav>

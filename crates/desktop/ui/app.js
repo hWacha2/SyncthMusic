@@ -271,9 +271,11 @@ function chrome(snap, copy) {
 }
 
 function viewHead(kicker, title, sub, actions = '') {
+  const plain = (value) => String(value == null ? '' : value).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+  const showKicker = plain(kicker).toLowerCase() !== plain(title).toLowerCase();
   return `<div class="view-head">
     <div>
-      <div class="eyebrow">${esc(kicker)}</div>
+      ${showKicker ? `<div class="eyebrow">${esc(kicker)}</div>` : ''}
       <h1 class="view-title">${title}</h1>
       ${sub ? `<p class="view-sub">${sub}</p>` : ''}
     </div>
@@ -298,7 +300,7 @@ function renderOverview() {
   const status = snap.status;
   const connected = snap.peers.filter((peer) => !peer.error).length;
   const peerCount = Math.max(connected, snap.known.length);
-  const rootName = snap.root ? basename(snap.root) : t('rail.noLibrary');
+  const rootPath = snap.root || t('rail.noLibrary');
 
   const size = sizeParts(status ? status.size : 0);
   const vaultSize = snap.vault.reduce((sum, row) => sum + Number(row.size || 0), 0);
@@ -346,7 +348,7 @@ function renderOverview() {
 
   const signal = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('sync')}${esc(t('panel.connection'))}</div>
+      <div class="panel-title">${esc(t('panel.connection'))}</div>
       <span class="tag ${connected ? 'tag--good' : ''}">${esc(connected ? t('tag.connected') : t('tag.disconnected'))}</span>
     </div>
     <div class="signal">
@@ -439,7 +441,7 @@ function renderOverview() {
 
   const attention = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('alert')}${esc(t('panel.attention'))}</div>
+      <div class="panel-title">${esc(t('panel.attention'))}</div>
       <span class="tag ${alerts.length ? 'tag--warn' : 'tag--good'}">${esc(alerts.length ? tp('attention.count', alerts.length) : t('attention.clean'))}</span>
     </div>
     ${alerts.length
@@ -474,7 +476,7 @@ function renderOverview() {
 
   const peers = `<section class="panel">
     <div class="panel-head">
-      <div class="panel-title">${icon('devices')}${esc(t('panel.devices'))}</div>
+      <div class="panel-title">${esc(t('panel.devices'))}</div>
       <span class="tag">${esc(snap.known.length + snap.peers.length ? t('devices.tag', { n: snap.known.length + snap.peers.length }) : t('devices.tagEmpty'))}</span>
     </div>
     ${peerRows.length
@@ -485,7 +487,7 @@ function renderOverview() {
 
   return `<div class="hero">
       <div>
-        <div class="eyebrow">${esc(t('nav.overview'))} <span class="path">${esc(rootName)}</span></div>
+        <div class="eyebrow">${esc(t('nav.overview'))} <span class="path" title="${esc(snap.root || '')}">${esc(rootPath)}</span></div>
         <h1 class="state-title">${copy.title}</h1>
         <p class="state-sub">${esc(copy.sub)}</p>
         <div class="hero-actions">
@@ -537,7 +539,7 @@ function renderPending() {
     t('pending.sub'),
     snap.pending.length ? `<button class="btn btn--sm" data-view="vault">${icon('box')}${esc(t('nav.vault'))}</button>` : '',
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('clock')}${esc(t('panel.waiting'))}</div><span class="tag ${snap.pending.length ? 'tag--warn' : 'tag--good'}">${snap.pending.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('panel.waiting'))}</div><span class="tag ${snap.pending.length ? 'tag--warn' : 'tag--good'}">${snap.pending.length}</span></div>
     ${content}
   </section>`;
 }
@@ -566,7 +568,7 @@ function renderConflicts() {
     t('conflicts.sub'),
     `<button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('conflicts.openLibrary'))}</button>`,
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('split')}${esc(t('panel.conflicts'))}</div><span class="tag ${snap.conflicts.length ? 'tag--bad' : 'tag--good'}">${snap.conflicts.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('panel.conflicts'))}</div><span class="tag ${snap.conflicts.length ? 'tag--bad' : 'tag--good'}">${snap.conflicts.length}</span></div>
     ${content}
   </section>`;
 }
@@ -595,7 +597,7 @@ function renderVault() {
     t('vault.sub'),
     `<button class="btn btn--sm" data-act="gc">${icon('refresh')}${esc(t('vault.gc'))}</button>`,
   ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('box')}${esc(t('panel.restorable'))}</div><span class="tag ${snap.vault.length ? 'tag--warn' : ''}">${esc(tp('vault.count', snap.vault.length))}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('panel.restorable'))}</div><span class="tag ${snap.vault.length ? 'tag--warn' : ''}">${esc(tp('vault.count', snap.vault.length))}</span></div>
     ${content}
   </section>`;
 }
@@ -607,7 +609,7 @@ function renderDevices() {
   const status = snap.status;
 
   const current = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('pc')}${esc(t('node.thisPc'))}</div><span class="tag ${snap.running ? 'tag--good' : ''}">${esc(snap.running ? t('devices.tagOnline') : t('devices.tagOffline'))}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('node.thisPc'))}</div><span class="tag ${snap.running ? 'tag--good' : ''}">${esc(snap.running ? t('devices.tagOnline') : t('devices.tagOffline'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.id'))}</span><span class="kv-v">${esc(snap.device || t('common.dash'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.library'))}</span><span class="kv-v">${esc(snap.root || t('common.notSelected'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.syncAddr'))}</span><span class="kv-v">${esc((status && status.pair_addr) || snap.info.sync_addr || t('common.dash'))}</span></div>
@@ -644,7 +646,7 @@ function renderDevices() {
   });
 
   const known = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('devices')}${esc(t('devices.known'))}</div><span class="tag">${snap.known.length}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('devices.known'))}</div><span class="tag">${snap.known.length}</span></div>
     ${rows.length
       ? `<div class="rows">${rows.join('')}</div>`
       : emptyState('phone', t('devices.otherEmptyTitle'), t('devices.otherEmptyText'))}
@@ -688,7 +690,7 @@ function renderPair() {
 
   return head + `<div class="pair-grid">
     <section class="panel">
-      <div class="panel-head"><div class="panel-title">${icon('qr')}${esc(t('pair.panelCode'))}</div><span class="tag">${esc(pair.dev || snap.device || '')}</span></div>
+      <div class="panel-head"><div class="panel-title">${esc(t('pair.panelCode'))}</div><span class="tag">${esc(pair.dev || snap.device || '')}</span></div>
       <div class="code-box">${esc(pair.code)}</div>
       <div class="settings-actions">
         <button class="btn btn--sm" data-act="copy-code">${icon('copy')}${esc(t('pair.copy'))}</button>
@@ -705,7 +707,7 @@ function renderPair() {
       </form>
     </section>
     <section class="panel">
-      <div class="panel-head"><div class="panel-title">${icon('qr')}${esc(t('pair.qrPanel'))}</div><span class="tag">${esc(t('pair.qrTag'))}</span></div>
+      <div class="panel-head"><div class="panel-title">${esc(t('pair.qrPanel'))}</div><span class="tag">${esc(t('pair.qrTag'))}</span></div>
       <div class="qr-card">${qr}</div>
       <p class="view-sub" style="margin-top:12px">${esc(t('pair.qrNote'))}</p>
     </section>
@@ -729,7 +731,7 @@ function renderSettings() {
   const stateLabel = state.running ? (labels[rawState] || rawState || t('settings.running')) : t('stateLabel.stopped');
 
   const paths = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('folder')}${esc(t('settings.paths'))}</div></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('settings.paths'))}</div></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.music'))}</span><span class="kv-v">${esc(snap.root || t('common.notSelected'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.data'))}</span><span class="kv-v">${esc(info.data_dir)}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.config'))}</span><span class="kv-v">${esc(info.config_path)}</span></div>
@@ -741,7 +743,7 @@ function renderSettings() {
   </section>`;
 
   const daemon = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('sync')}${esc(t('settings.service'))}</div><span class="tag ${state.running ? 'tag--good' : ''}">${esc(state.running ? t('settings.running') : t('settings.stopped'))}</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('settings.service'))}</div><span class="tag ${state.running ? 'tag--good' : ''}">${esc(state.running ? t('settings.running') : t('settings.stopped'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.state'))}</span><span class="kv-v">${esc(stateLabel)}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.binary'))}</span><span class="kv-v">${esc(snap.daemonBin || t('common.none'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.port'))}</span><span class="kv-v">${esc(snap.info.sync_addr || '')}</span></div>
@@ -757,7 +759,7 @@ function renderSettings() {
   </section>`;
 
   const about = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('disc')}${esc(t('settings.about'))}</div><span class="tag">AGPL-3.0</span></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('settings.about'))}</div><span class="tag">AGPL-3.0</span></div>
     <div class="grid grid-2b" style="margin:0;gap:0">
       <div>
         <div class="kv"><span class="kv-k">${esc(t('kv.version'))}</span><span class="kv-v">${esc(info.version)}</span></div>
@@ -772,7 +774,7 @@ function renderSettings() {
   </section>`;
 
   const language = `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${icon('sliders')}${esc(t('settings.language'))}</div></div>
+    <div class="panel-head"><div class="panel-title">${esc(t('settings.language'))}</div></div>
     <div class="settings-actions">
       <button class="btn btn--sm${I18N.locale === 'ru' ? ' btn--primary' : ''}" data-act="lang" data-lang="ru">Русский</button>
       <button class="btn btn--sm${I18N.locale === 'en' ? ' btn--primary' : ''}" data-act="lang" data-lang="en">English</button>
