@@ -264,7 +264,7 @@ function chrome(snap, copy) {
   $('#rail-root').textContent = snap.root ? basename(snap.root) : t('rail.noLibrary');
   $('#rail-root').title = snap.root || '';
   $('#rail-daemon').textContent = state.running ? t('rail.serviceRunning') : t('rail.serviceStopped');
-  $('#rail-locale').textContent = I18N.locale === 'ru' ? 'English' : 'Русский';
+  $('#rail-locale').textContent = I18N.locale === 'ru' ? 'Русский' : 'English';
   $('#rail-ver').textContent = info ? `v${info.version} · AGPL-3.0` : '';
   $('#nav').innerHTML = onboard ? '' : navHtml(snap);
   $('#progress').hidden = !state.busy;

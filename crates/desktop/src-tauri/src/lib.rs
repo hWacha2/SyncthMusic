@@ -131,7 +131,7 @@ fn resolve_daemon_bin(config: &Config) -> Option<PathBuf> {
 fn http(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
     let addr: SocketAddr = UI_ADDR.parse().map_err(|e| format!("{e}"))?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1200))
-        .map_err(|e| format!("демон не отвечает: {e}"))?;
+        .map_err(|e| format!("Служба не отвечает: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(190)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
@@ -144,24 +144,24 @@ fn http(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
         .write_all(head.as_bytes())
         .and_then(|_| stream.write_all(body.as_bytes()))
         .and_then(|_| stream.flush())
-        .map_err(|e| format!("не удалось отправить запрос демону: {e}"))?;
+        .map_err(|e| format!("Не удалось отправить запрос службе: {e}"))?;
 
     let mut raw = Vec::new();
     stream
         .read_to_end(&mut raw)
-        .map_err(|e| format!("не удалось прочитать ответ демона: {e}"))?;
+        .map_err(|e| format!("Не удалось прочитать ответ службы: {e}"))?;
 
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "демон вернул некорректный ответ".to_string())?;
+        .ok_or_else(|| "Служба вернула некорректный ответ".to_string())?;
     let head = String::from_utf8_lossy(&raw[..split]);
     let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
-        .ok_or_else(|| "демон вернул ответ без статуса".to_string())?;
+        .ok_or_else(|| "Служба вернула ответ без статуса".to_string())?;
     let payload = String::from_utf8_lossy(&raw[split + 4..]);
     let value: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({ "raw": payload }));
 
@@ -169,7 +169,7 @@ fn http(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
         let message = value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("демон вернул ошибку");
+            .unwrap_or("Служба вернула ошибку");
         return Err(message.to_string());
     }
     Ok(value)
@@ -186,7 +186,7 @@ where
 {
     tauri::async_runtime::spawn_blocking(f)
         .await
-        .map_err(|e| format!("фоновая задача упала: {e}"))?
+        .map_err(|e| format!("Фоновая задача упала: {e}"))?
 }
 
 // ------------------------------------------------------------------ commands
@@ -270,7 +270,7 @@ async fn daemon_action(name: String, payload: Option<Value>) -> Result<Value, St
 #[tauri::command]
 fn start_daemon(state: tauri::State<'_, Desktop>) -> Result<Value, String> {
     if daemon_running() {
-        return Ok(json!({ "started": false, "message": "демон уже запущен" }));
+        return Ok(json!({ "started": false, "message": "Служба уже запущена" }));
     }
 
     let config = load_config();
@@ -362,9 +362,9 @@ async fn stop_daemon(app: tauri::AppHandle) -> Result<Value, String> {
         }
 
         if stopped {
-            Ok(json!({ "stopped": true, "message": "Демон остановлен" }))
+            Ok(json!({ "stopped": true, "message": "Служба остановлена" }))
         } else {
-            Err("не удалось остановить демон: процесс не отвечает".to_string())
+            Err("Не удалось остановить службу: процесс не отвечает".to_string())
         }
     })
     .await
@@ -374,7 +374,7 @@ async fn stop_daemon(app: tauri::AppHandle) -> Result<Value, String> {
 async fn initialize_library(root: String, data_dir: Option<String>) -> Result<Value, String> {
     blocking(move || {
         if daemon_running() {
-            return Err("остановите демон перед созданием библиотеки".to_string());
+            return Err("Остановите службу перед созданием библиотеки".to_string());
         }
         let root_path = PathBuf::from(&root);
         if !root_path.is_dir() {
@@ -418,7 +418,7 @@ async fn initialize_library(root: String, data_dir: Option<String>) -> Result<Va
 async fn change_library(folder: String) -> Result<Value, String> {
     blocking(move || {
         if daemon_running() {
-            return Err("сначала остановите демон (он держит библиотеку открытой)".to_string());
+            return Err("Сначала остановите службу (она держит библиотеку открытой)".to_string());
         }
         let root = PathBuf::from(&folder);
         if !root.is_dir() {

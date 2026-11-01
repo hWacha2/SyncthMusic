@@ -385,10 +385,10 @@ fn worker(
                     .unwrap_or_else(|| "неизвестно".into());
                 let msg: Result<String> = if low {
                     Err(anyhow::anyhow!(
-                        "мало места: свободно {free} — синхронизация приостановлена"
+                        "Мало места: свободно {free} — синхронизация приостановлена"
                     ))
                 } else {
-                    Ok(format!("места достаточно: свободно {free}"))
+                    Ok(format!("Места достаточно: свободно {free}"))
                 };
                 respond(reply, msg, &runtime);
             }
@@ -397,7 +397,7 @@ fn worker(
                     let info = net::parse_pair_code(&code)?;
                     replica.set_token(&info.token)?;
                     replica.add_peer(&info.dev, &info.addr)?;
-                    Ok(format!("сопряжено с {} ({})", info.dev, info.addr))
+                    Ok(format!("Сопряжено с {} ({})", info.dev, info.addr))
                 })();
                 let ok = res.is_ok();
                 respond(reply, res, &runtime);
@@ -414,7 +414,7 @@ fn worker(
             }) => {
                 let res = resolve::resolve(&mut replica, &path, action).map(|out| match action {
                     Action::DeleteEverywhere => format!(
-                        "удалено путей: {}; копия в корзине",
+                        "Удалено путей: {}; копия в корзине",
                         out.deleted_paths.len()
                     ),
                     Action::OnlyHere => {
@@ -454,13 +454,13 @@ fn worker(
             Ok(Cmd::Forget { path, reply }) => {
                 let res = replica
                     .clear_pending_delete(&path)
-                    .map(|_| format!("ожидание для «{path}» снято"));
+                    .map(|_| format!("Ожидание для «{path}» снято"));
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Gc(reply)) => {
                 let res = vault::gc(&replica, cfg.vault_days).map(|r| {
                     format!(
-                        "корзина: удалено записей {}, файлов {}, сирот {}",
+                        "Корзина: удалено записей {}, файлов {}, сирот {}",
                         r.rows_removed, r.blobs_removed, r.orphans_removed
                     )
                 });
@@ -469,9 +469,9 @@ fn worker(
             Ok(Cmd::Pause { paused, reply }) => {
                 runtime.lock().unwrap().paused = paused;
                 let _ = reply.send(Ok(if paused {
-                    "автосинк на паузе".into()
+                    "Автосинк на паузе".into()
                 } else {
-                    "автосинк включён".into()
+                    "Автосинк включён".into()
                 }));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -630,7 +630,7 @@ fn do_sync(
 
     if targets.is_empty() {
         if manual {
-            bail!("никого не нашли: включён ли демон на другом устройстве и та же ли это сеть?");
+            bail!("Никого не нашли: включена ли служба на другом устройстве и та же ли это сеть?");
         }
         return Ok(String::new());
     }
@@ -679,11 +679,11 @@ fn do_sync(
     if done.is_empty() {
         let all = errors.join("; ");
         runtime.lock().unwrap().last_error = Some(all.clone());
-        bail!("синхронизация не удалась: {all}");
+        bail!("Синхронизация не удалась: {all}");
     }
     let mut msg = done.join("; ");
     if !errors.is_empty() {
-        msg.push_str(&format!(" | ошибки: {}", errors.join("; ")));
+        msg.push_str(&format!(" | Ошибки: {}", errors.join("; ")));
         runtime.lock().unwrap().last_error = Some(errors.join("; "));
     }
     Ok(msg)
@@ -934,18 +934,18 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
                 std::thread::sleep(Duration::from_millis(300));
                 std::process::exit(0);
             });
-            Ok("демон остановлен".to_string())
+            Ok("Служба остановлена".to_string())
         }
-        other => Err(format!("неизвестный запрос: {other}")),
+        other => Err(format!("Неизвестный запрос: {other}")),
     }
 }
 
 fn run_cmd(tx: &Sender<Cmd>, make: impl FnOnce(Reply) -> Cmd) -> Result<String, String> {
     let (reply, rx) = mpsc::channel();
     tx.send(make(reply))
-        .map_err(|_| "демон остановлен".to_string())?;
+        .map_err(|_| "Служба остановлена".to_string())?;
     rx.recv_timeout(Duration::from_secs(180))
-        .map_err(|_| "операция не завершилась за 3 минуты".to_string())?
+        .map_err(|_| "Операция не завершилась за 3 минуты".to_string())?
 }
 
 fn api_status(ctx: &UiCtx) -> Value {
