@@ -1,9 +1,12 @@
 const I18N = (() => {
   const ru = {
-    'start.title': 'Где лежит музыка?',
-    'start.text': 'Укажите папку с библиотекой. SynctMusic ничего не переносит, не переименовывает и не отправляет в облако.',
+    'start.title': 'Папка с музыкой',
+    'start.text': 'Выберите папку на этом устройстве. Файлы передаются напрямую между устройствами — без облака и серверов.',
     'start.action': 'Выбрать папку',
-    'start.scanning': 'Сканируем папку…',
+    'start.scanning': 'Сканируем…',
+    'map.this': 'Это устройство',
+    'map.peer': 'Другое устройство',
+    'map.note': 'Напрямую, без облака',
     'workspace.label': 'Библиотека',
     'picker.title': 'Выберите папку',
     'picker.up': 'Наверх',
@@ -19,10 +22,13 @@ const I18N = (() => {
   };
 
   const en = {
-    'start.title': 'Where does the music live?',
-    'start.text': 'Choose the folder that holds your library. SynctMusic never moves, renames, or uploads anything.',
+    'start.title': 'Your music folder',
+    'start.text': 'Choose a folder on this device. Files move directly between devices — no cloud, no servers.',
     'start.action': 'Choose folder',
-    'start.scanning': 'Scanning folder…',
+    'start.scanning': 'Scanning…',
+    'map.this': 'This device',
+    'map.peer': 'Other device',
+    'map.note': 'Direct, no cloud',
     'workspace.label': 'Library',
     'picker.title': 'Choose a folder',
     'picker.up': 'Up',

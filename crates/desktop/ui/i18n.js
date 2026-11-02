@@ -1,11 +1,14 @@
 const I18N = (() => {
   const ru = {
-    'start.title': 'Где лежит музыка?',
-    'start.text': 'Укажите папку с библиотекой. SynctMusic ничего не переносит, не переименовывает и не отправляет в облако.',
+    'start.title': 'Папка с музыкой',
+    'start.text': 'Выберите папку на этом устройстве. Файлы передаются напрямую между устройствами — без облака и серверов.',
     'start.action': 'Выбрать папку',
-    'start.scanning': 'Сканируем папку…',
-    'start.local': 'Папка остаётся на этом устройстве',
+    'start.scanning': 'Сканируем…',
+    'start.local': 'Файлы остаются на устройстве',
     'start.version': 'версия {version}',
+    'map.this': 'Это устройство',
+    'map.peer': 'Другое устройство',
+    'map.note': 'Напрямую, без облака',
     'dialog.pick': 'Выберите папку с музыкой',
     'workspace.label': 'Библиотека',
     'error.bridge': 'Нет доступа к приложению',
@@ -17,12 +20,15 @@ const I18N = (() => {
   };
 
   const en = {
-    'start.title': 'Where does the music live?',
-    'start.text': 'Choose the folder that holds your library. SynctMusic never moves, renames, or uploads anything.',
+    'start.title': 'Your music folder',
+    'start.text': 'Choose a folder on this device. Files move directly between devices — no cloud, no servers.',
     'start.action': 'Choose folder',
-    'start.scanning': 'Scanning folder…',
-    'start.local': 'The folder stays on this device',
+    'start.scanning': 'Scanning…',
+    'start.local': 'Files stay on this device',
     'start.version': 'version {version}',
+    'map.this': 'This device',
+    'map.peer': 'Other device',
+    'map.note': 'Direct, no cloud',
     'dialog.pick': 'Choose the music folder',
     'workspace.label': 'Library',
     'error.bridge': 'The application bridge is unavailable',

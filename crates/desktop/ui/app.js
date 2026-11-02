@@ -36,6 +36,35 @@ function iconFolder() {
   </svg>`;
 }
 
+function iconMonitor() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="3.5" y="4.5" width="17" height="12" rx="2"/>
+    <path d="M9 20h6M12 16.5V20"/>
+  </svg>`;
+}
+
+function iconPhone() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="7" y="3" width="10" height="18" rx="2.4"/>
+    <path d="M10.5 18h3"/>
+  </svg>`;
+}
+
+function devicesView() {
+  return `<aside class="devices devices--stack" aria-hidden="true">
+    <div class="device">
+      <span class="device-icon">${iconMonitor()}</span>
+      <span class="device-label">${esc(t('map.this'))}</span>
+    </div>
+    <span class="device-line"></span>
+    <div class="device">
+      <span class="device-icon">${iconPhone()}</span>
+      <span class="device-label">${esc(t('map.peer'))}</span>
+    </div>
+    <p class="devices-note">${esc(t('map.note'))}</p>
+  </aside>`;
+}
+
 function welcomeView() {
   const version = state.info?.version || '0.1.0';
   const note = state.error
@@ -43,7 +72,7 @@ function welcomeView() {
     : `<p class="welcome-note">${esc(state.note)}</p>`;
 
   return `<section class="welcome">
-    <div class="welcome-content">
+    <div class="welcome-inner">
       <div class="welcome-copy">
         <h1 class="welcome-title">${esc(t('start.title'))}</h1>
         <p class="welcome-text">${esc(t('start.text'))}</p>
@@ -55,12 +84,12 @@ function welcomeView() {
         </div>
         ${note}
       </div>
-      <footer class="welcome-foot">
-        <span>${esc(t('start.local'))}</span>
-        <span>${esc(t('start.version', { version }))}</span>
-      </footer>
+      ${devicesView()}
     </div>
-    <div class="orbit" aria-hidden="true"></div>
+    <footer class="welcome-foot">
+      <span>${esc(t('start.local'))}</span>
+      <span>${esc(t('start.version', { version }))}</span>
+    </footer>
   </section>`;
 }
 

@@ -46,6 +46,20 @@ function iconFolder() {
   </svg>`;
 }
 
+function iconMonitor() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="3.5" y="4.5" width="17" height="12" rx="2"/>
+    <path d="M9 20h6M12 16.5V20"/>
+  </svg>`;
+}
+
+function iconPhone() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="7" y="3" width="10" height="18" rx="2.4"/>
+    <path d="M10.5 18h3"/>
+  </svg>`;
+}
+
 function iconUp() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg>`;
 }
@@ -61,6 +75,21 @@ function topbar() {
   </header>`;
 }
 
+function devicesView() {
+  return `<aside class="devices" aria-hidden="true">
+    <div class="device">
+      <span class="device-icon">${iconMonitor()}</span>
+      <span class="device-label">${esc(t('map.this'))}</span>
+    </div>
+    <span class="device-line"></span>
+    <div class="device">
+      <span class="device-icon">${iconPhone()}</span>
+      <span class="device-label">${esc(t('map.peer'))}</span>
+    </div>
+    <p class="devices-note">${esc(t('map.note'))}</p>
+  </aside>`;
+}
+
 function welcomeView() {
   const note = state.error
     ? `<p class="welcome-note is-error" role="alert">${esc(state.note)}</p>`
@@ -71,6 +100,7 @@ function welcomeView() {
     <div class="welcome-copy">
       <h1 class="welcome-title">${esc(t('start.title'))}</h1>
       <p class="welcome-text">${esc(t('start.text'))}</p>
+      ${devicesView()}
     </div>
     <div class="welcome-actions">
       ${note}
@@ -79,7 +109,6 @@ function welcomeView() {
         <span>${esc(state.busy ? t('start.scanning') : t('start.action'))}</span>
       </button>
     </div>
-    <div class="orbit" aria-hidden="true"></div>
   </section>`;
 }
 

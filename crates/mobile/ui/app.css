@@ -1,16 +1,19 @@
 :root {
   --bg: #151517;
-  --panel: #1b1b1e;
-  --line: #28282d;
-  --line-strong: #3b3b42;
-  --text: #ecebe7;
-  --muted: #a09d97;
-  --dim: #74716c;
-  --accent: #ff6a3d;
-  --accent-ink: #17100d;
-  --danger: #ff9b84;
-  --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, "Noto Serif", serif;
-  --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --surface: #1b1c1f;
+  --surface-2: #212226;
+  --line: rgba(255, 255, 255, 0.075);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --text: #f1f2f3;
+  --muted: #a6a9ae;
+  --dim: #75787e;
+  --action: #ececee;
+  --action-hover: #ffffff;
+  --action-ink: #141517;
+  --focus: #9ea3ab;
+  --danger: #e09086;
+  --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
+  --display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
   --mono: "Cascadia Mono", "SFMono-Regular", Consolas, "Roboto Mono", monospace;
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -42,7 +45,7 @@ button {
 }
 
 button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: 3px;
 }
 
@@ -57,57 +60,68 @@ button:focus-visible {
 .topbar {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   padding-top: calc(18px + var(--safe-top));
 }
 
 .brand-mark {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
+  position: relative;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+}
+
+.brand-mark::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 3px;
+  left: 3px;
+  height: 1px;
+  background: var(--muted);
+  box-shadow: 0 4px 0 var(--muted);
 }
 
 .brand-name {
   font-size: 12.5px;
   font-weight: 600;
-  letter-spacing: 0.01em;
+  letter-spacing: 0.005em;
 }
 
 /* ------------------------------------------------------------------ выбор папки */
 
 .welcome {
-  position: relative;
   min-height: 100%;
   display: grid;
   grid-template-rows: auto 1fr auto;
-  padding: 0 24px calc(24px + var(--safe-bottom));
-  overflow: hidden;
+  padding: 0 20px calc(22px + var(--safe-bottom));
 }
 
 .welcome-copy {
   align-self: center;
-  padding: 30px 0;
-  animation: settle 0.38s ease-out both;
+  padding: 32px 0;
+  animation: settle 0.24s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .welcome-title {
-  max-width: 11ch;
+  max-width: 12ch;
   margin: 0;
-  font-family: var(--serif);
-  font-size: clamp(42px, 12vw, 57px);
-  font-weight: 400;
-  line-height: 0.98;
-  letter-spacing: -0.035em;
+  font-family: var(--display);
+  font-size: clamp(32px, 9vw, 40px);
+  font-weight: 600;
+  line-height: 1.06;
+  letter-spacing: -0.03em;
   text-wrap: balance;
 }
 
 .welcome-text {
-  max-width: 33ch;
-  margin: 22px 0 0;
+  max-width: 34ch;
+  margin: 18px 0 0;
   color: var(--muted);
   font-size: 15px;
-  line-height: 1.62;
+  line-height: 1.6;
+  text-wrap: pretty;
 }
 
 .welcome-actions {
@@ -139,54 +153,108 @@ button:focus-visible {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  height: 58px;
+  height: 52px;
   border: 0;
-  border-radius: 3px;
-  background: var(--accent);
-  color: var(--accent-ink);
+  border-radius: 10px;
+  background: var(--action);
+  color: var(--action-ink);
   font-size: 15px;
   font-weight: 600;
+  letter-spacing: -0.005em;
   cursor: pointer;
+  transition: background 0.15s ease, transform 0.12s ease;
 }
 
 .choose:active {
-  background: #f25e32;
+  background: var(--action-hover);
+  transform: scale(0.99);
 }
 
 .choose:disabled {
-  background: #2b2927;
-  color: var(--muted);
+  background: var(--surface-2);
+  color: var(--dim);
   cursor: default;
+  transform: none;
 }
 
 .choose svg {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.6;
   stroke-linejoin: round;
 }
 
-.orbit {
-  position: absolute;
-  top: -25vw;
-  right: -31vw;
-  width: min(88vw, 460px);
-  aspect-ratio: 1;
-  border: 1px solid rgba(236, 235, 231, 0.075);
-  border-radius: 50%;
-  pointer-events: none;
+/* ------------------------------------------------------------------ схема */
+
+.devices {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 28px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
 }
 
-.orbit::before {
+.device {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.device-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.device-icon svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.device-label {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+}
+
+.device-line {
+  position: relative;
+  flex: 1;
+  height: 1px;
+  background: var(--line-strong);
+}
+
+.device-line::after {
   content: "";
   position: absolute;
-  inset: 11%;
-  border: 1px solid rgba(236, 235, 231, 0.045);
+  top: -2px;
+  right: 0;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
+  background: var(--muted);
+}
+
+.devices-note {
+  display: none;
 }
 
 /* ------------------------------------------------------------------ пустое окно */
@@ -195,7 +263,7 @@ button:focus-visible {
   min-height: 100%;
   display: flex;
   flex-direction: column;
-  padding: 0 24px calc(20px + var(--safe-bottom));
+  padding: 0 20px calc(20px + var(--safe-bottom));
 }
 
 .workspace .topbar {
@@ -213,8 +281,8 @@ button:focus-visible {
 
 .workspace-label {
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .workspace-path {
@@ -253,7 +321,7 @@ button:focus-visible {
   flex-direction: column;
   background: var(--bg);
   padding-top: var(--safe-top);
-  animation: sheet-in 0.22s ease-out both;
+  animation: sheet-in 0.2s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .picker-head {
@@ -270,6 +338,7 @@ button:focus-visible {
 .picker-title {
   font-size: 14px;
   font-weight: 600;
+  letter-spacing: -0.005em;
   text-align: center;
 }
 
@@ -279,9 +348,14 @@ button:focus-visible {
   width: 44px;
   height: 44px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
+}
+
+.picker-close:active {
+  background: var(--surface-2);
 }
 
 .picker-close svg {
@@ -327,7 +401,7 @@ button:focus-visible {
 }
 
 .picker-row:active {
-  background: var(--panel);
+  background: var(--surface);
 }
 
 .picker-row svg {
@@ -387,30 +461,47 @@ button:focus-visible {
 
 .picker-use {
   width: 100%;
-  height: 56px;
+  height: 52px;
   border: 0;
-  border-radius: 3px;
-  background: var(--accent);
-  color: var(--accent-ink);
+  border-radius: 10px;
+  background: var(--action);
+  color: var(--action-ink);
   font-size: 15px;
   font-weight: 600;
+  letter-spacing: -0.005em;
   cursor: pointer;
 }
 
+.picker-use:active {
+  background: var(--action-hover);
+}
+
 .picker-use:disabled {
-  background: #2b2927;
-  color: var(--muted);
+  background: var(--surface-2);
+  color: var(--dim);
   cursor: default;
 }
 
 @keyframes settle {
-  from { opacity: 0; transform: translateY(7px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes sheet-in {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
