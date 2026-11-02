@@ -483,6 +483,8 @@ async function action(name, payload, data) {
         state.status = result.status;
         if (result.errors && result.errors.length) {
           toast(t('toast.syncPartial', { error: result.errors[0] }), true);
+        } else if (typeof result.accepted === 'number') {
+          toast(t('toast.commit', { accepted: result.accepted, rejected: result.rejected }));
         } else {
           toast(t('toast.sync', { sent: result.sent, received: result.received }));
         }

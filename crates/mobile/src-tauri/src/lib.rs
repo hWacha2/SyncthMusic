@@ -5,9 +5,10 @@
 //! нет второго процесса, которым надо управлять, и нет HTTP-прослойки.
 //!
 //! Что уже работает: инициализация библиотеки на выбранной папке, скан,
-//! исходящая синхронизация с сопряжённым пиром, очередь удалений, корзина,
-//! конфликты, список устройств. Входящие сеансы (когда ПК сам стучится на
-//! телефон) появятся вместе с foreground-сервисом.
+//! исходящая синхронизация с сопряжённым пиром, входящие сеансы и commit, пока
+//! приложение открыто, очередь удалений, корзина, конфликты, список устройств.
+//! После записи файлов Android просят перечитать библиотеку. Foreground-сервис
+//! для работы в фоне появится позже.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use syncth_core::{net, resolve, scan, store::Replica, Action, Hlc};
 use tauri::Manager;
+
+mod media;
+mod server;
 
 /// Порт синхронизации: тот же, что у демона на ПК.
 const SYNC_PORT: u16 = 47887;
@@ -158,14 +162,17 @@ fn status_json(replica: &Replica) -> Value {
         .ok()
         .flatten()
         .unwrap_or_default();
-    let connection = match known_peers.iter().find(|p| p.dev == connected) {
-        Some(peer) => json!({
-            "connected": true,
-            "dev": peer.dev,
-            "name": peer.name,
-            "addr": peer.addr,
-        }),
-        None => json!({ "connected": false }),
+    let connection = match server::session_json() {
+        Some(incoming) => incoming,
+        None => match known_peers.iter().find(|p| p.dev == connected) {
+            Some(peer) => json!({
+                "connected": true,
+                "dev": peer.dev,
+                "name": peer.name,
+                "addr": peer.addr,
+            }),
+            None => json!({ "connected": false }),
+        },
     };
     let known: Vec<Value> = known_peers
         .into_iter()
@@ -195,6 +202,7 @@ fn status_json(replica: &Replica) -> Value {
         "vault": vault,
         "known_peers": known,
         "connection": connection,
+        "listen": server::info_json(),
         "last_scan": last_scan,
         "last_sync": last_sync,
         "ignored": replica.ignored_paths().unwrap_or_default(),
@@ -312,6 +320,20 @@ async fn sync_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
         *busy = true;
     }
     let result = blocking(move || {
+        // Входящий сеанс обслуживает свой поток: commit надо попросить у него,
+        // а не открывать второе соединение к тому же пиру.
+        if server::has_session() {
+            let (accepted, rejected) = server::request_commit()
+                .unwrap_or_else(|| Err("Входящий сеанс уже закрыт".into()))?;
+            let replica = open(&app)?;
+            let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
+            return Ok(json!({
+                "accepted": accepted,
+                "rejected": rejected,
+                "status": status_json(&replica),
+            }));
+        }
+
         let mut replica = open(&app)?;
         let root = replica
             .root()
@@ -337,6 +359,9 @@ async fn sync_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
         let stats = net::sync_with_peer(&mut replica, &peer.addr, &token).map_err(err)?;
         let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
         let saved = resolve::prune_deleted_files(&mut replica, &root).map_err(err)?;
+        // Новые файлы появились через std::fs — Android узнает о них только
+        // после явного сканирования.
+        let _ = media::scan(&root);
         Ok(json!({
             "sent": stats.sent_remote_ops,
             "received": stats.applied_remote_ops,
@@ -401,6 +426,8 @@ async fn connect_peer(app: tauri::AppHandle, dev: String) -> Result<Value, Strin
 fn disconnect_peer(app: tauri::AppHandle) -> Result<Value, String> {
     let replica = open(&app)?;
     replica.set_meta("session_peer", "").map_err(err)?;
+    // Входящий сеанс закрывает его собственный поток.
+    server::request_disconnect();
     Ok(status_json(&replica))
 }
 
@@ -532,6 +559,8 @@ pub fn run() {
             if let Ok(replica) = open(app.handle()) {
                 let _ = replica.set_meta("session_peer", "");
             }
+            // Пока приложение открыто, ПК может подключиться первым.
+            server::ensure_started(app.handle().clone());
             #[cfg(debug_assertions)]
             if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
                 use tauri::Manager;
