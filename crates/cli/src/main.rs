@@ -206,7 +206,8 @@ fn run() -> Result<()> {
         }
 
         Command::Status => {
-            println!("устройство: {}", replica.device_id());
+            println!("устройство: {}", replica.device_name());
+            println!("id:         {}", replica.device_id());
             match replica.root()? {
                 Some(r) => println!("корень:     {}", r.display()),
                 None => println!("корень:     не задан"),
@@ -473,7 +474,7 @@ fn run() -> Result<()> {
         Command::PairCode { addr, port } => {
             let token = replica.ensure_token()?;
             let addr = addr.unwrap_or_else(|| net::advertised_addr(port));
-            let code = net::pair_code(&dev, &token, &addr);
+            let code = net::pair_code(&dev, replica.device_name(), &token, &addr);
             println!("{code}");
             println!();
             println!("На втором устройстве:");
@@ -485,8 +486,16 @@ fn run() -> Result<()> {
         Command::Pair { code } => {
             let info = net::parse_pair_code(&code)?;
             replica.set_token(&info.token)?;
-            replica.add_peer(&info.dev, &info.addr)?;
-            println!("сопряжено с {}", info.dev);
+            replica.add_peer(&info.dev, &info.addr, &info.name)?;
+            let shown = if info.name.is_empty() {
+                info.dev.clone()
+            } else {
+                info.name.clone()
+            };
+            println!("сопряжено с {shown}");
+            if !info.name.is_empty() {
+                println!("  id:    {}", info.dev);
+            }
             println!("  адрес: {}", info.addr);
             println!("  токен библиотеки обновлён");
             if replica.root()?.is_none() {
@@ -503,8 +512,12 @@ fn run() -> Result<()> {
             if peers.is_empty() {
                 println!("сопряжённых устройств нет");
             } else {
-                for (dev, addr) in peers {
-                    println!("{dev}\t{addr}");
+                for peer in peers {
+                    if peer.name.is_empty() {
+                        println!("{}\t{}", peer.dev, peer.addr);
+                    } else {
+                        println!("{}\t{}\t{}", peer.name, peer.dev, peer.addr);
+                    }
                 }
             }
         }

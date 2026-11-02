@@ -12,7 +12,8 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use syncth_core::{net, resolve, scan, store::Replica, Action};
+use std::time::Duration;
+use syncth_core::{net, resolve, scan, store::Replica, Action, Hlc};
 use tauri::Manager;
 
 /// Порт синхронизации: тот же, что у демона на ПК.
@@ -56,7 +57,31 @@ fn data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn open(app: &tauri::AppHandle) -> Result<Replica, String> {
     let dir = data_dir(app)?;
     let dev = boot_dev(&dir);
-    Replica::open(&dir, &dev).map_err(err)
+    let mut replica = Replica::open(&dir, &dev).map_err(err)?;
+    replica.set_device_name(&phone_name()).map_err(err)?;
+    Ok(replica)
+}
+
+/// Модель телефона для интерфейса и для второго устройства. В отличие от
+/// `device_id`, имя ничего не идентифицирует и может быть любым.
+fn phone_name() -> String {
+    use std::sync::OnceLock;
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        if cfg!(target_os = "android") {
+            if let Ok(out) = std::process::Command::new("getprop")
+                .arg("ro.product.model")
+                .output()
+            {
+                let model = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !model.is_empty() {
+                    return model;
+                }
+            }
+        }
+        syncth_core::device_name()
+    })
+    .clone()
 }
 
 fn default_root() -> String {
@@ -127,15 +152,39 @@ fn status_json(replica: &Replica) -> Value {
         .into_iter()
         .map(|v| json!({ "path": v.path, "size": v.size, "deleted_at": v.deleted_at }))
         .collect();
-    let known: Vec<Value> = replica
-        .known_peers()
-        .unwrap_or_default()
+    let known_peers = replica.known_peers().unwrap_or_default();
+    let connected = replica
+        .get_meta("session_peer")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let connection = match known_peers.iter().find(|p| p.dev == connected) {
+        Some(peer) => json!({
+            "connected": true,
+            "dev": peer.dev,
+            "name": peer.name,
+            "addr": peer.addr,
+        }),
+        None => json!({ "connected": false }),
+    };
+    let known: Vec<Value> = known_peers
         .into_iter()
-        .map(|(dev, addr)| json!({ "dev": dev, "addr": addr }))
+        .map(|p| json!({ "dev": p.dev, "addr": p.addr, "name": p.name }))
         .collect();
+    let last_scan = replica
+        .get_meta("last_scan")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok());
+    let last_sync = replica
+        .get_meta("last_sync")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok());
 
     json!({
         "device": replica.device_id(),
+        "name": replica.device_name(),
         "root": root_text,
         "files": entries.len(),
         "local": local,
@@ -145,6 +194,9 @@ fn status_json(replica: &Replica) -> Value {
         "conflicts": replica.conflict_paths().unwrap_or_default(),
         "vault": vault,
         "known_peers": known,
+        "connection": connection,
+        "last_scan": last_scan,
+        "last_sync": last_sync,
         "ignored": replica.ignored_paths().unwrap_or_default(),
         "ready": root.is_some(),
     })
@@ -170,6 +222,7 @@ fn app_info(app: tauri::AppHandle) -> Value {
             Ok(r) => json!({
                 "data_dir": data_dir(&app).map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
                 "device": r.device_id(),
+                "name": r.device_name(),
                 "root": r.root().ok().flatten().map(|p| p.to_string_lossy().to_string()),
             }),
             Err(e) => json!({ "error": e }),
@@ -204,6 +257,7 @@ async fn init_library(app: tauri::AppHandle, root: String) -> Result<Value, Stri
         let mut replica = open(&app)?;
         replica.set_root(&path).map_err(err)?;
         let report = scan::scan(&path, &mut replica).map_err(err)?;
+        let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
         Ok(json!({
             "added": report.added,
             "status": status_json(&replica),
@@ -233,6 +287,7 @@ async fn scan_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
             .map_err(err)?
             .ok_or("библиотека не настроена")?;
         let report = scan::scan(&root, &mut replica).map_err(err)?;
+        let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
         Ok(json!({
             "added": report.added,
             "changed": report.changed,
@@ -263,28 +318,29 @@ async fn sync_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
             .map_err(err)?
             .ok_or("библиотека не настроена")?;
         scan::scan(&root, &mut replica).map_err(err)?;
-        let peers = replica.known_peers().map_err(err)?;
-        if peers.is_empty() {
-            return Err("нет сопряжённых устройств".into());
+
+        let connected = replica
+            .get_meta("session_peer")
+            .map_err(err)?
+            .unwrap_or_default();
+        if connected.is_empty() {
+            return Err("Нет соединения: сначала подключитесь к устройству".into());
         }
+        let peer = replica
+            .known_peers()
+            .map_err(err)?
+            .into_iter()
+            .find(|p| p.dev == connected)
+            .ok_or("сохранённое устройство не найдено")?;
+
         let token = replica.ensure_token().map_err(err)?;
-        let mut sent = 0;
-        let mut received = 0;
-        let mut errors = Vec::new();
-        for (dev, addr) in peers {
-            match net::sync_with_peer(&mut replica, &addr, &token) {
-                Ok(stats) => {
-                    sent += stats.sent_remote_ops;
-                    received += stats.applied_remote_ops;
-                }
-                Err(e) => errors.push(format!("{dev} ({addr}): {e:#}")),
-            }
-        }
+        let stats = net::sync_with_peer(&mut replica, &peer.addr, &token).map_err(err)?;
+        let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
         let saved = resolve::prune_deleted_files(&mut replica, &root).map_err(err)?;
         Ok(json!({
-            "sent": sent,
-            "received": received,
-            "errors": errors,
+            "sent": stats.sent_remote_ops,
+            "received": stats.applied_remote_ops,
+            "errors": Vec::<String>::new(),
             "rescued": saved,
             "status": status_json(&replica),
         }))
@@ -295,25 +351,105 @@ async fn sync_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
 }
 
 #[tauri::command]
+async fn connect_peer(app: tauri::AppHandle, dev: String) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = open(&app)?;
+        let peer = replica
+            .known_peers()
+            .map_err(err)?
+            .into_iter()
+            .find(|p| p.dev == dev)
+            .ok_or_else(|| format!("устройство не сохранено: {dev}"))?;
+        let token = replica.ensure_token().map_err(err)?;
+        let mut addr = peer.addr.clone();
+        let hello = match net::probe_peer(&mut replica, &addr, &token) {
+            Ok(hello) => hello,
+            Err(first) => {
+                let found = net::discover(Duration::from_secs(2))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(found_dev, _)| *found_dev == dev);
+                match found {
+                    Some((_, new_addr)) => {
+                        addr = new_addr;
+                        net::probe_peer(&mut replica, &addr, &token)
+                            .map_err(|e| format!("{first:#}; повтор по {addr}: {e:#}"))?
+                    }
+                    None => return Err(err(first)),
+                }
+            }
+        };
+        let name = if hello.name.is_empty() {
+            peer.name
+        } else {
+            hello.name
+        };
+        replica
+            .set_meta("session_peer", &hello.dev)
+            .map_err(err)?;
+        Ok(json!({
+            "dev": hello.dev,
+            "name": name,
+            "addr": addr,
+            "status": status_json(&replica),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+fn disconnect_peer(app: tauri::AppHandle) -> Result<Value, String> {
+    let replica = open(&app)?;
+    replica.set_meta("session_peer", "").map_err(err)?;
+    Ok(status_json(&replica))
+}
+
+#[tauri::command]
+fn forget_peer(app: tauri::AppHandle, dev: String) -> Result<Value, String> {
+    let replica = open(&app)?;
+    replica.remove_peer(&dev).map_err(err)?;
+    let session = replica
+        .get_meta("session_peer")
+        .map_err(err)?
+        .unwrap_or_default();
+    if session == dev {
+        replica.set_meta("session_peer", "").map_err(err)?;
+    }
+    Ok(status_json(&replica))
+}
+
+#[tauri::command]
 fn pair_code(app: tauri::AppHandle) -> Result<Value, String> {
     let replica = open(&app)?;
     let token = replica.ensure_token().map_err(err)?;
     let addr = net::advertised_addr(SYNC_PORT);
-    let code = net::pair_code(replica.device_id(), &token, &addr);
+    let code = net::pair_code(replica.device_id(), replica.device_name(), &token, &addr);
     Ok(json!({
         "code": code,
         "addr": addr,
         "dev": replica.device_id(),
+        "name": replica.device_name(),
     }))
 }
 
 #[tauri::command]
-fn pair_accept(app: tauri::AppHandle, code: String) -> Result<Value, String> {
-    let info = net::parse_pair_code(&code).map_err(err)?;
-    let replica = open(&app)?;
-    replica.set_token(&info.token).map_err(err)?;
-    replica.add_peer(&info.dev, &info.addr).map_err(err)?;
-    Ok(json!({ "dev": info.dev, "addr": info.addr }))
+async fn pair_accept(app: tauri::AppHandle, code: String) -> Result<Value, String> {
+    blocking(move || {
+        let info = net::parse_pair_code(&code).map_err(err)?;
+        let mut replica = open(&app)?;
+        replica.set_token(&info.token).map_err(err)?;
+        replica.add_peer(&info.dev, &info.addr, &info.name).map_err(err)?;
+        // Сразу сообщаем второй стороне: иначе она увидит сопряжение только
+        // после первой синхронизации (или не увидит вовсе, если её не запускали).
+        let announced = net::announce(&mut replica, &info.addr, &info.token).is_ok();
+        Ok(json!({
+            "dev": info.dev,
+            "name": info.name,
+            "addr": info.addr,
+            "announced": announced,
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -391,6 +527,11 @@ pub fn run() {
         .manage(Mobile::default())
         // Отладочный канал для прогона интерфейса без кликов; в релизе нет.
         .setup(|app| {
+            // Сессия живёт только пока приложение открыто: сокет не переживает
+            // перезапуск, поэтому «подключено» из прошлого запуска не сохраняем.
+            if let Ok(replica) = open(app.handle()) {
+                let _ = replica.set_meta("session_peer", "");
+            }
             #[cfg(debug_assertions)]
             if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
                 use tauri::Manager;
@@ -414,6 +555,9 @@ pub fn run() {
             sync_now,
             pair_code,
             pair_accept,
+            connect_peer,
+            disconnect_peer,
+            forget_peer,
             resolve_pending,
             forget_pending,
             restore,

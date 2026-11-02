@@ -49,8 +49,12 @@ function toast(message, bad = false) {
 
 const status = () => state.status || {
   ready: false, files: 0, local: 0, size: 0, ops: 0,
-  pending: [], conflicts: [], vault: [], known_peers: [], device: '',
+  pending: [], conflicts: [], vault: [], known_peers: [], device: '', name: '',
+  connection: { connected: false },
 };
+
+// Понятное имя сопряжённого устройства; id остаётся запасным вариантом.
+const peerName = (peer) => (peer && (peer.name || peer.dev)) || t('device.unknown');
 
 // ------------------------------------------------------------------ загрузка
 
@@ -66,8 +70,8 @@ async function boot() {
     if (!state.status && state.info.info && state.info.info.error) {
       state.error = state.info.info.error;
     }
-    if (state.info.info && state.info.info.device) {
-      $('#app-dev').textContent = state.info.info.device;
+    if (state.info.info && (state.info.info.name || state.info.info.device)) {
+      $('#app-dev').textContent = state.info.info.name || state.info.info.device;
     }
   } catch (error) {
     state.error = errText(error);
@@ -89,7 +93,7 @@ async function refresh(silent = false) {
 
 function render() {
   const snap = status();
-  const device = snap.device || (state.info && state.info.info && state.info.info.device) || '';
+  const device = snap.name || snap.device || (state.info && state.info.info && (state.info.info.name || state.info.info.device)) || '';
   if (device) $('#app-dev').textContent = device;
 
   const led = $('#app-led');
@@ -167,6 +171,8 @@ function overviewView(snap) {
   const pending = snap.pending.length;
   const conflicts = snap.conflicts.length;
   const peers = snap.known_peers.length;
+  const connection = snap.connection || { connected: false };
+  const connected = !!connection.connected;
   const title = t('overview.title.ok');
   const hint = pending
     ? tp('overview.hint.pending', pending)
@@ -211,9 +217,15 @@ function overviewView(snap) {
       </div>
     </div>
     <div class="actions">
-      <button class="btn btn--primary" data-act="sync" ${state.busy ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>
+      <button class="btn btn--primary" data-act="sync" ${state.busy || !connected ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>
       <button class="btn btn--soft" data-act="scan" ${state.busy ? 'disabled' : ''}>${icon('rescan')}${esc(t('act.scan'))}</button>
     </div>
+    <div class="row-meta">
+      ${connected
+        ? `${esc(t('conn.connectedTo', { name: connection.name || connection.dev }))} · ${esc(connection.addr || '')}`
+        : esc(t('conn.none'))}
+    </div>
+    ${connected ? `<div class="actions"><button class="btn btn--block btn--ghost" data-act="disconnect">${esc(t('act.disconnect'))}</button></div>` : ''}
   </section>
 
   <div class="stats">
@@ -262,7 +274,7 @@ function overviewView(snap) {
           <div class="row">
             <div class="row-top">
               ${icon('pc', '')}
-              <span class="row-path">${esc(p.dev)}</span>
+              <span class="row-path">${esc(peerName(p))}</span>
             </div>
             <div class="row-meta">${esc(p.addr)}</div>
           </div>`).join('')}</div>`
@@ -345,11 +357,21 @@ function vaultView(snap) {
 }
 
 function moreView(snap) {
-  const peers = snap.known_peers.map((p) => `
+  const connection = snap.connection || { connected: false };
+  const peers = snap.known_peers.map((p) => {
+    const isConnected = connection.connected && connection.dev === p.dev;
+    return `
     <div class="row">
-      <div class="row-top">${icon('pc', '')}<span class="row-path">${esc(p.dev)}</span></div>
-      <div class="row-meta">${esc(p.addr)}</div>
-    </div>`).join('');
+      <div class="row-top">${icon('pc', '')}<span class="row-path">${esc(peerName(p))}</span></div>
+      <div class="row-meta">${esc(p.addr)}${isConnected ? ' · ' + esc(t('conn.connected')) : ''}</div>
+      <div class="row-actions">
+        ${isConnected
+          ? `<button class="btn btn--sm btn--ghost" data-act="disconnect">${esc(t('act.disconnect'))}</button>`
+          : `<button class="btn btn--sm btn--lime" data-act="connect" data-dev="${esc(p.dev)}">${esc(t('act.connect'))}</button>`}
+        <button class="btn btn--sm btn--ghost" data-act="forget" data-dev="${esc(p.dev)}">${esc(t('act.forget'))}</button>
+      </div>
+    </div>`;
+  }).join('');
 
   return `<section class="panel">
       <h1 class="hero-title">${esc(t('tab.more'))}</h1>
@@ -403,7 +425,7 @@ function moreView(snap) {
     <section class="panel panel--flat">
       <div class="panel-head"><span class="panel-title">${esc(t('pair.about'))}</span></div>
       <div class="row-meta">${esc(t('pair.version', { v: (state.info && state.info.version) || '' }))}</div>
-      <div class="row-meta">${esc(t('pair.device', { dev: snap.device || '' }))}</div>
+      <div class="row-meta">${esc(t('pair.device', { dev: snap.name || snap.device || '' }))}</div>
       <div class="row-meta">${esc(t('pair.port', { port: (state.info && state.info.sync_port) || 47887 }))}</div>
     </section>`;
 }
@@ -434,12 +456,13 @@ async function initLibrary() {
     if (state.info && state.info.info) {
       state.info.info.root = state.status.root;
       state.info.info.device = state.status.device;
+      state.info.info.name = state.status.name;
     }
     toast(t('toast.initDone', { n: num(result.added), word: plural('word.files', result.added) }));
   });
 }
 
-async function action(name, payload) {
+async function action(name, payload, data) {
   switch (name) {
     case 'init':
       await initLibrary();
@@ -463,6 +486,26 @@ async function action(name, payload) {
         } else {
           toast(t('toast.sync', { sent: result.sent, received: result.received }));
         }
+      });
+      break;
+    case 'connect':
+      await run(t('run.connect'), async () => {
+        const result = await invoke('connect_peer', { dev: data && data.dev });
+        state.status = result.status;
+        toast(t('toast.connected', { name: result.name || result.dev }));
+      });
+      break;
+    case 'disconnect':
+      await run(t('run.disconnect'), async () => {
+        state.status = await invoke('disconnect_peer');
+        toast(t('toast.disconnected'));
+      });
+      break;
+    case 'forget':
+      if (data && data.dev && !window.confirm(t('confirm.forgetPeer'))) return;
+      await run(t('run.forgetPeer'), async () => {
+        state.status = await invoke('forget_peer', { dev: data.dev });
+        toast(t('toast.peerForgotten'));
       });
       break;
     case 'gc':
@@ -519,7 +562,7 @@ async function pairAcceptCode(code) {
   await run(t('run.pair'), async () => {
     const result = await invoke('pair_accept', { code });
     await loadStatus();
-    toast(t('toast.paired', { dev: result.dev }));
+    toast(t('toast.paired', { dev: result.name || result.dev }));
   });
 }
 
@@ -694,7 +737,11 @@ document.addEventListener('click', (event) => {
 
   const act = event.target.closest('[data-act]');
   if (act) {
-    action(act.dataset.act, act.dataset.act === 'lang' ? act.dataset.lang : undefined);
+    action(
+      act.dataset.act,
+      act.dataset.act === 'lang' ? act.dataset.lang : undefined,
+      { ...act.dataset },
+    );
   }
 });
 

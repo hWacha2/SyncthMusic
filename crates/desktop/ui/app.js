@@ -66,6 +66,9 @@ const icon = (name, cls = '') => `<svg class="${cls}" aria-hidden="true"><use hr
 
 const sizeText = (bytes) => sizeParts(bytes).text;
 
+// Сопряжённое устройство показываем понятным именем, id — только запасной вариант.
+const peerLabel = (peer) => (peer && (peer.name || peer.dev)) || t('device.unknown');
+
 const basename = (path) => {
   const parts = String(path || '').split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : String(path || '');
@@ -136,7 +139,8 @@ function snapshot() {
     ignored: array(status && status.ignored),
     peers: array(status && status.peers),
     known: array(status && status.known_peers),
-    device: status ? status.device : state.lastDevice,
+    device: status ? (status.name || status.device) : (state.lastDevice || info.device_name),
+    deviceId: status ? status.device : null,
     daemonBin: info.daemon_bin || null,
   };
 }
@@ -258,9 +262,10 @@ function chrome(snap, copy) {
   $('#tb-ver').textContent = info ? `v${info.version}` : '';
   $('#tb-state').textContent = stateText;
   $('#tb-dev').textContent = snap.device || '';
+  $('#tb-dev').title = snap.deviceId ? `${snap.device} · ${snap.deviceId}` : (snap.device || '');
 
   $('#rail-dev').textContent = snap.device || t('common.dash');
-  $('#rail-dev').title = snap.device || '';
+  $('#rail-dev').title = snap.deviceId ? `${snap.device} · ${snap.deviceId}` : (snap.device || '');
   $('#rail-root').textContent = snap.root ? basename(snap.root) : t('rail.noLibrary');
   $('#rail-root').title = snap.root || '';
   $('#rail-daemon').textContent = state.running ? t('rail.serviceRunning') : t('rail.serviceStopped');
@@ -295,8 +300,9 @@ function renderOverview() {
   const snap = snapshot();
   const copy = stateCopy(snap);
   const status = snap.status;
-  const connected = snap.peers.filter((peer) => !peer.error).length;
-  const peerCount = Math.max(connected, snap.known.length);
+  const connection = (status && status.connection) || { connected: false };
+  const connected = !!connection.connected;
+  const peerCount = Math.max(connected ? 1 : 0, snap.known.length);
   const rootPath = snap.root || t('rail.noLibrary');
 
   const size = sizeParts(status ? status.size : 0);
@@ -304,7 +310,7 @@ function renderOverview() {
 
   const primaryAction = !snap.running
     ? `<button class="btn btn--primary" data-act="start-daemon">${icon('play')}${esc(t('act.startService'))}</button>`
-    : `<button class="btn btn--primary" data-act="sync" ${status.state === 'syncing' ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>`;
+    : `<button class="btn btn--primary" data-act="sync" ${status.state === 'syncing' || !connected ? 'disabled' : ''}>${icon('sync')}${esc(t('act.sync'))}</button>`;
 
   const pauseAction = !snap.running
     ? ''
@@ -334,11 +340,13 @@ function renderOverview() {
     </div>
   </div>`;
 
-  const peerTitle = peerCount
-    ? `${peerCount} ${plural('word.devices', peerCount)}`
-    : t('peers.phone');
+  const peerTitle = connected
+    ? (connection.name || connection.dev || t('peers.phone'))
+    : peerCount
+      ? `${peerCount} ${plural('word.devices', peerCount)}`
+      : t('peers.phone');
   const peerMeta = connected
-    ? t('peers.online', { ago: ago((snap.peers.find((peer) => !peer.error) || {}).last_seen) })
+    ? t('peers.online', { ago: ago(connection.since) })
     : snap.known.length
       ? t('peers.noResponse')
       : t('peers.notPaired');
@@ -367,7 +375,9 @@ function renderOverview() {
         <span>${esc(status && status.last_sync ? t('signal.lastContact', { ago: ago(status.last_sync) }) : t('signal.never'))}</span>
       </div>
       <span class="mono">${esc((status && status.pair_addr) || snap.info.sync_addr || '')}</span>
-      <button class="btn btn--sm" data-view="pair">${esc(t('btn.pairCode'))}</button>
+      ${connected
+        ? `<button class="btn btn--sm btn--ghost" data-act="peer-disconnect">${esc(t('act.disconnect'))}</button>`
+        : `<button class="btn btn--sm" data-view="pair">${esc(t('btn.pairCode'))}</button>`}
     </div>
   </section>`;
 
@@ -454,7 +464,7 @@ function renderOverview() {
     peerRows.push(`<div class="row">
       <span class="dot ${live ? (live.error ? 'bad' : 'good') : ''}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || t('device.unknown'))}</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(peerLabel(known))}</div>
         <div class="row-meta mono">${esc(known.addr)}</div>
       </div>
       <div class="row-meta" style="margin:0">${esc(live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer'))}</div>
@@ -607,10 +617,14 @@ function renderDevices() {
 
   const current = `<section class="panel">
     <div class="panel-head"><div class="panel-title">${esc(t('node.thisPc'))}</div><span class="tag ${snap.running ? 'tag--good' : ''}">${esc(snap.running ? t('devices.tagOnline') : t('devices.tagOffline'))}</span></div>
-    <div class="kv"><span class="kv-k">${esc(t('kv.id'))}</span><span class="kv-v">${esc(snap.device || t('common.dash'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.device'))}</span><span class="kv-v">${esc(snap.device || t('common.dash'))}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('kv.id'))}</span><span class="kv-v mono">${esc(snap.deviceId || t('common.dash'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.library'))}</span><span class="kv-v">${esc(snap.root || t('common.notSelected'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.syncAddr'))}</span><span class="kv-v">${esc((status && status.pair_addr) || snap.info.sync_addr || t('common.dash'))}</span></div>
     <div class="kv"><span class="kv-k">${esc(t('kv.filesOnDisk'))}</span><span class="kv-v">${num(status ? status.local : 0)}</span></div>
+    <div class="kv"><span class="kv-k">${esc(t('conn.label'))}</span><span class="kv-v">${esc(status && status.connection && status.connection.connected
+      ? t('conn.connectedTo', { name: status.connection.name || status.connection.dev })
+      : t('conn.none'))}</span></div>
     <div class="settings-actions">
       <button class="btn btn--sm" data-act="copy-device" ${snap.device ? '' : 'disabled'}>${icon('copy')}${esc(t('devices.copyId'))}</button>
       <button class="btn btn--sm btn--ghost" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('devices.folder'))}</button>
@@ -618,17 +632,27 @@ function renderDevices() {
   </section>`;
 
   const seen = new Map(snap.peers.map((peer) => [peer.addr, peer]));
+  const connectedDev = status && status.connection && status.connection.connected
+    ? (status.connection.dev || '')
+    : '';
   const rows = [];
   snap.known.forEach((known) => {
     const live = seen.get(known.addr);
     if (live) seen.delete(known.addr);
+    const isConnected = connectedDev === known.dev;
     rows.push(`<div class="row">
-      <span class="dot ${live ? (live.error ? 'bad' : 'good') : ''}"></span>
+      <span class="dot ${isConnected ? 'good' : live ? (live.error ? 'bad' : 'good') : ''}"></span>
       <div class="row-body">
-        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(known.dev || t('device.unknown'))}</div>
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(peerLabel(known))}</div>
         <div class="row-meta mono">${esc(known.addr)}${live && live.error ? ' · ' + esc(live.error) : ''}</div>
       </div>
-      <div class="row-meta" style="margin:0">${esc(live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer'))}</div>
+      <div class="row-side" style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center">
+        <span class="row-meta" style="margin:0">${esc(isConnected ? t('conn.connected') : live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer'))}</span>
+        ${isConnected
+          ? `<button class="btn btn--sm btn--ghost" data-act="peer-disconnect">${esc(t('act.disconnect'))}</button>`
+          : `<button class="btn btn--sm" data-act="peer-connect" data-dev="${esc(known.dev)}" ${snap.running ? '' : 'disabled'}>${esc(t('act.connect'))}</button>`}
+        <button class="btn btn--sm btn--ghost" data-act="peer-forget" data-dev="${esc(known.dev)}">${esc(t('act.forget'))}</button>
+      </div>
     </div>`);
   });
   [...seen.values()].forEach((live) => {
@@ -685,9 +709,30 @@ function renderPair() {
     ? pair.svg
     : `<div class="qr-empty">${esc(t('pair.qrMissing'))}<br>${esc(t('pair.qrMissingHint'))}</div>`;
 
+  const knownRows = snap.known.map((known) => {
+    const live = snap.peers.find((peer) => peer.addr === known.addr);
+    const dot = live ? (live.error ? 'bad' : 'good') : '';
+    const state = live ? (live.error ? t('common.error') : ago(live.last_seen)) : t('common.noAnswer');
+    return `<div class="row">
+      <span class="dot ${dot}"></span>
+      <div class="row-body">
+        <div class="row-path" style="font-family:var(--body);font-size:12.5px">${esc(peerLabel(known))}</div>
+        <div class="row-meta mono">${esc(known.addr)}</div>
+      </div>
+      <div class="row-meta" style="margin:0">${esc(state)}</div>
+    </div>`;
+  }).join('');
+  const paired = `<section class="panel" style="margin-top:18px">
+    <div class="panel-head">
+      <div class="panel-title">${esc(t('devices.known'))}</div>
+      <span class="tag ${snap.known.length ? 'tag--good' : ''}">${esc(snap.known.length ? t('devices.tag', { n: snap.known.length }) : t('devices.tagEmpty'))}</span>
+    </div>
+    ${knownRows || emptyState('phone', t('devices.otherEmptyTitle'), t('devices.otherEmptyText'))}
+  </section>`;
+
   return head + `<div class="pair-grid">
     <section class="panel">
-      <div class="panel-head"><div class="panel-title">${esc(t('pair.panelCode'))}</div><span class="tag">${esc(pair.dev || snap.device || '')}</span></div>
+      <div class="panel-head"><div class="panel-title">${esc(t('pair.panelCode'))}</div><span class="tag">${esc(pair.name || snap.device || '')}</span></div>
       <div class="code-box">${esc(pair.code)}</div>
       <div class="settings-actions">
         <button class="btn btn--sm" data-act="copy-code">${icon('copy')}${esc(t('pair.copy'))}</button>
@@ -708,7 +753,7 @@ function renderPair() {
       <div class="qr-card">${qr}</div>
       <p class="view-sub" style="margin-top:12px">${esc(t('pair.qrNote'))}</p>
     </section>
-  </div>`;
+  </div>` + paired;
 }
 
 // ------------------------------------------------------------------ настройки
@@ -736,6 +781,11 @@ function renderSettings() {
       <button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('settings.openMusic'))}</button>
       <button class="btn btn--sm" data-act="open-data">${icon('folder')}${esc(t('settings.data'))}</button>
       <button class="btn btn--sm btn--ghost" data-act="change-library">${esc(t('settings.changeFolder'))}</button>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label for="library-path">${esc(t('settings.manualPath'))}</label>
+      <input class="input" id="library-path" value="${esc(snap.root || '')}" spellcheck="false" autocomplete="off">
+      <button class="btn btn--sm" data-act="apply-library">${esc(t('settings.applyPath'))}</button>
     </div>
   </section>`;
 
@@ -809,6 +859,11 @@ function renderOnboarding() {
       <p class="hint">${esc(t('onboard.hint'))}</p>
       <div class="picked ${root ? '' : 'is-empty'}">${icon('folder')}<span>${esc(root || t('onboard.noFolder'))}</span></div>
       <button class="btn" data-act="pick-root" ${busy ? 'disabled' : ''}>${esc(t('onboard.pick'))}</button>
+      <div class="field" style="margin-top:12px">
+        <label for="root-input">${esc(t('onboard.manualLabel'))}</label>
+        <input class="input" id="root-input" value="${esc(root || '')}" spellcheck="false" autocomplete="off">
+        <button class="btn btn--sm" data-act="apply-root" ${busy ? 'disabled' : ''}>${esc(t('onboard.manualApply'))}</button>
+      </div>
 
       <div class="picked" style="margin-top:12px">${icon('box')}<span>${esc(dataDir || t('onboard.dataDefault'))}</span></div>
       <button class="btn btn--ghost btn--sm" data-act="pick-data" ${busy ? 'disabled' : ''}>${esc(t('onboard.pickData'))}</button>
@@ -916,7 +971,9 @@ async function refreshStatus() {
     state.running = !!result.running;
     state.status = result.status || null;
     state.lastError = result.error || null;
-    if (state.status && state.status.device) state.lastDevice = state.status.device;
+    if (state.status && state.status.device) {
+      state.lastDevice = state.status.name || state.status.device;
+    }
   } catch (error) {
     state.running = false;
     state.status = null;
@@ -1053,8 +1110,17 @@ async function changeLibraryFlow() {
 async function pickNewLibrary() {
   const folder = await invoke('pick_folder', { title: t('dialog.pickNewMusic') });
   if (!folder) return;
+  await switchLibrary(folder);
+}
+
+async function switchLibrary(folder) {
+  const probe = await invoke('probe_folder', { path: folder }).catch(() => null);
+  if (!probe || !probe.exists) {
+    toast(t('toast.folderMissing', { path: probe ? probe.path : folder }), 'bad');
+    return;
+  }
   await runBusy(async () => {
-    await invoke('change_library', { folder });
+    await invoke('change_library', { folder: probe.path });
     await refreshInfo();
     state.lastHtml = '';
     return t('toast.librarySwitched');
@@ -1139,12 +1205,27 @@ async function handleAction(action, dataset) {
       render();
       if (!state.pairError) toast(t('toast.codeUpdated'));
       break;
+    case 'peer-connect':
+      await daemonCommand('connect', { dev: dataset.dev }, t('toast.connected', { name: peerLabel({ dev: dataset.dev }) }));
+      break;
+    case 'peer-disconnect':
+      await daemonCommand('disconnect', null, t('toast.disconnected'));
+      break;
+    case 'peer-forget':
+      openConfirm({
+        title: t('modal.forgetPeer.title'),
+        text: t('modal.forgetPeer.text'),
+        label: t('act.forget'),
+        danger: true,
+        run: () => daemonCommand('peer_forget', { dev: dataset.dev }, t('toast.peerForgotten')),
+      });
+      break;
     case 'copy-code':
       if (state.pair) await copyText(state.pair.code);
       break;
     case 'copy-device': {
       const snap = snapshot();
-      if (snap.device) await copyText(snap.device);
+      if (snap.deviceId) await copyText(snap.deviceId);
       break;
     }
     case 'lang':
@@ -1175,6 +1256,48 @@ async function handleAction(action, dataset) {
     case 'change-library':
       await changeLibraryFlow();
       break;
+    case 'apply-root': {
+      const input = $('#root-input');
+      const value = input ? input.value.trim() : '';
+      if (!value) {
+        toast(t('toast.needFolder'), 'bad');
+        break;
+      }
+      const probe = await invoke('probe_folder', { path: value }).catch(() => null);
+      if (!probe || !probe.exists) {
+        toast(t('toast.folderMissing', { path: probe ? probe.path : value }), 'bad');
+        break;
+      }
+      state.onboarding.root = probe.path;
+      render();
+      break;
+    }
+    case 'apply-library': {
+      const input = $('#library-path');
+      const folder = input ? input.value.trim() : '';
+      if (!folder) {
+        toast(t('toast.needFolder'), 'bad');
+        break;
+      }
+      if (state.running) {
+        openConfirm({
+          title: t('modal.changeRoot.title'),
+          text: t('modal.changeRoot.text'),
+          label: t('modal.changeRoot.label'),
+          danger: false,
+          run: async () => {
+            await runBusy(async () => {
+              const result = await invoke('stop_daemon');
+              return (result && result.message) || t('toast.serviceStopped');
+            });
+            await switchLibrary(folder);
+          },
+        });
+      } else {
+        await switchLibrary(folder);
+      }
+      break;
+    }
     case 'pick-root': {
       const folder = await invoke('pick_folder', { title: t('dialog.pickMusic') });
       if (folder) {

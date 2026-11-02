@@ -1,15 +1,14 @@
-//! `syncthd` — фоновый демон для ПК.
+//! `syncthd` — служба синхронизации для ПК.
 //!
-//! Задачи, которые он забирает у пользователя:
-//! * следит за папкой библиотеки и сам запускает скан после паузы;
-//! * периодически ищет пиров в LAN и синхронизируется с ними;
-//! * принимает входящие сеансы;
-//! * отдаёт локальную веб-страницу на `127.0.0.1` — очередь удалений,
-//!   конфликты, корзина, состояние;
+//! По умолчанию работает только по кнопке: без watcher и без автосинка.
+//! Задачи, которые она забирает у пользователя:
+//! * отдаёт локальную веб-страницу на `127.0.0.1` — состояние, план изменений,
+//!   устройства;
+//! * держит соединение с выбранным устройством и обслуживает входящие сеансы;
 //! * умеет прописаться в автозапуск Windows.
 //!
 //! Вся мутация реплики идёт через один рабочий поток: у `Replica` один
-//! SQLite-коннектор, а наблюдатель, сеть и веб-UI лишь шлют ему команды.
+//! SQLite-коннектор, а сеть и веб-UI лишь шлют ему команды.
 //! UI читает состояние через отдельное соединение (WAL это позволяет).
 
 use anyhow::{bail, Context, Result};
@@ -56,9 +55,14 @@ struct Cli {
     #[arg(long)]
     token: Option<String>,
 
-    /// Как часто автоматически искать пиров, секунды.
+    /// Автоматически искать пиров и синхронизироваться каждые N секунд.
+    /// Работает только вместе со скрытым `--auto-sync`.
     #[arg(long, default_value_t = 30)]
     sync_interval: u64,
+
+    /// Включить автосинк (скрытый флаг для отладки). По умолчанию выключен.
+    #[arg(long, hide = true)]
+    auto_sync: bool,
 
     /// Сколько дней хранить удалённое в корзине.
     #[arg(long, default_value_t = vault::DEFAULT_TTL_DAYS)]
@@ -69,9 +73,10 @@ struct Cli {
     #[arg(long = "peer")]
     peers: Vec<String>,
 
-    /// Не следить за папкой (скан только по кнопке).
-    #[arg(long)]
-    no_watch: bool,
+    /// Следить за папкой и сканировать после изменений. По умолчанию
+    /// выключено: скан запускает только пользователь.
+    #[arg(long, hide = true)]
+    watch: bool,
 
     /// Порог свободного места, %. Ниже — синхронизация приостанавливается.
     #[arg(long, default_value_t = 5.0)]
@@ -111,9 +116,23 @@ fn main() {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct PeerStatus {
+    name: String,
     addr: String,
     last_seen: Option<u64>,
     error: Option<String>,
+}
+
+/// Логическая сессия с выбранным устройством.
+///
+/// На этапе 1 это проверенное рукопожатие: сокет живёт только на время
+/// проверки. Живой двусторонний канал с решениями появится в этапе 3;
+/// состояние «подключено» уже сейчас блокирует синхронизацию без подключения.
+#[derive(Debug, Clone, Default, Serialize)]
+struct ActivePeer {
+    dev: String,
+    name: String,
+    addr: String,
+    since: u64,
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +148,7 @@ struct Runtime {
     disk_total: u64,
     disk_threshold: f64,
     peers: BTreeMap<String, PeerStatus>,
+    active_peer: Option<ActivePeer>,
 }
 
 type Shared = Arc<Mutex<Runtime>>;
@@ -148,6 +168,15 @@ type Reply = Sender<Result<String, String>>;
 enum Cmd {
     Scan(Reply),
     Sync(Reply),
+    Connect {
+        dev: String,
+        reply: Reply,
+    },
+    Disconnect(Reply),
+    ForgetPeer {
+        dev: String,
+        reply: Reply,
+    },
     Resolve {
         path: String,
         action: Action,
@@ -242,10 +271,10 @@ fn run() -> Result<()> {
         }
     });
 
-    let _watcher = if cli.no_watch {
-        None
-    } else {
+    let _watcher = if cli.watch {
         Some(watch_root(&root, fs_tx.clone())?)
+    } else {
+        None
     };
 
     let runtime: Shared = Arc::new(Mutex::new(Runtime::default()));
@@ -255,6 +284,7 @@ fn run() -> Result<()> {
     };
     let cfg = WorkerConfig {
         root: root.clone(),
+        auto_sync: cli.auto_sync,
         sync_interval: Duration::from_secs(cli.sync_interval.max(5)),
         vault_days: cli.vault_days,
         explicit_peers: cli.peers.clone(),
@@ -308,12 +338,17 @@ fn run() -> Result<()> {
     // UI-поток читает БД отдельным соединением: WAL допускает читателей
     // параллельно с записью рабочего потока.
     let read = Arc::new(Mutex::new(Replica::open(&cli.data_dir, &dev)?));
+    let name = read
+        .lock()
+        .map(|r| r.device_name().to_string())
+        .unwrap_or_default();
     let ui_ctx = UiCtx {
         commands: cmd_tx.clone(),
         read,
         runtime: runtime.clone(),
         root,
         dev: dev.clone(),
+        name,
         sync_addr: net::advertised_addr(port),
     };
     if !cli.no_tray {
@@ -334,6 +369,7 @@ fn run() -> Result<()> {
 
 struct WorkerConfig {
     root: PathBuf,
+    auto_sync: bool,
     sync_interval: Duration,
     vault_days: u64,
     explicit_peers: Vec<String>,
@@ -375,6 +411,30 @@ fn worker(
                 let res = do_sync(&mut replica, &cfg, &runtime, true);
                 respond(reply, res, &runtime);
             }
+            Ok(Cmd::Connect { dev, reply }) => {
+                let res = do_connect(&mut replica, &runtime, &dev);
+                respond(reply, res, &runtime);
+            }
+            Ok(Cmd::Disconnect(reply)) => {
+                runtime.lock().unwrap().active_peer = None;
+                let _ = reply.send(Ok("Соединение закрыто".into()));
+            }
+            Ok(Cmd::ForgetPeer { dev, reply }) => {
+                let res = (|| -> Result<String> {
+                    let removed = replica.remove_peer(&dev)?;
+                    let mut rt = runtime.lock().unwrap();
+                    if rt.active_peer.as_ref().is_some_and(|p| p.dev == dev) {
+                        rt.active_peer = None;
+                    }
+                    rt.peers.remove(&dev);
+                    if removed {
+                        Ok(format!("Устройство {dev} забыто"))
+                    } else {
+                        Ok(format!("Устройство {dev} и так не сохранено"))
+                    }
+                })();
+                respond(reply, res, &runtime);
+            }
             Ok(Cmd::CheckDisk(reply)) => {
                 let low = refresh_disk(&runtime, &cfg.disk);
                 let free = runtime
@@ -396,16 +456,18 @@ fn worker(
                 let res = (|| -> Result<String> {
                     let info = net::parse_pair_code(&code)?;
                     replica.set_token(&info.token)?;
-                    replica.add_peer(&info.dev, &info.addr)?;
-                    Ok(format!("Сопряжено с {} ({})", info.dev, info.addr))
+                    replica.add_peer(&info.dev, &info.addr, &info.name)?;
+                    // Сообщаем второй стороне, чтобы она увидела сопряжение,
+                    // даже если код вводили только здесь. Сеть не обязательна.
+                    let _ = net::announce(&mut replica, &info.addr, &info.token);
+                    let shown = if info.name.is_empty() {
+                        info.dev.clone()
+                    } else {
+                        info.name.clone()
+                    };
+                    Ok(format!("Сопряжено с {shown} ({})", info.addr))
                 })();
-                let ok = res.is_ok();
                 respond(reply, res, &runtime);
-                if ok {
-                    // Не ждём следующего периода: пользователь только что
-                    // выбрал «сопрячь», он ждёт эффекта.
-                    next_sync = Instant::now();
-                }
             }
             Ok(Cmd::Resolve {
                 path,
@@ -498,7 +560,7 @@ fn worker(
         }
 
         let now = Instant::now();
-        if now >= next_sync {
+        if cfg.auto_sync && now >= next_sync {
             next_sync = now + cfg.sync_interval;
             let low = refresh_disk(&runtime, &cfg.disk);
             let paused = runtime.lock().unwrap().paused;
@@ -587,6 +649,94 @@ fn notify_deletions(missing: &[String]) {
     });
 }
 
+/// Отказ соединения на уровне сети: пир выключен, спит или ещё не слушает.
+/// Такие сбои не должны переводить весь интерфейс в состояние «ошибка».
+fn is_unreachable(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::TimedOut
+                        | ErrorKind::NotFound
+                        | ErrorKind::AddrNotAvailable
+                        | ErrorKind::NetworkUnreachable
+                        | ErrorKind::HostUnreachable
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// «Подключиться» к сохранённому устройству.
+///
+/// Проверяет рукопожатием, что пир отвечает, обновляет его адрес (DHCP) и
+/// запоминает активную сессию. Полный обмен манифестами появится на этапе
+/// плана; сейчас важно, что без этого состояния синхронизация запрещена.
+fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<String> {
+    let peer = replica
+        .known_peers()?
+        .into_iter()
+        .find(|p| p.dev == dev)
+        .with_context(|| format!("устройство не сохранено: {dev}"))?;
+    let token = replica.ensure_token()?;
+    let mut addr = peer.addr.clone();
+
+    let hello = match net::probe_peer(replica, &addr, &token) {
+        Ok(hello) => hello,
+        Err(first) => {
+            // Адрес мог смениться по DHCP: пробуем найти пира в локальной сети.
+            let found = net::discover(Duration::from_secs(2))
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(found_dev, _)| *found_dev == dev);
+            match found {
+                Some((_, new_addr)) => {
+                    addr = new_addr;
+                    net::probe_peer(replica, &addr, &token)
+                        .with_context(|| format!("первая попытка: {first:#}"))?
+                }
+                None => return Err(first),
+            }
+        }
+    };
+
+    let name = if hello.name.is_empty() {
+        peer.name
+    } else {
+        hello.name
+    };
+    let label = if name.is_empty() {
+        hello.dev.clone()
+    } else {
+        name.clone()
+    };
+    let now = Hlc::wall_ms();
+    let mut rt = runtime.lock().unwrap();
+    rt.peers.insert(
+        hello.dev.clone(),
+        PeerStatus {
+            name: name.clone(),
+            addr: addr.clone(),
+            last_seen: Some(now),
+            error: None,
+        },
+    );
+    rt.active_peer = Some(ActivePeer {
+        dev: hello.dev,
+        name,
+        addr: addr.clone(),
+        since: now,
+    });
+    rt.last_error = None;
+    Ok(format!("Подключено: {label} ({addr})"))
+}
+
 fn do_sync(
     replica: &mut Replica,
     cfg: &WorkerConfig,
@@ -598,39 +748,54 @@ fn do_sync(
     }
     let token = replica.ensure_token()?;
     let me = replica.device_id().to_string();
-    let mut targets: Vec<(String, String)> = cfg
-        .explicit_peers
-        .iter()
-        .map(|a| (a.clone(), a.clone()))
-        .collect();
-    for (dev, addr) in replica.known_peers()? {
-        if dev != me && !targets.iter().any(|(_, a)| *a == addr) {
-            targets.push((dev, addr));
-        }
+    let active = runtime.lock().unwrap().active_peer.clone();
+
+    // Ручной режим: обмен только с тем устройством, к которому пользователь
+    // явно подключился. Скрытый `--auto-sync` сохраняет прежний поиск всех.
+    if active.is_none() && !cfg.auto_sync {
+        bail!("Нет соединения: сначала подключитесь к устройству");
     }
 
-    match net::discover(Duration::from_secs(2)) {
-        Ok(found) => {
-            for (dev, addr) in found {
-                // Себя пропускаем; при автоматическом синке инициатор только
-                // один (меньший device id), чтобы не открывать две сессии.
-                if dev == me {
-                    continue;
-                }
-                if !manual && me > dev {
-                    continue;
-                }
-                if !targets.iter().any(|(_, a)| *a == addr) {
-                    targets.push((dev, addr));
-                }
+    // Тройка: device id, адрес и понятное имя (если известно). В сообщениях
+    // показываем имя, иначе пользователь видит только dev-xxxxxxxx.
+    let mut targets: Vec<(String, String, String)> = Vec::new();
+    if let Some(peer) = &active {
+        targets.push((peer.dev.clone(), peer.addr.clone(), peer.name.clone()));
+    } else {
+        targets.extend(
+            cfg.explicit_peers
+                .iter()
+                .map(|a| (a.clone(), a.clone(), String::new())),
+        );
+        for peer in replica.known_peers()? {
+            if peer.dev != me && !targets.iter().any(|(_, a, _)| *a == peer.addr) {
+                targets.push((peer.dev, peer.addr, peer.name));
             }
         }
-        Err(e) => tracing::debug!("discovery: {e:#}"),
+
+        match net::discover(Duration::from_secs(2)) {
+            Ok(found) => {
+                for (dev, addr) in found {
+                    // Себя пропускаем; при автоматическом синке инициатор только
+                    // один (меньший device id), чтобы не открывать две сессии.
+                    if dev == me {
+                        continue;
+                    }
+                    if !manual && me > dev {
+                        continue;
+                    }
+                    if !targets.iter().any(|(_, a, _)| *a == addr) {
+                        targets.push((dev, addr, String::new()));
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("discovery: {e:#}"),
+        }
     }
 
     if targets.is_empty() {
         if manual {
-            bail!("Никого не нашли: включена ли служба на другом устройстве и та же ли это сеть?");
+            bail!("Нет соединения: сначала подключитесь к устройству");
         }
         return Ok(String::new());
     }
@@ -638,14 +803,21 @@ fn do_sync(
     runtime.lock().unwrap().syncing = true;
     let mut done = Vec::new();
     let mut errors = Vec::new();
-    for (dev, addr) in targets {
+    let mut no_answer = Vec::new();
+    for (dev, addr, name) in targets {
+        let label = if name.is_empty() {
+            dev.clone()
+        } else {
+            name.clone()
+        };
         match net::sync_with_peer(replica, &addr, &token) {
             Ok(stats) => {
-                done.push(format!("{dev} ({addr}): {}", stats.summary()));
+                done.push(format!("{label} ({addr}): {}", stats.summary()));
                 let mut rt = runtime.lock().unwrap();
                 rt.peers.insert(
                     dev,
                     PeerStatus {
+                        name,
                         addr,
                         last_seen: Some(Hlc::wall_ms()),
                         error: None,
@@ -655,11 +827,29 @@ fn do_sync(
             }
             Err(e) => {
                 let message = format!("{e:#}");
-                errors.push(format!("{dev} ({addr}): {message}"));
+                if is_unreachable(&e) {
+                    // Устройство просто не в сети или ещё не слушает порт —
+                    // это не ошибка синхронизации, а «нет ответа».
+                    tracing::debug!("{label} ({addr}): {message}");
+                    no_answer.push(format!("{label} ({addr})"));
+                    let mut rt = runtime.lock().unwrap();
+                    rt.peers.insert(
+                        dev,
+                        PeerStatus {
+                            name,
+                            addr,
+                            last_seen: None,
+                            error: None,
+                        },
+                    );
+                    continue;
+                }
+                errors.push(format!("{label} ({addr}): {message}"));
                 let mut rt = runtime.lock().unwrap();
                 rt.peers.insert(
                     dev,
                     PeerStatus {
+                        name,
                         addr,
                         last_seen: None,
                         error: Some(message),
@@ -676,6 +866,13 @@ fn do_sync(
         }
     }
 
+    if done.is_empty() && errors.is_empty() {
+        if manual && !no_answer.is_empty() {
+            // Пользователь нажал «синхронизировать» и ждёт ответа.
+            return Ok(format!("Нет ответа: {}", no_answer.join(", ")));
+        }
+        return Ok(String::new());
+    }
     if done.is_empty() {
         let all = errors.join("; ");
         runtime.lock().unwrap().last_error = Some(all.clone());
@@ -799,6 +996,8 @@ struct UiCtx {
     runtime: Shared,
     root: PathBuf,
     dev: String,
+    /// Понятное имя устройства (COMPUTERNAME и т.п.).
+    name: String,
     /// Адрес, который попадёт в строку сопряжения.
     sync_addr: String,
 }
@@ -882,6 +1081,17 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
     match path {
         "/api/scan" => run_cmd(&ctx.commands, Cmd::Scan),
         "/api/sync" => run_cmd(&ctx.commands, Cmd::Sync),
+        "/api/connect" => {
+            let body = body_json(request);
+            let dev = str_field(&body, "dev")?;
+            run_cmd(&ctx.commands, move |reply| Cmd::Connect { dev, reply })
+        }
+        "/api/disconnect" => run_cmd(&ctx.commands, Cmd::Disconnect),
+        "/api/peers/forget" => {
+            let body = body_json(request);
+            let dev = str_field(&body, "dev")?;
+            run_cmd(&ctx.commands, move |reply| Cmd::ForgetPeer { dev, reply })
+        }
         "/api/gc" => run_cmd(&ctx.commands, Cmd::Gc),
         "/api/disk/check" => run_cmd(&ctx.commands, Cmd::CheckDisk),
         "/api/pair" => {
@@ -976,8 +1186,31 @@ fn api_status(ctx: &UiCtx) -> Value {
         .known_peers()
         .unwrap_or_default()
         .into_iter()
-        .map(|(dev, addr)| json!({ "dev": dev, "addr": addr }))
+        .map(|p| json!({ "dev": p.dev, "addr": p.addr, "name": p.name }))
         .collect();
+    let peers: Vec<Value> = rt
+        .peers
+        .iter()
+        .map(|(dev, p)| {
+            json!({
+                "dev": dev,
+                "name": p.name,
+                "addr": p.addr,
+                "last_seen": p.last_seen,
+                "error": p.error,
+            })
+        })
+        .collect();
+    let connection = match &rt.active_peer {
+        Some(peer) => json!({
+            "connected": true,
+            "dev": peer.dev,
+            "name": peer.name,
+            "addr": peer.addr,
+            "since": peer.since,
+        }),
+        None => json!({ "connected": false }),
+    };
 
     let state = if rt.disk_low {
         "paused_with_warning"
@@ -993,6 +1226,7 @@ fn api_status(ctx: &UiCtx) -> Value {
 
     json!({
         "device": ctx.dev,
+        "name": ctx.name,
         "root": ctx.root.to_string_lossy(),
         "state": state,
         "paused": rt.paused,
@@ -1015,7 +1249,8 @@ fn api_status(ctx: &UiCtx) -> Value {
         "ignored": ignored,
         "conflicts": conflicts,
         "vault": vault,
-        "peers": rt.peers.values().collect::<Vec<_>>(),
+        "peers": peers,
+        "connection": connection,
         "known_peers": known_peers,
         "pair_addr": ctx.sync_addr,
     })
@@ -1023,7 +1258,7 @@ fn api_status(ctx: &UiCtx) -> Value {
 
 fn api_pair_code(ctx: &UiCtx) -> Value {
     let token = ctx.read.lock().unwrap().ensure_token().unwrap_or_default();
-    let code = net::pair_code(&ctx.dev, &token, &ctx.sync_addr);
+    let code = net::pair_code(&ctx.dev, &ctx.name, &token, &ctx.sync_addr);
     let svg = qrcode::QrCode::new(code.as_bytes())
         .map(|qr| {
             qr.render::<qrcode::render::svg::Color>()
@@ -1036,6 +1271,7 @@ fn api_pair_code(ctx: &UiCtx) -> Value {
         "svg": svg,
         "addr": ctx.sync_addr,
         "dev": ctx.dev,
+        "name": ctx.name,
     })
 }
 

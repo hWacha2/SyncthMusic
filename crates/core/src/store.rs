@@ -129,8 +129,17 @@ pub struct VaultRow {
 pub struct Replica {
     conn: Connection,
     dev: String,
+    name: String,
     data_dir: Option<PathBuf>,
     key: SigningKey,
+}
+
+/// Сопряжённое устройство. `name` — понятное имя, если пир его сообщил.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub dev: String,
+    pub addr: String,
+    pub name: String,
 }
 
 impl Replica {
@@ -141,6 +150,7 @@ impl Replica {
         let mut replica = Self {
             conn,
             dev: dev.to_string(),
+            name: crate::device_name(),
             data_dir: None,
             key: load_or_create_key(None)?,
         };
@@ -159,6 +169,7 @@ impl Replica {
         let mut replica = Self {
             conn,
             dev: dev.to_string(),
+            name: crate::device_name(),
             data_dir: Some(data_dir.to_path_buf()),
             key: load_or_create_key(Some(data_dir))?,
         };
@@ -181,6 +192,12 @@ impl Replica {
                 [],
             )?;
         }
+        if !self.has_column("peers", "name")? {
+            self.conn.execute(
+                "ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         self.set_meta("schema_version", "4")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
@@ -189,11 +206,28 @@ impl Replica {
             }
             None => self.set_meta("device_id", &self.dev)?,
         }
+        // Имя не входит в идентичность: его можно менять без миграции данных.
+        // Всегда берём текущее системное имя, чтобы переименование ПК было видно.
+        self.name = crate::device_name();
+        self.set_meta("device_name", &self.name)?;
         Ok(())
     }
 
     pub fn device_id(&self) -> &str {
         &self.dev
+    }
+
+    /// Понятное имя этого устройства. Отличается от `device_id`.
+    pub fn device_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Задать имя явно (например, модель телефона вместо пустого hostname).
+    pub fn set_device_name(&mut self, name: &str) -> Result<()> {
+        let name = crate::sanitize_name(name);
+        self.name = name.clone();
+        self.set_meta("device_name", &name)?;
+        Ok(())
     }
 
     pub fn data_dir(&self) -> Option<&Path> {
@@ -268,21 +302,37 @@ impl Replica {
 
     // ---------------------------------------------------------------- peers
 
-    pub fn add_peer(&self, dev: &str, addr: &str) -> Result<()> {
+    pub fn add_peer(&self, dev: &str, addr: &str, name: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO peers(dev, addr, added_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(dev) DO UPDATE SET addr = excluded.addr",
-            params![dev, addr, Hlc::wall_ms() as i64],
+            "INSERT INTO peers(dev, addr, added_at, name) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(dev) DO UPDATE SET addr = excluded.addr,
+                 name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE peers.name END",
+            params![dev, addr, Hlc::wall_ms() as i64, name],
         )?;
         Ok(())
     }
 
-    pub fn known_peers(&self) -> Result<Vec<(String, String)>> {
+    pub fn known_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT dev, addr FROM peers ORDER BY dev")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            .prepare("SELECT dev, addr, name FROM peers ORDER BY dev")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Peer {
+                dev: r.get(0)?,
+                addr: r.get(1)?,
+                name: r.get(2)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Забыть устройство. Токен библиотеки не меняется: «забыть» — это убрать
+    /// сохранённый адрес, а не сменить общий секрет для остальных пиров.
+    pub fn remove_peer(&self, dev: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM peers WHERE dev = ?1", params![dev])?
+            > 0)
     }
 
     // ---------------------------------------------------------------- clock

@@ -31,6 +31,7 @@ const I18N = (() => {
     'alert.conflicts.action': 'Открыть',
     'devices.tag': 'всего {n}',
     'devices.tagEmpty': 'нет',
+    'device.unknown': 'неизвестное устройство',
 
     'word.files': ['файл', 'файла', 'файлов'],
 
@@ -78,6 +79,19 @@ const I18N = (() => {
 
     'act.sync': 'Синхронизировать',
     'act.scan': 'Пересканировать',
+    'act.connect': 'Подключиться',
+    'act.disconnect': 'Отключиться',
+    'act.forget': 'Забыть',
+    'conn.none': 'Нет соединения',
+    'conn.connected': 'подключено',
+    'conn.connectedTo': 'Подключено: {name}',
+    'toast.connected': 'Подключено: {name}',
+    'toast.disconnected': 'Соединение закрыто',
+    'toast.peerForgotten': 'Устройство забыто',
+    'run.connect': 'Подключение',
+    'run.disconnect': 'Отключение',
+    'run.forgetPeer': 'Забывание устройства',
+    'confirm.forgetPeer': 'Забыть устройство? Сопряжение придётся выполнить заново.',
 
     'stat.files': 'Файлов в индексе',
     'stat.filesNote': '{n} на телефоне',
@@ -204,6 +218,7 @@ const I18N = (() => {
     'alert.conflicts.action': 'Open',
     'devices.tag': '{n} total',
     'devices.tagEmpty': 'none',
+    'device.unknown': 'Unknown device',
 
     'word.files': ['file', 'files'],
 
@@ -250,6 +265,19 @@ const I18N = (() => {
 
     'act.sync': 'Sync',
     'act.scan': 'Rescan',
+    'act.connect': 'Connect',
+    'act.disconnect': 'Disconnect',
+    'act.forget': 'Forget',
+    'conn.none': 'No connection',
+    'conn.connected': 'connected',
+    'conn.connectedTo': 'Connected: {name}',
+    'toast.connected': 'Connected: {name}',
+    'toast.disconnected': 'Connection closed',
+    'toast.peerForgotten': 'Device forgotten',
+    'run.connect': 'Connect',
+    'run.disconnect': 'Disconnect',
+    'run.forgetPeer': 'Forget device',
+    'confirm.forgetPeer': 'Forget this device? You will need to pair again.',
 
     'stat.files': 'Files indexed',
     'stat.filesNote': '{n} on the phone',

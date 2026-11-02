@@ -201,6 +201,7 @@ fn app_info() -> Value {
         "config_path": config_path().to_string_lossy(),
         "config": config,
         "data_dir": data_dir.to_string_lossy(),
+        "device_name": syncth_core::device_name(),
         "daemon_bin": daemon.map(|p| p.to_string_lossy().to_string()),
         "app_data_dir": app_data_dir().to_string_lossy(),
         "platform": if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" },
@@ -244,6 +245,12 @@ async fn daemon_action(name: String, payload: Option<Value>) -> Result<Value, St
             })),
         ),
         "pair" => ("/api/pair", Some(json!({ "code": field("code")? }))),
+        "connect" => ("/api/connect", Some(json!({ "dev": field("dev")? }))),
+        "disconnect" => ("/api/disconnect", None),
+        "peer_forget" => (
+            "/api/peers/forget",
+            Some(json!({ "dev": field("dev")? })),
+        ),
         "pending_resolve" => (
             "/api/pending/resolve",
             Some(json!({ "path": field("path")?, "action": field("action")? })),
@@ -457,6 +464,17 @@ fn pick_data_folder() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Проверка пути, введённого вручную. Диалог выбора — удобство, но путь
+/// всегда можно напечатать: на ПК это обычный `F:\Music`.
+#[tauri::command]
+fn probe_folder(path: String) -> Value {
+    let path = PathBuf::from(path.trim());
+    json!({
+        "exists": path.is_dir(),
+        "path": path.to_string_lossy(),
+    })
+}
+
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     open_target(&path)
@@ -566,6 +584,7 @@ pub fn run() {
             change_library,
             pick_folder,
             pick_data_folder,
+            probe_folder,
             open_path,
             open_url,
             daemon_log_tail,

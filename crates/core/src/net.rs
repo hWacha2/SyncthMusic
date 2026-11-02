@@ -35,6 +35,8 @@ use crate::store::{EntryRow, Replica};
 
 const MAX_MSG: usize = 256 * 1024 * 1024;
 const DISCOVERY_PORT: u16 = 47_888;
+/// Порт, на котором телефон и ПК слушают синхронизацию по умолчанию.
+pub const SYNC_PORT: u16 = 47_887;
 const PROTO: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,11 +47,28 @@ enum Msg {
         token: String,
         proto: u32,
         have: HashMap<String, (i64, i64)>,
+        #[serde(default)]
+        name: String,
     },
     HelloAck {
         dev: String,
         proto: u32,
         have: HashMap<String, (i64, i64)>,
+        #[serde(default)]
+        name: String,
+    },
+    /// Лёгкое рукопожатие сразу после сопряжения: без операций и блобов.
+    PairHello {
+        dev: String,
+        token: String,
+        proto: u32,
+        #[serde(default)]
+        name: String,
+    },
+    PairAck {
+        dev: String,
+        #[serde(default)]
+        name: String,
     },
     Ops {
         ops: Vec<Op>,
@@ -553,18 +572,20 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
         &mut w,
         &Msg::Hello {
             dev: replica.device_id().to_string(),
+            name: replica.device_name().to_string(),
             token: token.to_string(),
             proto: PROTO,
             have: replica.watermarks()?,
         },
     )?;
     let peer_have = match recv_msg(&mut r)? {
-        Msg::HelloAck { dev, have, .. } => {
+        Msg::HelloAck { dev, have, name, .. } => {
             anyhow::ensure!(
                 dev != replica.device_id(),
                 "подключились к самому себе — проверьте адрес"
             );
             tracing::info!("подключено к {dev}");
+            replica.add_peer(&dev, addr, &name)?;
             have
         }
         Msg::Error { message } => bail!("пир отказал: {message}"),
@@ -597,49 +618,78 @@ pub fn serve_stream(stream: TcpStream, replica: &mut Replica, token: &str) -> Re
     serve_one(stream, replica, token)
 }
 
+/// Запомнить пира, пришедшего к нам, если его ещё нет. Порт берём обычный
+/// для синхронизации: адрес источника — эфемерный порт клиента.
+fn remember_peer(replica: &Replica, dev: &str, name: &str, ip: Option<&str>) -> Result<()> {
+    if replica.known_peers()?.iter().any(|p| p.dev == dev) {
+        return Ok(());
+    }
+    if let Some(ip) = ip {
+        replica.add_peer(dev, &format!("{ip}:{SYNC_PORT}"), name)?;
+    }
+    Ok(())
+}
+
+fn check_hello(token: &str, got: &str, proto: u32, dev: &str, me: &str) -> Result<()> {
+    anyhow::ensure!(!token.is_empty() && got == token, "неверный токен");
+    anyhow::ensure!(proto == PROTO, "несовместимая версия протокола {proto}");
+    anyhow::ensure!(dev != me, "клиент представился нашим же device id");
+    Ok(())
+}
+
 fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
-    let root = replica.root()?.context("корень библиотеки не задан")?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip().to_string());
+    let me = replica.device_id().to_string();
     let mut w = BufWriter::new(stream.try_clone()?);
     let mut r = BufReader::new(stream);
     let mut stats = SyncStats::default();
 
     let peer_have = match recv_msg(&mut r)? {
+        Msg::PairHello {
+            token: got,
+            proto,
+            dev,
+            name,
+        } => {
+            if let Err(e) = check_hello(token, &got, proto, &dev, &me) {
+                let _ = send_msg(
+                    &mut w,
+                    &Msg::Error {
+                        message: e.to_string(),
+                    },
+                );
+                return Err(e);
+            }
+            remember_peer(replica, &dev, &name, peer_ip.as_deref())?;
+            send_msg(
+                &mut w,
+                &Msg::PairAck {
+                    dev: me,
+                    name: replica.device_name().to_string(),
+                },
+            )?;
+            return Ok(stats);
+        }
         Msg::Hello {
             token: got,
             proto,
             dev,
             have,
+            name,
         } => {
-            if token.is_empty() || got != token {
-                send_msg(
+            if let Err(e) = check_hello(token, &got, proto, &dev, &me) {
+                let _ = send_msg(
                     &mut w,
                     &Msg::Error {
-                        message: "неверный токен".into(),
+                        message: e.to_string(),
                     },
-                )?;
-                bail!("неверный токен от устройства {dev}");
+                );
+                return Err(e);
             }
-            if proto != PROTO {
-                send_msg(
-                    &mut w,
-                    &Msg::Error {
-                        message: format!("версия протокола {proto}, ожидаем {PROTO}"),
-                    },
-                )?;
-                bail!("несовместимая версия протокола");
-            }
-            if dev == replica.device_id() {
-                send_msg(
-                    &mut w,
-                    &Msg::Error {
-                        message: "это то же самое устройство".into(),
-                    },
-                )?;
-                bail!("клиент представился нашим же device id");
-            }
+            remember_peer(replica, &dev, &name, peer_ip.as_deref())?;
             have
         }
         other => bail!("ожидали hello, получили {other:?}"),
@@ -647,11 +697,14 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
     send_msg(
         &mut w,
         &Msg::HelloAck {
-            dev: replica.device_id().to_string(),
+            dev: me,
+            name: replica.device_name().to_string(),
             proto: PROTO,
             have: replica.watermarks()?,
         },
     )?;
+
+    let root = replica.root()?.context("корень библиотеки не задан")?;
 
     // 1. Принимаем операции клиента.
     match recv_msg(&mut r)? {
@@ -802,13 +855,18 @@ pub fn reject_stream(stream: TcpStream, message: &str) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairInfo {
     pub dev: String,
+    pub name: String,
     pub token: String,
     pub addr: String,
 }
 
-/// Строка вида `syncth://pair?v=1&dev=…&token=…&addr=192.168.1.5:47887`.
-pub fn pair_code(dev: &str, token: &str, addr: &str) -> String {
-    format!("syncth://pair?v=1&dev={dev}&token={token}&addr={addr}")
+/// Строка вида `syncth://pair?v=1&dev=…&name=…&token=…&addr=192.168.1.5:47887`.
+pub fn pair_code(dev: &str, name: &str, token: &str, addr: &str) -> String {
+    if name.is_empty() {
+        format!("syncth://pair?v=1&dev={dev}&token={token}&addr={addr}")
+    } else {
+        format!("syncth://pair?v=1&dev={dev}&name={name}&token={token}&addr={addr}")
+    }
 }
 
 pub fn parse_pair_code(code: &str) -> Result<PairInfo> {
@@ -817,6 +875,7 @@ pub fn parse_pair_code(code: &str) -> Result<PairInfo> {
         .strip_prefix("syncth://pair?")
         .with_context(|| "ожидали строку syncth://pair?…")?;
     let mut dev = None;
+    let mut name = String::new();
     let mut token = None;
     let mut addr = None;
     for part in rest.split('&') {
@@ -825,6 +884,7 @@ pub fn parse_pair_code(code: &str) -> Result<PairInfo> {
         };
         match key {
             "dev" => dev = Some(value.to_string()),
+            "name" => name = value.to_string(),
             "token" => token = Some(value.to_string()),
             "addr" => addr = Some(value.to_string()),
             _ => {}
@@ -842,7 +902,63 @@ pub fn parse_pair_code(code: &str) -> Result<PairInfo> {
         addr.rsplit_once(':').is_some(),
         "адрес должен быть вида ip:порт"
     );
-    Ok(PairInfo { dev, token, addr })
+    Ok(PairInfo {
+        dev,
+        name,
+        token,
+        addr,
+    })
+}
+
+/// Кто ответил на лёгкое рукопожатие.
+#[derive(Debug, Clone)]
+pub struct PeerHello {
+    pub dev: String,
+    pub name: String,
+}
+
+/// Лёгкое рукопожатие без операций и блобов. Нужно и сопряжению, и кнопке
+/// «Подключиться»: она проверяет, что пир жив, и запоминает его адрес.
+pub fn probe_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<PeerHello> {
+    let stream = TcpStream::connect_timeout(
+        &addr.parse().with_context(|| format!("адрес {addr}"))?,
+        Duration::from_secs(3),
+    )
+    .with_context(|| format!("подключение к {addr}"))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut w = BufWriter::new(stream.try_clone()?);
+    let mut r = BufReader::new(stream);
+    send_msg(
+        &mut w,
+        &Msg::PairHello {
+            dev: replica.device_id().to_string(),
+            name: replica.device_name().to_string(),
+            token: token.to_string(),
+            proto: PROTO,
+        },
+    )?;
+    match recv_msg(&mut r)? {
+        Msg::PairAck { dev, name } => {
+            anyhow::ensure!(
+                dev != replica.device_id(),
+                "подключились к самому себе — проверьте адрес"
+            );
+            // Адрес мог смениться по DHCP: успешный ответ — самый свежий источник.
+            replica.add_peer(&dev, addr, &name)?;
+            Ok(PeerHello { dev, name })
+        }
+        Msg::Error { message } => bail!("пир отказал: {message}"),
+        other => bail!("неожиданный ответ на сопряжение: {other:?}"),
+    }
+}
+
+/// Сообщить пиру, что мы сопряжены, не запуская полный синк. Нужно, чтобы
+/// вторая сторона сразу увидела новое устройство, даже если QR сканировали
+/// только с одной стороны. Ошибка сети не отменяет уже сохранённое сопряжение.
+pub fn announce(replica: &mut Replica, addr: &str, token: &str) -> Result<()> {
+    probe_peer(replica, addr, token).map(|_| ())
 }
 
 /// Локальный IPv4, который видит сеть. UDP-connect пакетов не отправляет.
@@ -910,9 +1026,10 @@ mod tests {
     #[test]
     fn pair_code_roundtrip() {
         let token = "a".repeat(64);
-        let code = pair_code("dev-1234abcd", &token, "192.168.1.5:47887");
+        let code = pair_code("dev-1234abcd", "DESKTOP-ABC123", &token, "192.168.1.5:47887");
         let info = parse_pair_code(&code).unwrap();
         assert_eq!(info.dev, "dev-1234abcd");
+        assert_eq!(info.name, "DESKTOP-ABC123");
         assert_eq!(info.token, token);
         assert_eq!(info.addr, "192.168.1.5:47887");
     }
@@ -922,6 +1039,34 @@ mod tests {
         assert!(parse_pair_code("https://example.com").is_err());
         assert!(parse_pair_code("syncth://pair?dev=x&token=zz&addr=1.2.3.4:5").is_err());
         assert!(parse_pair_code("syncth://pair?dev=x&token=abcd&addr=localhost").is_err());
+    }
+
+    #[test]
+    fn announce_makes_the_pairing_visible_on_both_sides() {
+        let token = "a".repeat(64);
+        let mut server = Replica::in_memory("dev-server").unwrap();
+        server.set_token(&token).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_token = token.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = serve_stream(stream, &mut server, &server_token);
+            (result, server.known_peers().unwrap())
+        });
+
+        let mut client = Replica::in_memory("dev-client").unwrap();
+        client.set_token(&token).unwrap();
+        announce(&mut client, &addr, &token).unwrap();
+
+        let (result, server_peers) = handle.join().unwrap();
+        result.unwrap();
+        assert!(server_peers.iter().any(|p| p.dev == "dev-client"));
+        assert!(client
+            .known_peers()
+            .unwrap()
+            .iter()
+            .any(|p| p.dev == "dev-server"));
     }
 
     #[test]

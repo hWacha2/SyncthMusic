@@ -23,4 +23,42 @@ pub use hlc::Hlc;
 pub use op::{Op, OpKind};
 pub use resolve::{resolve, Action, Outcome};
 pub use scan::{scan, ScanReport};
-pub use store::{EntryRow, PendingDelete, Replica, VaultRow};
+pub use store::{EntryRow, Peer, PendingDelete, Replica, VaultRow};
+
+/// Понятное человеку имя устройства. Не заменяет `device_id`: тот остаётся
+/// стабильным, а имя можно менять (переименование ПК, `SYNCTH_DEVICE_NAME`).
+/// Символы, ломающие строку сопряжения, вычищаются.
+pub fn device_name() -> String {
+    let raw = std::env::var("SYNCTH_DEVICE_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "device".into());
+    sanitize_name(&raw)
+}
+
+/// Привести имя устройства к виду, безопасному для строки сопряжения.
+pub fn sanitize_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.trim().chars() {
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') || !ch.is_ascii();
+        let ch = if keep { ch } else { '-' };
+        if ch == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(ch);
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "device".into()
+    } else {
+        out
+    }
+}
