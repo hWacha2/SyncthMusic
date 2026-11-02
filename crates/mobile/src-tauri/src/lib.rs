@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+use syncth_core::plan::{self, Decision, PathDecision};
 use syncth_core::{net, resolve, scan, store::Replica, Action, Hlc};
 use tauri::Manager;
 
@@ -210,6 +211,103 @@ fn status_json(replica: &Replica) -> Value {
     })
 }
 
+/// Устройство, с которым открыт живой сеанс. На телефоне это входящее
+/// соединение: исходящее пока только проверяет доступность пира.
+fn session_dev() -> Option<String> {
+    server::session_json()
+        .and_then(|session| session.get("dev").and_then(Value::as_str).map(str::to_string))
+}
+
+fn plan_payload(replica: &Replica) -> Value {
+    let Some(dev) = session_dev() else {
+        // Без сеанса план всё равно нужен: человек видит локальные изменения,
+        // но решения и commit недоступны.
+        return match plan::build(replica, "", &replica.device_name(), &[]) {
+            Ok(plan) => json!({
+                "connected": false,
+                "local_only": true,
+                "stale": false,
+                "plan": plan,
+                "hash": plan.decisions_hash(),
+                "unresolved": plan.unresolved().len(),
+                "paths": plan.path_count(),
+                "session": Value::Null,
+            }),
+            Err(e) => json!({
+                "connected": false,
+                "local_only": true,
+                "stale": false,
+                "plan": Value::Null,
+                "error": format!("{e:#}"),
+                "session": Value::Null,
+            }),
+        };
+    };
+
+    match replica.load_plan(&dev, Hlc::wall_ms()) {
+        Ok(Some(plan)) => {
+            let stale = !plan.local_is_current(replica).unwrap_or(false);
+            json!({
+                "connected": true,
+                "local_only": false,
+                "stale": stale,
+                "plan": plan,
+                "hash": plan.decisions_hash(),
+                "unresolved": plan.unresolved().len(),
+                "paths": plan.path_count(),
+                "session": server::session_json(),
+            })
+        }
+        Ok(None) => json!({
+            "connected": true,
+            "local_only": false,
+            "stale": false,
+            "plan": Value::Null,
+            "session": server::session_json(),
+        }),
+        Err(e) => json!({
+            "connected": true,
+            "local_only": false,
+            "stale": false,
+            "plan": Value::Null,
+            "error": format!("{e:#}"),
+            "session": server::session_json(),
+        }),
+    }
+}
+
+/// Записать решение в план сеанса. Отправка пиру происходит в потоке сеанса:
+/// он периодически забирает новые решения из базы.
+fn save_decision(
+    replica: &mut Replica,
+    peer_dev: &str,
+    path: &str,
+    action: Decision,
+) -> Result<(), String> {
+    let mut plan = replica
+        .load_plan(peer_dev, Hlc::wall_ms())
+        .map_err(err)?
+        .ok_or_else(|| "План не найден: обновите соединение".to_string())?;
+    let blob = plan
+        .blob_for(path)
+        .ok_or_else(|| format!("Путь отсутствует в плане: {path}"))?;
+    let hlc = replica.next_hlc().map_err(err)?;
+    let decision = PathDecision {
+        path: path.to_string(),
+        action,
+        blob,
+        hlc,
+        dev: replica.device_id().to_string(),
+    };
+    let mut set = replica.load_decisions(peer_dev).map_err(err)?;
+    set.entries.insert(path.to_string(), decision);
+    set.retain_valid(&plan);
+    replica.save_decisions(peer_dev, &set).map_err(err)?;
+    plan.decisions = set;
+    replica.save_plan(&plan).map_err(err)?;
+    Ok(())
+}
+
 async fn blocking<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -251,6 +349,52 @@ async fn status(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
         let replica = open(&app)?;
         Ok(status_json(&replica))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sync_plan(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let replica = open(&app)?;
+        Ok(plan_payload(&replica))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_plan_decision(
+    app: tauri::AppHandle,
+    path: String,
+    action: String,
+) -> Result<Value, String> {
+    blocking(move || {
+        let peer_dev = session_dev()
+            .ok_or_else(|| "Нет соединения: решения недоступны".to_string())?;
+        let action = Decision::parse(&action)
+            .ok_or_else(|| format!("Неизвестное решение: {action}"))?;
+        let mut replica = open(&app)?;
+        save_decision(&mut replica, &peer_dev, &path, action)?;
+        Ok(plan_payload(&replica))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn commit_plan(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let Some(result) = server::request_commit() else {
+            return Err("Нет сеанса: попросите ПК подключиться к телефону".into());
+        };
+        let (accepted, rejected) = result?;
+        let replica = open(&app)?;
+        let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
+        Ok(json!({
+            "accepted": accepted,
+            "rejected": rejected,
+            "plan": plan_payload(&replica),
+            "status": status_json(&replica),
+        }))
     })
     .await
 }
@@ -578,6 +722,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             status,
+            sync_plan,
+            set_plan_decision,
+            commit_plan,
             init_library,
             change_root,
             scan_now,

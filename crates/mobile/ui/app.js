@@ -20,6 +20,13 @@ const state = {
   error: null,
   code: null,
   peers: [],
+  plan: null,
+  planError: null,
+  planLoading: false,
+  planFilter: 'all',
+  // Выделение строго одной группы «источник + тип»: { group, paths:Set }.
+  planSelection: null,
+  polling: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -73,6 +80,7 @@ async function boot() {
     if (state.info.info && (state.info.info.name || state.info.info.device)) {
       $('#app-dev').textContent = state.info.info.name || state.info.info.device;
     }
+    if (state.status) await loadPlan();
   } catch (error) {
     state.error = errText(error);
   }
@@ -89,6 +97,41 @@ async function refresh(silent = false) {
   }
 }
 
+async function loadPlan() {
+  if (!state.status) {
+    state.plan = null;
+    state.planSelection = null;
+    return;
+  }
+  if (state.planLoading) return;
+  state.planLoading = true;
+  try {
+    state.plan = await invoke('sync_plan');
+    state.planError = null;
+    reconcilePlanSelection();
+  } catch (error) {
+    state.plan = { connected: false, local_only: true, stale: false, plan: null, error: errText(error) };
+    state.planSelection = null;
+    state.planError = errText(error);
+  } finally {
+    state.planLoading = false;
+  }
+}
+
+function planSummary() {
+  const data = state.plan;
+  const plan = data && data.plan ? data.plan : null;
+  return {
+    connected: !!(data && data.connected),
+    localOnly: !!(data && data.local_only),
+    stale: !!(data && data.stale),
+    plan,
+    paths: plan && data.paths != null ? data.paths : 0,
+    unresolved: data && data.unresolved != null ? data.unresolved : 0,
+    error: (data && data.error) || state.planError,
+  };
+}
+
 // ------------------------------------------------------------------ отрисовка
 
 function render() {
@@ -100,7 +143,9 @@ function render() {
   const stateText = $('#app-state');
   const progress = $('#progress');
   if (progress) progress.hidden = !state.busy;
-  const problems = snap.pending.length + snap.conflicts.length;
+  const plan = planSummary();
+  const planCount = plan.paths || snap.pending.length + snap.conflicts.length;
+  const problems = planCount;
   led.className = 'led ' + (state.busy ? 'led--warn' : problems ? 'led--warn' : state.status ? 'led--ok' : '');
   stateText.textContent = state.busy
     ? t('appbar.busy')
@@ -110,13 +155,11 @@ function render() {
         ? t('appbar.attention')
         : t('appbar.synced');
 
-  const badge = $('#badge-pending');
-  badge.textContent = String(snap.pending.length);
-  badge.hidden = !snap.pending.length;
-
-  const conflictBadge = $('#badge-conflicts');
-  conflictBadge.textContent = String(snap.conflicts.length);
-  conflictBadge.hidden = !snap.conflicts.length;
+  const badge = $('#badge-plan');
+  if (badge) {
+    badge.textContent = String(planCount);
+    badge.hidden = !planCount;
+  }
 
   for (const tab of document.querySelectorAll('.tab')) {
     tab.classList.toggle('is-on', tab.dataset.tab === state.tab);
@@ -129,9 +172,12 @@ function render() {
     view.innerHTML = state.error ? errorScreen(state.error) : setupScreen();
     return;
   }
-  if (state.tab === 'pending') view.innerHTML = pendingView(snap);
-  else if (state.tab === 'conflicts') view.innerHTML = conflictsView(snap);
-  else if (state.tab === 'vault') view.innerHTML = vaultView(snap);
+  if (state.tab === 'plan') {
+    view.innerHTML = planView(snap);
+    view.querySelectorAll('.plan-check[data-indeterminate]').forEach((box) => {
+      box.indeterminate = true;
+    });
+  } else if (state.tab === 'vault') view.innerHTML = vaultView(snap);
   else if (state.tab === 'more') view.innerHTML = moreView(snap);
   else view.innerHTML = overviewView(snap);
 }
@@ -168,36 +214,26 @@ function setupScreen() {
 }
 
 function overviewView(snap) {
-  const pending = snap.pending.length;
-  const conflicts = snap.conflicts.length;
+  const plan = planSummary();
+  const planPaths = plan.paths || snap.pending.length + snap.conflicts.length;
+  const planUnresolved = plan.unresolved || snap.conflicts.length;
   const peers = snap.known_peers.length;
   const connection = snap.connection || { connected: false };
   const connected = !!connection.connected;
   const title = t('overview.title.ok');
-  const hint = pending
-    ? tp('overview.hint.pending', pending)
-    : conflicts
-      ? t('overview.hint.conflicts')
-      : t('overview.hint.ok');
+  const hint = planPaths
+    ? tp('overview.hint.plan', planPaths)
+    : t('overview.hint.ok');
   const root = snap.root || '';
 
   const alerts = [];
-  if (pending) {
+  if (planPaths || planUnresolved) {
     alerts.push({
-      icon: 'alert',
-      tone: 'bad',
-      title: tp('alert.pending.title', pending),
-      text: t('alert.pending.text'),
-      action: `<button class="btn btn--sm" data-tab-jump="pending">${esc(t('alert.pending.action'))}</button>`,
-    });
-  }
-  if (conflicts) {
-    alerts.push({
-      icon: 'split',
-      tone: 'bad',
-      title: tp('alert.conflicts.title', conflicts),
-      text: t('alert.conflicts.text'),
-      action: `<button class="btn btn--sm" data-tab-jump="conflicts">${esc(t('alert.conflicts.action'))}</button>`,
+      icon: planUnresolved ? 'split' : 'clock',
+      tone: planUnresolved ? 'bad' : '',
+      title: tp('alert.plan.title', planPaths || planUnresolved),
+      text: planUnresolved ? t('alert.plan.conflicts') : t('alert.plan.text'),
+      action: `<button class="btn btn--sm" data-tab-jump="plan">${esc(t('alert.plan.action'))}</button>`,
     });
   }
 
@@ -289,49 +325,257 @@ function overviewView(snap) {
   </section>`;
 }
 
-function pendingView(snap) {
-  const rows = snap.pending.map((p) => `
-    <div class="row">
-      <div class="row-top"><span class="row-path">${esc(p.path)}</span></div>
-      <div class="row-meta">${esc(t('pending.rowMeta', { ago: ago(p.detected_at) }))}</div>
-      <div class="row-actions">
-        <button class="btn btn--sm btn--danger" data-resolve="delete_everywhere" data-path="${esc(p.path)}">${esc(t('queue.delete'))}</button>
-        <button class="btn btn--sm" data-resolve="only_here" data-path="${esc(p.path)}">${esc(t('queue.keep'))}</button>
-      </div>
-      <div class="row-actions">
-        <button class="btn btn--sm btn--ghost" data-forget="${esc(p.path)}">${esc(t('queue.dismiss'))}</button>
-      </div>
-    </div>`).join('');
+const PLAN_KINDS = ['added', 'updated', 'moved', 'deleted'];
+const PLAN_FILTERS = ['all', 'added', 'updated', 'moved', 'deleted', 'conflicts'];
 
-  return `<section class="panel">
-      <h1 class="hero-title">${esc(t('queue.title'))}</h1>
-      <p class="hero-hint">${esc(t('queue.hint'))}</p>
-    </section>
-    <section class="panel panel--flat">
-      ${snap.pending.length
-        ? `<div class="rows">${rows}</div>
-           <p class="hint">${esc(t('queue.explain'))}</p>`
-        : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('pending.emptyTitle'))}</b><p>${esc(t('queue.emptyText'))}</p></div>`}
-    </section>`;
+function planSourceName(plan, side) {
+  if (side === 'local') {
+    return (state.status && state.status.name)
+      || (state.info && state.info.info && state.info.info.name)
+      || t('plan.thisDevice');
+  }
+  return (plan && plan.peer_name) || t('plan.otherDevice');
 }
 
-function conflictsView(snap) {
-  const rows = snap.conflicts.map((path) => `
-    <div class="row">
-      <div class="row-top">${icon('split', '')}<span class="row-path">${esc(path)}</span></div>
-      <div class="row-meta">${esc(t('conflicts.rowMeta'))}</div>
-    </div>`).join('');
+function planGroups(filter = state.planFilter) {
+  const { plan } = planSummary();
+  if (!plan) return [];
+  const groups = [];
+  if ((filter === 'all' || filter === 'conflicts') && (plan.conflicts || []).length) {
+    groups.push({
+      key: 'conflict',
+      side: 'conflict',
+      kind: 'conflict',
+      title: t('plan.filter.conflicts'),
+      source: t('plan.bothDevices'),
+      items: plan.conflicts.map((conflict) => ({
+        path: conflict.path,
+        size: conflict.local_size || conflict.remote_size || 0,
+        time: 0,
+        conflict,
+      })),
+    });
+  }
+  for (const side of ['local', 'remote']) {
+    for (const kind of PLAN_KINDS) {
+      if (filter !== 'all' && filter !== kind) continue;
+      const items = (plan[side] || [])
+        .filter((change) => change.kind === kind)
+        .map((change) => ({
+          path: change.path,
+          size: change.size || 0,
+          time: change.mtime_ns ? Math.round(change.mtime_ns / 1e6) : 0,
+          change,
+        }));
+      if (!items.length) continue;
+      groups.push({
+        key: `${side}:${kind}`,
+        side,
+        kind,
+        title: t(`plan.filter.${kind}`),
+        source: planSourceName(plan, side),
+        items,
+      });
+    }
+  }
+  return groups;
+}
+
+function planGroupPaths() {
+  const map = new Map();
+  planGroups('all').forEach((group) => {
+    map.set(group.key, new Set(group.items.map((item) => item.path)));
+  });
+  return map;
+}
+
+function reconcilePlanSelection() {
+  const selection = state.planSelection;
+  if (!selection) return;
+  const allowed = planGroupPaths().get(selection.group);
+  if (!allowed) {
+    state.planSelection = null;
+    return;
+  }
+  const kept = [...selection.paths].filter((path) => allowed.has(path));
+  if (!kept.length) {
+    state.planSelection = null;
+    return;
+  }
+  selection.paths = new Set(kept);
+}
+
+function planDecision(group, action) {
+  if (group === 'conflict') {
+    return action === 'keep' ? 'keep' : action === 'keep_both' ? 'keep_both' : 'accept';
+  }
+  const kind = group.split(':')[1];
+  if (kind === 'deleted') {
+    return action === 'revert' ? 'keep_in_library' : action === 'only_here' ? 'only_here' : 'delete_everywhere';
+  }
+  if (action === 'revert') return 'revert';
+  if (action === 'only_here') return 'only_here';
+  return 'accept';
+}
+
+function planActions(group, kind) {
+  if (group === 'conflict') {
+    return [
+      { action: 'keep', label: t('plan.action.conflict.keep') },
+      { action: 'accept', label: t('plan.action.conflict.accept') },
+      { action: 'keep_both', label: t('plan.action.conflict.keepBoth') },
+    ];
+  }
+  const actions = [
+    { action: 'accept', label: t(`plan.action.${kind}.accept`) },
+    { action: 'revert', label: t(`plan.action.${kind}.revert`) },
+  ];
+  if (kind === 'added' || kind === 'deleted') {
+    actions.push({ action: 'only_here', label: t(`plan.action.${kind}.onlyHere`) });
+  }
+  return actions;
+}
+
+function planItemMeta(item, plan) {
+  const parts = [];
+  if (item.size) parts.push(size(item.size).text);
+  if (item.time) parts.push(ago(item.time));
+  if (item.conflict) {
+    const entries = plan && plan.decisions && plan.decisions.entries;
+    parts.push(entries && entries[item.path] ? t('plan.decisionSet') : t('plan.needsDecision'));
+  }
+  return parts.join(' · ');
+}
+
+function planView(snap) {
+  const summary = planSummary();
+  const connection = snap.connection || { connected: false };
+  const readonly = !!connection.read_only;
+  const diverged = !!connection.diverged;
+  const connected = summary.connected;
+  const stale = summary.stale;
+  const busy = state.busy;
+  const canCommit = connected && !stale && !diverged && !readonly && !busy
+    && summary.unresolved === 0 && summary.paths > 0;
+  const peerName = (summary.plan && summary.plan.peer_name)
+    || connection.name
+    || connection.dev
+    || '';
+
+  const notices = [];
+  if (!connected) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico">${icon('devices')}</div>
+      <div class="alert-body"><b>${esc(t('plan.offlineTitle'))}</b><p>${esc(t('plan.offlineText'))}</p></div>
+      <button class="btn btn--sm" data-tab-jump="more">${esc(t('plan.connect'))}</button>
+    </div>`);
+  }
+  if (stale) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico">${icon('alert')}</div>
+      <div class="alert-body"><b>${esc(t('plan.staleTitle'))}</b><p>${esc(t('plan.staleText'))}</p></div>
+      <button class="btn btn--sm" data-act="plan-refresh">${esc(t('plan.staleAction'))}</button>
+    </div>`);
+  }
+  if (diverged) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico bad">${icon('alert')}</div>
+      <div class="alert-body"><b>${esc(t('plan.divergedTitle'))}</b><p>${esc(t('plan.divergedText'))}</p></div>
+    </div>`);
+  }
+  if (readonly) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico">${icon('sync')}</div>
+      <div class="alert-body"><b>${esc(t('plan.readonlyTitle'))}</b><p>${esc(t('plan.readonlyText'))}</p></div>
+    </div>`);
+  }
+  if (summary.error) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico bad">${icon('alert')}</div>
+      <div class="alert-body"><b>${esc(t('plan.errorTitle'))}</b><p>${esc(summary.error)}</p></div>
+    </div>`);
+  }
+
+  const filters = `<div class="plan-filters">${PLAN_FILTERS.map((filter) => {
+    const on = state.planFilter === filter ? ' is-on' : '';
+    return `<button class="plan-filter${on}" data-plan-filter="${filter}">${esc(t(`plan.filter.${filter}`))}</button>`;
+  }).join('')}</div>`;
+
+  const groups = planGroups();
+  const selection = state.planSelection;
+  const selectedPaths = selection ? selection.paths : new Set();
+  const lockDecisions = readonly || busy || !connected || stale || diverged;
+
+  const body = groups.length
+    ? groups.map((group) => {
+      const allSelected = group.items.length > 0
+        && selection && selection.group === group.key
+        && group.items.every((item) => selectedPaths.has(item.path));
+      const someSelected = selection && selection.group === group.key
+        && group.items.some((item) => selectedPaths.has(item.path));
+      const items = group.items.map((item) => {
+        const checked = !!(selection && selection.group === group.key && selectedPaths.has(item.path));
+        return `<label class="plan-item${checked ? ' is-selected' : ''}">
+          <input class="plan-check" type="checkbox" data-plan-path="${esc(item.path)}" data-plan-group="${esc(group.key)}" ${checked ? 'checked' : ''} ${lockDecisions ? 'disabled' : ''}>
+          <span class="plan-item-body">
+            <span class="plan-item-path">${esc(item.path)}</span>
+            <span class="plan-item-meta">${esc(planItemMeta(item, summary.plan))}</span>
+          </span>
+        </label>`;
+      }).join('');
+      return `<section class="plan-group">
+        <div class="plan-group-head">
+          <input class="plan-check" type="checkbox" data-plan-group="${esc(group.key)}" aria-label="${esc(t('plan.selectAll'))}" ${allSelected ? 'checked' : ''} ${someSelected && !allSelected ? 'data-indeterminate="1"' : ''} ${lockDecisions ? 'disabled' : ''}>
+          <div class="plan-group-title"><b>${esc(group.title)}</b><span>${esc(group.source)}</span></div>
+          <span class="tag">${group.items.length}</span>
+        </div>
+        <div class="plan-items">${items}</div>
+      </section>`;
+    }).join('')
+    : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('plan.emptyTitle'))}</b><p>${esc(connected ? t('plan.emptyText') : t('plan.emptyLocalText'))}</p></div>`;
+
+  let plate = '';
+  if (selection && selection.paths.size) {
+    const group = groups.find((entry) => entry.key === selection.group)
+      || planGroups('all').find((entry) => entry.key === selection.group);
+    const actions = group ? planActions(group.key, group.kind) : [];
+    plate = `<div class="plan-plate">
+      <div class="plan-plate-head">
+        <span class="plan-plate-count">${esc(tp('plan.selected', selection.paths.size))}</span>
+        <button class="plan-plate-clear" data-plan-clear>${esc(t('plan.clear'))}</button>
+      </div>
+      <div class="plan-plate-actions">
+        ${actions.map((entry) => `<button class="btn btn--sm${entry.action === 'accept' ? ' btn--primary' : ''}" data-plan-action="${entry.action}" ${lockDecisions ? 'disabled' : ''}>${esc(entry.label)}</button>`).join('')}
+        <button class="btn btn--sm btn--ghost" data-plan-all="${esc(selection.group)}" ${lockDecisions ? 'disabled' : ''}>${esc(t('plan.selectAll'))}</button>
+      </div>
+      ${lockDecisions ? `<div class="plan-plate-note">${esc(!connected ? t('plan.offlineActions') : stale || diverged ? t('plan.staleActions') : t('plan.readonlyActions'))}</div>` : ''}
+    </div>`;
+  }
 
   return `<section class="panel">
-      <h1 class="hero-title">${esc(t('conflicts.title'))}</h1>
-      <p class="hero-hint">${esc(t('conflicts.sub'))}</p>
+      <div class="kicker">${esc(t('tab.plan'))}</div>
+      <h1 class="hero-title">${esc(t('plan.title'))}</h1>
+      <p class="hero-hint">${esc(t('plan.sub'))}</p>
+      <div class="plan-status">
+        <span class="tag ${connected ? 'tag--good' : 'tag--warn'}">${esc(connected && peerName ? t('conn.connectedTo', { name: peerName }) : t('plan.offline'))}</span>
+        ${summary.unresolved ? `<span class="tag tag--warn">${esc(tp('plan.unresolved', summary.unresolved))}</span>` : ''}
+      </div>
+      <div class="actions">
+        <button class="btn btn--primary" data-act="plan-commit" ${canCommit ? '' : 'disabled'}>${icon('sync')}${esc(t('plan.commit'))}</button>
+      </div>
     </section>
+
+    ${notices.length ? `<section class="panel panel--flat"><div class="alert-list">${notices.join('')}</div></section>` : ''}
+
     <section class="panel panel--flat">
-      ${snap.conflicts.length
-        ? `<div class="rows">${rows}</div>
-           <p class="hint">${esc(t('conflicts.hint'))}</p>`
-        : `<div class="empty">${icon('check', 'empty-ic')}<b>${esc(t('conflicts.emptyTitle'))}</b><p>${esc(t('conflicts.emptyText'))}</p></div>`}
-    </section>`;
+      <div class="panel-head">
+        <div class="panel-title">${esc(t('plan.changes'))}</div>
+      </div>
+      ${filters}
+      <div class="plan-groups">${body}</div>
+    </section>
+
+    ${plate}`;
 }
 
 function vaultView(snap) {
@@ -458,6 +702,7 @@ async function initLibrary() {
       state.info.info.device = state.status.device;
       state.info.info.name = state.status.name;
     }
+    await loadPlan();
     toast(t('toast.initDone', { n: num(result.added), word: plural('word.files', result.added) }));
   });
 }
@@ -468,12 +713,16 @@ async function action(name, payload, data) {
       await initLibrary();
       break;
     case 'refresh':
-      await run(t('run.refresh'), async () => { await loadStatus(); });
+      await run(t('run.refresh'), async () => {
+        await loadStatus();
+        await loadPlan();
+      });
       break;
     case 'scan':
       await run(t('run.scan'), async () => {
         const result = await invoke('scan_now');
         state.status = result.status;
+        await loadPlan();
         toast(t('toast.scan', { added: result.added, changed: result.changed, missing: result.missing }));
       });
       break;
@@ -481,6 +730,7 @@ async function action(name, payload, data) {
       await run(t('run.sync'), async () => {
         const result = await invoke('sync_now');
         state.status = result.status;
+        await loadPlan();
         if (result.errors && result.errors.length) {
           toast(t('toast.syncPartial', { error: result.errors[0] }), true);
         } else if (typeof result.accepted === 'number') {
@@ -490,10 +740,27 @@ async function action(name, payload, data) {
         }
       });
       break;
+    case 'plan-refresh':
+      await run(t('run.planRefresh'), async () => {
+        await loadPlan();
+        if (planSummary().stale) toast(t('toast.planStale'), true);
+        else toast(t('toast.planRefreshed'));
+      });
+      break;
+    case 'plan-commit':
+      if (!window.confirm(t('confirm.commit'))) return;
+      await run(t('run.commit'), async () => {
+        const result = await invoke('commit_plan');
+        state.status = result.status;
+        state.plan = result.plan;
+        toast(t('toast.commit', { accepted: result.accepted, rejected: result.rejected }));
+      });
+      break;
     case 'connect':
       await run(t('run.connect'), async () => {
         const result = await invoke('connect_peer', { dev: data && data.dev });
         state.status = result.status;
+        await loadPlan();
         toast(t('toast.connected', { name: result.name || result.dev }));
       });
       break;
@@ -663,6 +930,24 @@ async function copy(text) {
   }
 }
 
+async function applyPlanDecision(action) {
+  const selection = state.planSelection;
+  if (!selection || !selection.paths.size) return;
+  const summary = planSummary();
+  if (!summary.connected || summary.stale) return;
+  const decision = planDecision(selection.group, action);
+  const paths = [...selection.paths];
+  await run(t('run.decision'), async () => {
+    for (const path of paths) {
+      await invoke('set_plan_decision', { path, action: decision });
+    }
+    state.planSelection = null;
+    await loadStatus();
+    await loadPlan();
+    toast(tp('toast.decisionsSaved', paths.length));
+  });
+}
+
 async function resolvePending(path, decision) {
   if (decision === 'delete_everywhere') {
     const ok = window.confirm(t('confirm.delete', { path }));
@@ -695,12 +980,43 @@ async function restorePath(path) {
 
 // ------------------------------------------------------------------ события
 
+document.addEventListener('change', (event) => {
+  const box = event.target.closest('.plan-check');
+  if (!box) return;
+  const groupKey = box.dataset.planGroup;
+  if (!groupKey) return;
+
+  if (box.dataset.planPath) {
+    let selection = state.planSelection;
+    if (!selection || selection.group !== groupKey) {
+      selection = { group: groupKey, paths: new Set() };
+    }
+    if (box.checked) selection.paths.add(box.dataset.planPath);
+    else selection.paths.delete(box.dataset.planPath);
+    state.planSelection = selection.paths.size ? selection : null;
+    render();
+    return;
+  }
+
+  const group = planGroups('all').find((entry) => entry.key === groupKey);
+  if (box.checked && group) {
+    state.planSelection = {
+      group: groupKey,
+      paths: new Set(group.items.map((item) => item.path)),
+    };
+  } else if (state.planSelection && state.planSelection.group === groupKey) {
+    state.planSelection = null;
+  }
+  render();
+});
+
 document.addEventListener('click', (event) => {
   const tab = event.target.closest('.tab');
   if (tab) {
     state.tab = tab.dataset.tab;
     render();
     $('#view').scrollTop = 0;
+    if (state.tab === 'plan') loadPlan().then(render);
     return;
   }
 
@@ -709,6 +1025,44 @@ document.addEventListener('click', (event) => {
     state.tab = jump.dataset.tabJump;
     render();
     $('#view').scrollTop = 0;
+    if (state.tab === 'plan') loadPlan().then(render);
+    return;
+  }
+
+  const planFilter = event.target.closest('[data-plan-filter]');
+  if (planFilter) {
+    state.planFilter = planFilter.dataset.planFilter;
+    const visible = new Set(planGroups(state.planFilter).map((group) => group.key));
+    if (state.planSelection && !visible.has(state.planSelection.group)) {
+      state.planSelection = null;
+    }
+    render();
+    return;
+  }
+
+  const planAll = event.target.closest('[data-plan-all]');
+  if (planAll) {
+    const group = planGroups('all').find((entry) => entry.key === planAll.dataset.planAll);
+    if (group) {
+      state.planSelection = {
+        group: group.key,
+        paths: new Set(group.items.map((item) => item.path)),
+      };
+      render();
+    }
+    return;
+  }
+
+  const planClear = event.target.closest('[data-plan-clear]');
+  if (planClear) {
+    state.planSelection = null;
+    render();
+    return;
+  }
+
+  const planAction = event.target.closest('[data-plan-action]');
+  if (planAction && !planAction.disabled) {
+    applyPlanDecision(planAction.dataset.planAction);
     return;
   }
 
@@ -752,5 +1106,21 @@ window.__syncth = { state, boot, render, loadStatus, action };
 I18N.onChange(() => {
   render();
 });
+
+// Пока приложение открыто, сеанс на другой стороне может менять решения и
+// статус. Опрашиваем нечасто, чтобы не тратить батарею.
+setInterval(async () => {
+  if (!state.status || state.busy || state.polling || document.hidden) return;
+  state.polling = true;
+  try {
+    await loadStatus();
+    if (state.tab === 'plan') await loadPlan();
+    render();
+  } catch {
+    // Молча: следующая попытка через несколько секунд.
+  } finally {
+    state.polling = false;
+  }
+}, 5000);
 
 boot();
