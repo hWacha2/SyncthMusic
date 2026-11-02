@@ -21,14 +21,15 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
+use crate::plan::{self, Decision, DecisionSet, PathDecision, Plan};
 use crate::resolve;
 use crate::scan;
 use crate::store::{EntryRow, Replica};
@@ -37,7 +38,11 @@ const MAX_MSG: usize = 256 * 1024 * 1024;
 const DISCOVERY_PORT: u16 = 47_888;
 /// Порт, на котором телефон и ПК слушают синхронизацию по умолчанию.
 pub const SYNC_PORT: u16 = 47_887;
-const PROTO: u32 = 2;
+/// Версия протокола. `2` отклоняется: там не было предварительного плана.
+pub const PROTO: u32 = 3;
+/// Как часто живая сессия шлёт heartbeat и проверяет локальные решения.
+const SESSION_TICK: Duration = Duration::from_millis(100);
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -72,6 +77,39 @@ enum Msg {
     },
     Ops {
         ops: Vec<Op>,
+    },
+    /// Запрос предварительного плана: операции, которых у пира ещё нет, и
+    /// сохранённые решения. Ничего не применяется.
+    Preview {
+        ops: Vec<Op>,
+        #[serde(default)]
+        decisions: DecisionSet,
+    },
+    PreviewAck {
+        ops: Vec<Op>,
+        #[serde(default)]
+        decisions: DecisionSet,
+        version: Hlc,
+    },
+    /// Push-решение по одному пути. Обе стороны могут слать в любой момент.
+    Decision(PathDecision),
+    /// Сводка набора решений: хэш и версия плана.
+    DecisionState {
+        hash: String,
+        version: Hlc,
+    },
+    Heartbeat,
+    Commit {
+        decisions_hash: String,
+    },
+    CommitAck {
+        accepted: usize,
+        rejected: usize,
+        message: String,
+    },
+    /// Запрос копии блоба из корзины пира.
+    BlobNeed {
+        blob: String,
     },
     Want {
         blobs: Vec<String>,
@@ -137,6 +175,25 @@ fn recv_msg<R: Read>(r: &mut R) -> Result<Msg> {
     let mut body = vec![0u8; n];
     r.read_exact(&mut body)?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+/// Неблокирующее чтение: сначала проверяем буфер, не забирая байты.
+/// Сообщения маленькие и уходят одним `write_all`, поэтому если пришёл хотя бы
+/// первый байт, дочитываем сообщение целиком обычным блокирующим путём.
+fn try_recv_msg(r: &mut BufReader<TcpStream>) -> Result<Option<Msg>> {
+    match r.fill_buf() {
+        Ok(buf) if buf.is_empty() => bail!("пир закрыл сеанс"),
+        Ok(_) => recv_msg(r).map(Some),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ------------------------------------------------------------------ blobs
@@ -579,7 +636,9 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
         },
     )?;
     let peer_have = match recv_msg(&mut r)? {
-        Msg::HelloAck { dev, have, name, .. } => {
+        Msg::HelloAck {
+            dev, have, name, ..
+        } => {
             anyhow::ensure!(
                 dev != replica.device_id(),
                 "подключились к самому себе — проверьте адрес"
@@ -615,7 +674,18 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
 
 /// Серверная сторона: принять одно соединение и обслужить его.
 pub fn serve_stream(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
-    serve_one(stream, replica, token)
+    serve_one(stream, replica, token, &mut |_| {})
+}
+
+/// То же, но с уведомлением о состоянии живой preview-сессии. Callback
+/// вызывается при открытии плана и после каждого шага сессии.
+pub fn serve_stream_with(
+    stream: TcpStream,
+    replica: &mut Replica,
+    token: &str,
+    on_session: &mut dyn FnMut(&PreviewSession),
+) -> Result<SyncStats> {
+    serve_one(stream, replica, token, on_session)
 }
 
 /// Запомнить пира, пришедшего к нам, если его ещё нет. Порт берём обычный
@@ -637,7 +707,12 @@ fn check_hello(token: &str, got: &str, proto: u32, dev: &str, me: &str) -> Resul
     Ok(())
 }
 
-fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
+fn serve_one(
+    stream: TcpStream,
+    replica: &mut Replica,
+    token: &str,
+    on_session: &mut dyn FnMut(&PreviewSession),
+) -> Result<SyncStats> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
@@ -647,7 +722,7 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
     let mut r = BufReader::new(stream);
     let mut stats = SyncStats::default();
 
-    let peer_have = match recv_msg(&mut r)? {
+    let (peer_have, peer_dev, peer_name) = match recv_msg(&mut r)? {
         Msg::PairHello {
             token: got,
             proto,
@@ -690,7 +765,7 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
                 return Err(e);
             }
             remember_peer(replica, &dev, &name, peer_ip.as_deref())?;
-            have
+            (have, dev, name)
         }
         other => bail!("ожидали hello, получили {other:?}"),
     };
@@ -706,22 +781,344 @@ fn serve_one(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<Sy
 
     let root = replica.root()?.context("корень библиотеки не задан")?;
 
-    // 1. Принимаем операции клиента.
-    match recv_msg(&mut r)? {
-        Msg::Ops { ops } => absorb_ops(replica, &root, &ops, &mut stats)?,
-        other => bail!("ожидали операции, получили {other:?}"),
+    let next = recv_msg(&mut r)?;
+    match next {
+        // Новый режим: сначала манифест и план, ничего не применяем.
+        Msg::Preview { ops, decisions } => {
+            let server = PreviewSession::accept(
+                r, w, replica, &peer_dev, &peer_name, &ops, decisions, &peer_have,
+            )?;
+            on_session(&server);
+            server.run_with(replica, on_session)
+        }
+        // Старый полный обмен оставлен до этапа commit: он ещё используется
+        // кнопкой «Синхронизировать» и тестами.
+        Msg::Ops { ops } => {
+            // 1. Принимаем операции клиента.
+            absorb_ops(replica, &root, &ops, &mut stats)?;
+            // 2. Отдаём свои — только то, чего у клиента ещё нет.
+            let ops = replica.ops_since(&peer_have)?;
+            stats.sent_remote_ops += ops.len();
+            send_msg(&mut w, &Msg::Ops { ops })?;
+
+            // 3. Просим своё, 4. отдаём чужое.
+            request_wants(&mut r, &mut w, replica, &root, &mut stats)?;
+            serve_wants(&mut r, &mut w, replica, &root, &mut stats)?;
+
+            replica.confirm_synced()?;
+            Ok(stats)
+        }
+        other => bail!("ожидали операции или preview, получили {other:?}"),
     }
-    // 2. Отдаём свои — только то, чего у клиента ещё нет.
-    let ops = replica.ops_since(&peer_have)?;
-    stats.sent_remote_ops += ops.len();
-    send_msg(&mut w, &Msg::Ops { ops })?;
+}
 
-    // 3. Просим своё, 4. отдаём чужое.
-    request_wants(&mut r, &mut w, replica, &root, &mut stats)?;
-    serve_wants(&mut r, &mut w, replica, &root, &mut stats)?;
+// ------------------------------------------------------------- live session
 
-    replica.confirm_synced()?;
-    Ok(stats)
+/// Живая preview-сессия: обе стороны видят один план и обмениваются решениями,
+/// пока не будет commit. Никакие операции здесь не применяются.
+pub struct PreviewSession {
+    pub peer_dev: String,
+    pub peer_name: String,
+    pub plan: Plan,
+    pub read_only: bool,
+    /// Наборы решений разошлись: хэш пира не совпал с нашим.
+    pub diverged: bool,
+    w: BufWriter<TcpStream>,
+    r: BufReader<TcpStream>,
+    /// Решения, о которых пир уже знает. Нужны, чтобы не слать их повторно.
+    announced: HashMap<String, PathDecision>,
+    last_heartbeat: Instant,
+}
+
+impl PreviewSession {
+    /// Клиентская сторона: рукопожатие, обмен манифестами и первый план.
+    pub fn open(replica: &mut Replica, addr: &str, token: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).with_context(|| format!("подключение к {addr}"))?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let mut w = BufWriter::new(stream.try_clone()?);
+        let mut r = BufReader::new(stream);
+
+        let me = replica.device_id().to_string();
+        send_msg(
+            &mut w,
+            &Msg::Hello {
+                dev: me,
+                name: replica.device_name().to_string(),
+                token: token.to_string(),
+                proto: PROTO,
+                have: replica.watermarks()?,
+            },
+        )?;
+        let (peer_dev, peer_name, peer_have) = match recv_msg(&mut r)? {
+            Msg::HelloAck {
+                dev, have, name, ..
+            } => {
+                anyhow::ensure!(dev != replica.device_id(), "подключились к самому себе");
+                replica.add_peer(&dev, addr, &name)?;
+                (dev, name, have)
+            }
+            Msg::Error { message } => bail!("пир отказал: {message}"),
+            other => bail!("неожиданный ответ: {other:?}"),
+        };
+
+        // Свой манифест и сохранённые решения — пиру. Он ответит тем же.
+        let local_ops = replica.ops_since(&peer_have)?;
+        let local_decisions = replica.load_decisions(&peer_dev)?;
+        send_msg(
+            &mut w,
+            &Msg::Preview {
+                ops: local_ops,
+                decisions: local_decisions.clone(),
+            },
+        )?;
+        let (remote_ops, peer_decisions, version) = match recv_msg(&mut r)? {
+            Msg::PreviewAck {
+                ops,
+                decisions,
+                version,
+            } => (ops, decisions, version),
+            Msg::Error { message } => bail!("пир отказал в плане: {message}"),
+            other => bail!("ожидали preview_ack, получили {other:?}"),
+        };
+
+        let mut merged = local_decisions;
+        merged.merge(&peer_decisions);
+        let mut plan = plan::build(replica, &peer_dev, &peer_name, &remote_ops)?;
+        if version > plan.version {
+            plan.version = version;
+        }
+        merged.retain_valid(&plan);
+        plan.decisions = merged.clone();
+        replica.save_plan(&plan)?;
+        replica.save_decisions(&peer_dev, &merged)?;
+
+        // Таймаут ставим на читающий сокет: на Windows `try_clone` создаёт
+        // отдельный handle, и опция, выставленная через писателя, не видна.
+        r.get_ref().set_read_timeout(Some(SESSION_TICK))?;
+        Ok(Self::new(peer_dev, peer_name, plan, merged, w, r))
+    }
+
+    /// Серверная сторона: клиент уже прислал манифест и решения.
+    fn accept(
+        r: BufReader<TcpStream>,
+        w: BufWriter<TcpStream>,
+        replica: &mut Replica,
+        peer_dev: &str,
+        peer_name: &str,
+        remote_ops: &[Op],
+        peer_decisions: DecisionSet,
+        peer_have: &HashMap<String, (i64, i64)>,
+    ) -> Result<Self> {
+        let mut merged = replica.load_decisions(peer_dev)?;
+        merged.merge(&peer_decisions);
+        let mut plan = plan::build(replica, peer_dev, peer_name, remote_ops)?;
+        merged.retain_valid(&plan);
+        plan.decisions = merged.clone();
+
+        let local_ops = replica.ops_since(peer_have)?;
+        let ack = Msg::PreviewAck {
+            ops: local_ops,
+            decisions: merged.clone(),
+            version: plan.version,
+        };
+        replica.save_plan(&plan)?;
+        replica.save_decisions(peer_dev, &merged)?;
+
+        r.get_ref().set_read_timeout(Some(SESSION_TICK))?;
+        let mut session = Self::new(
+            peer_dev.to_string(),
+            peer_name.to_string(),
+            plan,
+            merged,
+            w,
+            r,
+        );
+        session.send(&ack)?;
+        Ok(session)
+    }
+
+    fn new(
+        peer_dev: String,
+        peer_name: String,
+        plan: Plan,
+        merged: DecisionSet,
+        w: BufWriter<TcpStream>,
+        r: BufReader<TcpStream>,
+    ) -> Self {
+        let announced = merged
+            .entries
+            .iter()
+            .map(|(path, decision)| (path.clone(), decision.clone()))
+            .collect();
+        Self {
+            peer_dev,
+            peer_name,
+            plan,
+            read_only: false,
+            diverged: false,
+            w,
+            r,
+            announced,
+            last_heartbeat: Instant::now(),
+        }
+    }
+
+    pub fn paths(&self) -> usize {
+        self.plan.path_count()
+    }
+
+    pub fn unresolved(&self) -> usize {
+        self.plan.unresolved().len()
+    }
+
+    pub fn decisions_hash(&self) -> String {
+        self.plan.decisions_hash()
+    }
+
+    /// Записать решение в БД. Отправка пиру произойдёт на ближайшем `poll`.
+    pub fn record_decision(
+        &mut self,
+        replica: &mut Replica,
+        path: &str,
+        action: Decision,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only,
+            "передача уже началась — решения заморожены"
+        );
+        let blob = self
+            .plan
+            .blob_for(path)
+            .with_context(|| format!("путь отсутствует в плане: {path}"))?;
+        let hlc = replica.next_hlc()?;
+        let decision = PathDecision {
+            path: path.to_string(),
+            action,
+            blob,
+            hlc,
+            dev: replica.device_id().to_string(),
+        };
+        let mut set = replica.load_decisions(&self.peer_dev)?;
+        set.entries.insert(path.to_string(), decision);
+        set.retain_valid(&self.plan);
+        replica.save_decisions(&self.peer_dev, &set)?;
+        self.plan.decisions = set;
+        replica.save_plan(&self.plan)?;
+        Ok(())
+    }
+
+    /// Один шаг живой сессии: отправить новые локальные решения, принять
+    /// входящие, сравнить сводки, при необходимости послать heartbeat.
+    pub fn poll(&mut self, replica: &mut Replica) -> Result<()> {
+        self.pump_local(replica)?;
+
+        match try_recv_msg(&mut self.r)? {
+            None => {}
+            Some(Msg::Decision(decision)) => {
+                let mut one = DecisionSet::default();
+                one.entries.insert(decision.path.clone(), decision.clone());
+                let (merged, _) = replica.merge_decisions(&self.peer_dev, &one)?;
+                let mut merged = merged;
+                merged.retain_valid(&self.plan);
+                self.plan.decisions = merged;
+                self.announced.insert(decision.path.clone(), decision);
+                replica.save_plan(&self.plan)?;
+                let hash = self.plan.decisions_hash();
+                self.send(&Msg::DecisionState {
+                    hash,
+                    version: self.plan.version,
+                })?;
+            }
+            Some(Msg::DecisionState { hash, .. }) => {
+                self.diverged = hash != self.plan.decisions_hash();
+            }
+            Some(Msg::Heartbeat) => {}
+            Some(Msg::Commit { .. }) => {
+                // Этап 4: здесь будет применение выбранного. Пока честно
+                // отказываем, чтобы старая кнопка не притворялась commit.
+                self.send(&Msg::CommitAck {
+                    accepted: 0,
+                    rejected: 0,
+                    message: "commit появится на следующем этапе".into(),
+                })?;
+            }
+            Some(Msg::BlobNeed { .. }) => {
+                self.send(&Msg::Error {
+                    message: "обмен блобами в сессии ещё не включён".into(),
+                })?;
+            }
+            Some(Msg::Error { message }) => bail!("пир вернул ошибку: {message}"),
+            Some(other) => bail!("неожиданное сообщение в сессии: {other:?}"),
+        }
+
+        if self.last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
+            self.last_heartbeat = Instant::now();
+            self.send(&Msg::Heartbeat)?;
+        }
+        Ok(())
+    }
+
+    /// Отправить решения, которые появились в БД после прошлого шага.
+    fn pump_local(&mut self, replica: &mut Replica) -> Result<()> {
+        let set = replica.load_decisions(&self.peer_dev)?;
+        let mut outgoing = Vec::new();
+        for (path, decision) in &set.entries {
+            if self.announced.get(path) == Some(decision) {
+                continue;
+            }
+            if self.plan.blob_for(path).as_deref() != Some(decision.blob.as_str()) {
+                continue;
+            }
+            outgoing.push(decision.clone());
+        }
+        if outgoing.is_empty() {
+            return Ok(());
+        }
+
+        let mut merged = self.plan.decisions.clone();
+        for decision in &outgoing {
+            merged
+                .entries
+                .insert(decision.path.clone(), decision.clone());
+            self.announced
+                .insert(decision.path.clone(), decision.clone());
+        }
+        merged.retain_valid(&self.plan);
+        self.plan.decisions = merged;
+        replica.save_plan(&self.plan)?;
+
+        for decision in outgoing {
+            self.send(&Msg::Decision(decision))?;
+        }
+        let hash = self.plan.decisions_hash();
+        self.send(&Msg::DecisionState {
+            hash,
+            version: self.plan.version,
+        })?;
+        Ok(())
+    }
+
+    fn send(&mut self, msg: &Msg) -> Result<()> {
+        send_msg(&mut self.w, msg)
+    }
+
+    /// Серверный цикл: живёт, пока пир не закроет соединение.
+    fn run_with(
+        mut self,
+        replica: &mut Replica,
+        on_session: &mut dyn FnMut(&PreviewSession),
+    ) -> Result<SyncStats> {
+        loop {
+            self.poll(replica)?;
+            on_session(&self);
+        }
+    }
+
+    pub fn close(&mut self) {
+        let _ = self.w.get_ref().shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// Блокирующий сервер: принимает соединения одно за другим.
@@ -741,7 +1138,7 @@ pub fn serve(
         match stream {
             Ok(s) => {
                 let peer = s.peer_addr().ok();
-                match serve_one(s, replica, token) {
+                match serve_one(s, replica, token, &mut |_| {}) {
                     Ok(stats) => {
                         println!("сеанс {peer:?}: {}", stats.summary());
                         on_connection(&stats);
@@ -777,7 +1174,7 @@ pub fn spawn_one(replica: Replica, bind: &str, token: String) -> Result<ServerHa
     let join = std::thread::spawn(move || {
         let mut replica = replica;
         let (stream, _) = listener.accept()?;
-        serve_one(stream, &mut replica, &token)
+        serve_one(stream, &mut replica, &token, &mut |_| {})
     });
     Ok(ServerHandle { addr, join })
 }
@@ -1026,7 +1423,12 @@ mod tests {
     #[test]
     fn pair_code_roundtrip() {
         let token = "a".repeat(64);
-        let code = pair_code("dev-1234abcd", "DESKTOP-ABC123", &token, "192.168.1.5:47887");
+        let code = pair_code(
+            "dev-1234abcd",
+            "DESKTOP-ABC123",
+            &token,
+            "192.168.1.5:47887",
+        );
         let info = parse_pair_code(&code).unwrap();
         assert_eq!(info.dev, "dev-1234abcd");
         assert_eq!(info.name, "DESKTOP-ABC123");

@@ -1,4 +1,4 @@
-﻿//! LAN-транспорт: реальные сокеты, реальные байты, без моков.
+//! LAN-транспорт: реальные сокеты, реальные байты, без моков.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,135 @@ fn session(ctx: &Ctx) -> net::SyncStats {
 
 fn state(data: &Path) -> String {
     Replica::open(data, "probe").unwrap().state_hash().unwrap()
+}
+
+#[test]
+fn preview_builds_plan_without_applying_ops_and_shares_decisions() {
+    use syncth_core::plan::Decision;
+
+    let ctx = setup();
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    assert!(session.paths() >= 2, "план должен содержать оба трека");
+    assert_eq!(
+        b.live_entries().unwrap().len(),
+        0,
+        "preview не применяет операции"
+    );
+
+    let path = session
+        .plan
+        .remote
+        .first()
+        .expect("у пира есть добавленные пути")
+        .path
+        .clone();
+    session
+        .record_decision(&mut b, &path, Decision::Accept)
+        .unwrap();
+    session.poll(&mut b).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.close();
+    drop(session);
+    let _ = handle.finish();
+
+    // Решение доехало до сервера, но операции так и не применились.
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let plan = a
+        .load_plan("dev-b", syncth_core::Hlc::wall_ms())
+        .unwrap()
+        .expect("план сохранён на сервере");
+    assert_eq!(
+        plan.decisions.get(&path).map(|d| d.action),
+        Some(Decision::Accept)
+    );
+    assert_eq!(
+        b.live_entries().unwrap().len(),
+        0,
+        "решение не должно применяться до commit"
+    );
+}
+
+#[test]
+fn server_side_db_decisions_reach_the_live_channel() {
+    use syncth_core::plan::{Decision, PathDecision};
+
+    let ctx = setup();
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    let path = session.plan.remote[0].path.clone();
+
+    // Как будто решение пришло из UI сервера в его отдельном соединении.
+    let mut admin = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut plan = admin
+        .load_plan("dev-b", syncth_core::Hlc::wall_ms())
+        .unwrap()
+        .unwrap();
+    let blob = plan.blob_for(&path).unwrap();
+    let hlc = admin.next_hlc().unwrap();
+    let mut set = admin.load_decisions("dev-b").unwrap();
+    set.entries.insert(
+        path.clone(),
+        PathDecision {
+            path: path.clone(),
+            action: Decision::Accept,
+            blob,
+            hlc,
+            dev: "dev-a".into(),
+        },
+    );
+    set.retain_valid(&plan);
+    admin.save_decisions("dev-b", &set).unwrap();
+    plan.decisions = set;
+    admin.save_plan(&plan).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while session.plan.decisions.get(&path).is_none() && std::time::Instant::now() < deadline {
+        session.poll(&mut b).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        session.plan.decisions.get(&path).is_some(),
+        "решение из БД сервера должно приехать по живому каналу"
+    );
+    session.close();
+    drop(session);
+    let _ = handle.finish();
+}
+
+#[test]
+fn old_protocol_is_rejected() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let ctx = setup();
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+
+    let mut stream = TcpStream::connect(&handle.addr).unwrap();
+    let body = format!(
+        r#"{{"t":"hello","dev":"old","token":"{}","proto":2,"have":{{}}}}"#,
+        ctx.token
+    )
+    .into_bytes();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&body).unwrap();
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).unwrap();
+    let mut reply = vec![0u8; u32::from_be_bytes(len) as usize];
+    stream.read_exact(&mut reply).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(value["t"], "error");
+    assert!(value["message"].as_str().unwrap().contains("версия"));
+    drop(stream);
+    let _ = handle.finish();
 }
 
 #[test]

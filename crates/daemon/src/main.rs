@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::Watcher;
+use syncth_core::plan::{Decision, PathDecision};
 use syncth_core::{net, resolve, scan, vault, Action, Hlc, Replica};
 
 mod tray;
@@ -124,15 +125,50 @@ struct PeerStatus {
 
 /// Логическая сессия с выбранным устройством.
 ///
-/// На этапе 1 это проверенное рукопожатие: сокет живёт только на время
-/// проверки. Живой двусторонний канал с решениями появится в этапе 3;
-/// состояние «подключено» уже сейчас блокирует синхронизацию без подключения.
+/// С этапа 3 сокет живёт всё время сессии: стороны обмениваются манифестом,
+/// планом и push-решениями. Состояние «подключено» разрешает синхронизацию.
 #[derive(Debug, Clone, Default, Serialize)]
 struct ActivePeer {
     dev: String,
     name: String,
     addr: String,
     since: u64,
+}
+
+/// Сводка живого плана для статуса. Сам план читается из БД через `/api/plan`.
+#[derive(Debug, Clone, Default, Serialize)]
+struct SessionStatus {
+    peer_dev: String,
+    peer_name: String,
+    addr: String,
+    since: u64,
+    paths: usize,
+    unresolved: usize,
+    decisions_hash: String,
+    diverged: bool,
+    read_only: bool,
+    /// `outgoing` — мы подключились, `incoming` — подключились к нам.
+    source: String,
+}
+
+fn session_snapshot(
+    session: &net::PreviewSession,
+    addr: String,
+    since: u64,
+    source: &str,
+) -> SessionStatus {
+    SessionStatus {
+        peer_dev: session.peer_dev.clone(),
+        peer_name: session.peer_name.clone(),
+        addr,
+        since,
+        paths: session.paths(),
+        unresolved: session.unresolved(),
+        decisions_hash: session.decisions_hash(),
+        diverged: session.diverged,
+        read_only: session.read_only,
+        source: source.to_string(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +185,7 @@ struct Runtime {
     disk_threshold: f64,
     peers: BTreeMap<String, PeerStatus>,
     active_peer: Option<ActivePeer>,
+    session: Option<SessionStatus>,
 }
 
 type Shared = Arc<Mutex<Runtime>>;
@@ -177,6 +214,12 @@ enum Cmd {
         dev: String,
         reply: Reply,
     },
+    SetDecision {
+        path: String,
+        action: Decision,
+        reply: Reply,
+    },
+    RefreshPlan(Reply),
     Resolve {
         path: String,
         action: Action,
@@ -304,13 +347,6 @@ fn run() -> Result<()> {
         let runtime = runtime.clone();
         let disk = disk.clone();
         std::thread::spawn(move || {
-            let mut replica = match Replica::open(&data_dir, &dev) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("сервер синхронизации не стартовал: {e:#}");
-                    return;
-                }
-            };
             while let Ok(stream) = stream_rx.recv() {
                 if refresh_disk(&runtime, &disk) {
                     let _ = net::reject_stream(
@@ -319,18 +355,89 @@ fn run() -> Result<()> {
                     );
                     continue;
                 }
-                let token = match replica.ensure_token() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!("токен: {e:#}");
-                        continue;
+                // Соединение обслуживается своим потоком и своим SQLite-
+                // соединением: живая preview-сессия может висеть долго и не
+                // должна блокировать встречные подключения.
+                let data_dir = data_dir.clone();
+                let dev = dev.clone();
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    let mut replica = match Replica::open(&data_dir, &dev) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("входящий сеанс: {e:#}");
+                            return;
+                        }
+                    };
+                    let token = match replica.ensure_token() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("токен: {e:#}");
+                            return;
+                        }
+                    };
+                    let peer_addr = stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    let since = Hlc::wall_ms();
+                    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                    let seen_in_cb = seen.clone();
+                    let runtime_in_cb = runtime.clone();
+                    let result =
+                        net::serve_stream_with(stream, &mut replica, &token, &mut |session| {
+                            *seen_in_cb.lock().unwrap() = Some(session.peer_dev.clone());
+                            let snapshot =
+                                session_snapshot(session, peer_addr.clone(), since, "incoming");
+                            let mut rt = runtime_in_cb.lock().unwrap();
+                            rt.peers.insert(
+                                snapshot.peer_dev.clone(),
+                                PeerStatus {
+                                    name: snapshot.peer_name.clone(),
+                                    addr: snapshot.addr.clone(),
+                                    last_seen: Some(Hlc::wall_ms()),
+                                    error: None,
+                                },
+                            );
+                            rt.active_peer = Some(ActivePeer {
+                                dev: snapshot.peer_dev.clone(),
+                                name: snapshot.peer_name.clone(),
+                                addr: snapshot.addr.clone(),
+                                since,
+                            });
+                            rt.session = Some(snapshot);
+                        });
+                    let peer = seen.lock().unwrap().clone();
+                    match result {
+                        Ok(stats) => {
+                            let mut rt = runtime.lock().unwrap();
+                            rt.last_sync = Some(Hlc::wall_ms());
+                            if !rt.disk_low {
+                                rt.last_error = None;
+                            }
+                            tracing::info!("входящий сеанс: {}", stats.summary());
+                        }
+                        Err(e) => {
+                            let message = format!("{e:#}");
+                            if !is_unreachable(&e) && !message.contains("закрыл сеанс") {
+                                runtime
+                                    .lock()
+                                    .unwrap()
+                                    .error(format!("входящий сеанс: {message}"));
+                            }
+                        }
                     }
-                };
-                runtime.lock().unwrap().syncing = true;
-                finish_sync(
-                    &runtime,
-                    net::serve_stream(stream, &mut replica, &token).map(|s| s.summary()),
-                );
+                    // Сессия закончилась: не оставляем «подключено» висеть.
+                    if let Some(peer) = peer {
+                        let mut rt = runtime.lock().unwrap();
+                        let same = rt.active_peer.as_ref().is_some_and(|p| p.dev == peer);
+                        let incoming = rt.session.as_ref().is_some_and(|s| s.source == "incoming");
+                        if same && incoming {
+                            rt.active_peer = None;
+                            rt.session = None;
+                        }
+                    }
+                });
             }
         });
     }
@@ -385,6 +492,7 @@ fn worker(
     runtime: Shared,
 ) {
     let root = cfg.root.clone();
+    let mut session: Option<net::PreviewSession> = None;
     let mut pending_scan = false;
     let mut scan_at = Instant::now();
     let mut next_sync = Instant::now() + cfg.sync_interval;
@@ -412,19 +520,78 @@ fn worker(
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Connect { dev, reply }) => {
-                let res = do_connect(&mut replica, &runtime, &dev);
+                let res = do_connect(&mut replica, &runtime, &dev, &mut session);
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Disconnect(reply)) => {
-                runtime.lock().unwrap().active_peer = None;
+                if let Some(mut old) = session.take() {
+                    old.close();
+                }
+                let mut rt = runtime.lock().unwrap();
+                rt.active_peer = None;
+                rt.session = None;
+                drop(rt);
                 let _ = reply.send(Ok("Соединение закрыто".into()));
             }
+            Ok(Cmd::SetDecision {
+                path,
+                action,
+                reply,
+            }) => {
+                let res = match session.as_mut() {
+                    Some(s) => s.record_decision(&mut replica, &path, action),
+                    // Входящая сессия живёт в своём потоке: решение пишем в БД,
+                    // оттуда его заберёт и отправит живой канал.
+                    None => (|| -> Result<()> {
+                        let dev = runtime
+                            .lock()
+                            .unwrap()
+                            .active_peer
+                            .as_ref()
+                            .map(|p| p.dev.clone())
+                            .context("Нет соединения: сначала подключитесь к устройству")?;
+                        save_decision(&mut replica, &dev, &path, action)
+                    })(),
+                };
+                respond(
+                    reply,
+                    res.map(|_| format!("Решение по «{path}» сохранено")),
+                    &runtime,
+                );
+            }
+            Ok(Cmd::RefreshPlan(reply)) => {
+                let dev = runtime
+                    .lock()
+                    .unwrap()
+                    .active_peer
+                    .as_ref()
+                    .map(|p| p.dev.clone());
+                let res = match dev {
+                    Some(dev) => do_connect(&mut replica, &runtime, &dev, &mut session),
+                    None => Err(anyhow::anyhow!(
+                        "Нет соединения: сначала подключитесь к устройству"
+                    )),
+                };
+                respond(reply, res.map(|_| "План обновлён".to_string()), &runtime);
+            }
             Ok(Cmd::ForgetPeer { dev, reply }) => {
+                let was_active = runtime
+                    .lock()
+                    .unwrap()
+                    .active_peer
+                    .as_ref()
+                    .is_some_and(|p| p.dev == dev);
+                if was_active {
+                    if let Some(mut old) = session.take() {
+                        old.close();
+                    }
+                }
                 let res = (|| -> Result<String> {
                     let removed = replica.remove_peer(&dev)?;
                     let mut rt = runtime.lock().unwrap();
-                    if rt.active_peer.as_ref().is_some_and(|p| p.dev == dev) {
+                    if was_active {
                         rt.active_peer = None;
+                        rt.session = None;
                     }
                     rt.peers.remove(&dev);
                     if removed {
@@ -538,6 +705,36 @@ fn worker(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // Живая сессия: отправляем новые решения и принимаем входящие.
+        if let Some(active) = session.as_mut() {
+            match active.poll(&mut replica) {
+                Ok(()) => {
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(info) = rt.session.as_mut() {
+                        info.paths = active.paths();
+                        info.unresolved = active.unresolved();
+                        info.decisions_hash = active.decisions_hash();
+                        info.diverged = active.diverged;
+                        info.read_only = active.read_only;
+                    }
+                }
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    active.close();
+                    session = None;
+                    let mut rt = runtime.lock().unwrap();
+                    rt.session = None;
+                    rt.active_peer = None;
+                    if is_unreachable(&e) || message.contains("закрыл сеанс") {
+                        tracing::info!("сеанс завершён: {message}");
+                        rt.last_error = None;
+                    } else {
+                        rt.error(format!("Сеанс прерван: {message}"));
+                    }
+                }
+            }
         }
 
         // Входящие сеансы обслуживает отдельный поток (см. `run`), чтобы
@@ -675,10 +872,17 @@ fn is_unreachable(error: &anyhow::Error) -> bool {
 
 /// «Подключиться» к сохранённому устройству.
 ///
-/// Проверяет рукопожатием, что пир отвечает, обновляет его адрес (DHCP) и
-/// запоминает активную сессию. Полный обмен манифестами появится на этапе
-/// плана; сейчас важно, что без этого состояния синхронизация запрещена.
-fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<String> {
+/// Открывает живую preview-сессию: рукопожатие, обмен манифестами и планом.
+/// Сокет остаётся открытым до «Отключиться»; по нему идут решения и heartbeat.
+fn do_connect(
+    replica: &mut Replica,
+    runtime: &Shared,
+    dev: &str,
+    session: &mut Option<net::PreviewSession>,
+) -> Result<String> {
+    if let Some(mut old) = session.take() {
+        old.close();
+    }
     let peer = replica
         .known_peers()?
         .into_iter()
@@ -687,8 +891,8 @@ fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<Stri
     let token = replica.ensure_token()?;
     let mut addr = peer.addr.clone();
 
-    let hello = match net::probe_peer(replica, &addr, &token) {
-        Ok(hello) => hello,
+    let opened = match net::PreviewSession::open(replica, &addr, &token) {
+        Ok(session) => session,
         Err(first) => {
             // Адрес мог смениться по DHCP: пробуем найти пира в локальной сети.
             let found = net::discover(Duration::from_secs(2))
@@ -698,7 +902,7 @@ fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<Stri
             match found {
                 Some((_, new_addr)) => {
                     addr = new_addr;
-                    net::probe_peer(replica, &addr, &token)
+                    net::PreviewSession::open(replica, &addr, &token)
                         .with_context(|| format!("первая попытка: {first:#}"))?
                 }
                 None => return Err(first),
@@ -706,20 +910,21 @@ fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<Stri
         }
     };
 
-    let name = if hello.name.is_empty() {
+    let name = if opened.peer_name.is_empty() {
         peer.name
     } else {
-        hello.name
+        opened.peer_name.clone()
     };
     let label = if name.is_empty() {
-        hello.dev.clone()
+        opened.peer_dev.clone()
     } else {
         name.clone()
     };
     let now = Hlc::wall_ms();
+    let status = session_snapshot(&opened, addr.clone(), now, "outgoing");
     let mut rt = runtime.lock().unwrap();
     rt.peers.insert(
-        hello.dev.clone(),
+        opened.peer_dev.clone(),
         PeerStatus {
             name: name.clone(),
             addr: addr.clone(),
@@ -728,13 +933,46 @@ fn do_connect(replica: &mut Replica, runtime: &Shared, dev: &str) -> Result<Stri
         },
     );
     rt.active_peer = Some(ActivePeer {
-        dev: hello.dev,
+        dev: opened.peer_dev.clone(),
         name,
         addr: addr.clone(),
         since: now,
     });
+    rt.session = Some(status);
     rt.last_error = None;
+    *session = Some(opened);
     Ok(format!("Подключено: {label} ({addr})"))
+}
+
+/// Записать решение без живого канала в этом потоке. Так работают входящие
+/// сессии и будущий офлайн-план: канал заберёт решение из БД.
+fn save_decision(
+    replica: &mut Replica,
+    peer_dev: &str,
+    path: &str,
+    action: Decision,
+) -> Result<()> {
+    let mut plan = replica
+        .load_plan(peer_dev, Hlc::wall_ms())?
+        .context("план не найден или истёк")?;
+    let blob = plan
+        .blob_for(path)
+        .with_context(|| format!("путь отсутствует в плане: {path}"))?;
+    let hlc = replica.next_hlc()?;
+    let decision = PathDecision {
+        path: path.to_string(),
+        action,
+        blob,
+        hlc,
+        dev: replica.device_id().to_string(),
+    };
+    let mut set = replica.load_decisions(peer_dev)?;
+    set.entries.insert(path.to_string(), decision);
+    set.retain_valid(&plan);
+    replica.save_decisions(peer_dev, &set)?;
+    plan.decisions = set;
+    replica.save_plan(&plan)?;
+    Ok(())
 }
 
 fn do_sync(
@@ -886,21 +1124,6 @@ fn do_sync(
     Ok(msg)
 }
 
-fn finish_sync(runtime: &Shared, result: Result<String>) {
-    let mut rt = runtime.lock().unwrap();
-    rt.syncing = false;
-    match result {
-        Ok(summary) => {
-            rt.last_sync = Some(Hlc::wall_ms());
-            if !rt.disk_low {
-                rt.last_error = None;
-            }
-            tracing::info!("входящий сеанс: {summary}");
-        }
-        Err(e) => rt.error(format!("входящий сеанс: {e:#}")),
-    }
-}
-
 // ------------------------------------------------------------------ disk guard
 
 #[derive(Debug, Clone)]
@@ -1032,6 +1255,11 @@ fn handle_request(mut request: tiny_http::Request, ctx: &UiCtx) {
             "application/json; charset=utf-8",
             api_pair_code(ctx).to_string(),
         ),
+        (tiny_http::Method::Get, "/api/plan") => (
+            200,
+            "application/json; charset=utf-8",
+            api_plan(ctx).to_string(),
+        ),
         (tiny_http::Method::Post, p) => match api_action(ctx, p, &mut request) {
             Ok(msg) => (
                 200,
@@ -1072,7 +1300,7 @@ fn str_field(v: &Value, key: &str) -> Result<String, String> {
 }
 
 fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Result<String, String> {
-    let body = if path == "/api/pause" {
+    let body = if matches!(path, "/api/pause" | "/api/decision") {
         body_json(request)
     } else {
         Value::Null
@@ -1081,6 +1309,21 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
     match path {
         "/api/scan" => run_cmd(&ctx.commands, Cmd::Scan),
         "/api/sync" => run_cmd(&ctx.commands, Cmd::Sync),
+        "/api/plan/refresh" => run_cmd(&ctx.commands, Cmd::RefreshPlan),
+        "/api/decision" => {
+            let path = str_field(&body, "path")?;
+            let action = match body.get("action").and_then(Value::as_str) {
+                Some(raw) => {
+                    Decision::parse(raw).ok_or_else(|| format!("неизвестное решение: {raw}"))?
+                }
+                None => return Err("в запросе нет поля «action»".into()),
+            };
+            run_cmd(&ctx.commands, move |reply| Cmd::SetDecision {
+                path,
+                action,
+                reply,
+            })
+        }
         "/api/connect" => {
             let body = body_json(request);
             let dev = str_field(&body, "dev")?;
@@ -1156,6 +1399,31 @@ fn run_cmd(tx: &Sender<Cmd>, make: impl FnOnce(Reply) -> Cmd) -> Result<String, 
         .map_err(|_| "Служба остановлена".to_string())?;
     rx.recv_timeout(Duration::from_secs(180))
         .map_err(|_| "Операция не завершилась за 3 минуты".to_string())?
+}
+
+fn api_plan(ctx: &UiCtx) -> Value {
+    let dev = ctx
+        .runtime
+        .lock()
+        .unwrap()
+        .active_peer
+        .as_ref()
+        .map(|p| p.dev.clone());
+    let Some(dev) = dev else {
+        return json!({ "connected": false, "plan": Value::Null });
+    };
+    let r = ctx.read.lock().unwrap();
+    match r.load_plan(&dev, Hlc::wall_ms()) {
+        Ok(Some(plan)) => json!({
+            "connected": true,
+            "plan": plan,
+            "hash": plan.decisions_hash(),
+            "unresolved": plan.unresolved().len(),
+            "paths": plan.path_count(),
+        }),
+        Ok(None) => json!({ "connected": true, "plan": Value::Null }),
+        Err(e) => json!({ "connected": true, "plan": Value::Null, "error": format!("{e:#}") }),
+    }
 }
 
 fn api_status(ctx: &UiCtx) -> Value {
@@ -1251,6 +1519,7 @@ fn api_status(ctx: &UiCtx) -> Value {
         "vault": vault,
         "peers": peers,
         "connection": connection,
+        "session": rt.session,
         "known_peers": known_peers,
         "pair_addr": ctx.sync_addr,
     })
