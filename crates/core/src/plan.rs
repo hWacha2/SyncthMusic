@@ -104,13 +104,17 @@ pub enum Decision {
     /// Принять изменение: добавление, правку, перенос или версию пира
     /// в конфликте.
     Accept,
-    /// Оставить как есть. Для удаления это «Остаётся».
+    /// Отменить локальное изменение и вернуть версию со второго устройства.
+    /// Для добавления/удаления не используется.
+    Revert,
+    /// Оставить как есть. Для удаления это «Остаётся» — решение по умолчанию,
+    /// которое не применяет удаление и не фиксирует расхождение навсегда.
     Keep,
     /// Удалить путь во всей библиотеке.
     DeleteEverywhere,
     /// Отклонить удаление и вернуть файл: новый `EntryPut`.
     KeepInLibrary,
-    /// Оставить файл только на этом устройстве.
+    /// Оставить файл только на одной стороне (`local_ignored` на другой).
     OnlyHere,
     /// Сохранить обе версии конфликта.
     KeepBoth,
@@ -120,6 +124,7 @@ impl Decision {
     pub fn as_str(self) -> &'static str {
         match self {
             Decision::Accept => "accept",
+            Decision::Revert => "revert",
             Decision::Keep => "keep",
             Decision::DeleteEverywhere => "delete_everywhere",
             Decision::KeepInLibrary => "keep_in_library",
@@ -131,6 +136,7 @@ impl Decision {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "accept" => Decision::Accept,
+            "revert" => Decision::Revert,
             "keep" => Decision::Keep,
             "delete_everywhere" => Decision::DeleteEverywhere,
             "keep_in_library" => Decision::KeepInLibrary,
@@ -144,11 +150,12 @@ impl Decision {
     fn rank(self) -> u8 {
         match self {
             Decision::Keep => 0,
-            Decision::Accept => 1,
-            Decision::DeleteEverywhere => 2,
-            Decision::KeepInLibrary => 3,
-            Decision::OnlyHere => 4,
-            Decision::KeepBoth => 5,
+            Decision::Revert => 1,
+            Decision::Accept => 2,
+            Decision::DeleteEverywhere => 3,
+            Decision::KeepInLibrary => 4,
+            Decision::OnlyHere => 5,
+            Decision::KeepBoth => 6,
         }
     }
 }
