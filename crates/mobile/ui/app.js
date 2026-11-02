@@ -21,6 +21,10 @@ const state = {
   },
 };
 
+/// Что уже нарисовано. Нужно, чтобы секундный опрос не пересоздавал DOM
+/// и не вызывал мерцание, если данные не изменились.
+const painted = { screen: null, picker: null, pair: null };
+
 let browseSeq = 0;
 
 function t(key, vars) {
@@ -201,17 +205,29 @@ function render() {
   const pair = document.getElementById('pair');
   if (!screen || !picker || !pair) return;
 
-  if (state.view === 'ready') screen.innerHTML = readyView();
-  else if (state.view === 'waiting') screen.innerHTML = waitingView();
-  else if (state.view === 'error') screen.innerHTML = `<div class="fatal">${esc(state.note)}</div>`;
-  else screen.innerHTML = '';
+  let main = '';
+  if (state.view === 'ready') main = readyView();
+  else if (state.view === 'waiting') main = waitingView();
+  else if (state.view === 'error') main = `<div class="fatal">${esc(state.note)}</div>`;
+  if (main !== painted.screen) {
+    screen.innerHTML = main;
+    painted.screen = main;
+  }
 
-  picker.hidden = !state.pickerOpen;
-  picker.innerHTML = state.pickerOpen ? pickerView() : '';
+  const pickerHtml = state.pickerOpen ? pickerView() : '';
+  if (picker.hidden !== !state.pickerOpen) picker.hidden = !state.pickerOpen;
+  if (pickerHtml !== painted.picker) {
+    picker.innerHTML = pickerHtml;
+    painted.picker = pickerHtml;
+  }
 
   const pending = state.info?.pending;
-  pair.hidden = !pending;
-  pair.innerHTML = pending ? pairView() : '';
+  const pairHtml = pending ? pairView() : '';
+  if (pair.hidden !== !pending) pair.hidden = !pending;
+  if (pairHtml !== painted.pair) {
+    pair.innerHTML = pairHtml;
+    painted.pair = pairHtml;
+  }
 }
 
 async function browse(path) {
