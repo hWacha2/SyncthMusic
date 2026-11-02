@@ -38,6 +38,12 @@ const state = {
   pair: null,
   pairError: null,
   pairLoading: false,
+  plan: null,
+  planError: null,
+  planLoading: false,
+  planFilter: 'all',
+  // Выделение строго одной группы «источник + тип»: { group, paths:Set }.
+  planSelection: null,
   log: null,
   logLoading: false,
   onboarding: { root: null, dataDir: null },
@@ -212,13 +218,280 @@ function stateCopy(snap) {
   }
 }
 
+// ------------------------------------------------------------------ план синхронизации
+
+const PLAN_KINDS = ['added', 'updated', 'moved', 'deleted'];
+const PLAN_FILTERS = ['all', 'added', 'updated', 'moved', 'deleted', 'conflicts'];
+
+function planSummary() {
+  const data = state.plan;
+  const plan = data && data.plan ? data.plan : null;
+  return {
+    connected: !!(data && data.connected),
+    localOnly: !!(data && data.local_only),
+    stale: !!(data && data.stale),
+    plan,
+    paths: plan && data.paths != null ? data.paths : 0,
+    unresolved: data && data.unresolved != null ? data.unresolved : 0,
+    error: data && data.error,
+  };
+}
+
+function planSourceName(plan, side) {
+  if (side === 'local') {
+    return (state.status && state.status.name)
+      || (state.info && state.info.device_name)
+      || t('plan.thisDevice');
+  }
+  return (plan && plan.peer_name) || t('plan.otherDevice');
+}
+
+// Группы — «источник + тип события». Конфликты идут отдельной группой:
+// у них нет одной стороны-источника.
+function planGroups(filter = state.planFilter) {
+  const { plan } = planSummary();
+  if (!plan) return [];
+  const groups = [];
+  if ((filter === 'all' || filter === 'conflicts') && (plan.conflicts || []).length) {
+    groups.push({
+      key: 'conflict',
+      side: 'conflict',
+      kind: 'conflict',
+      title: t('plan.filter.conflicts'),
+      source: t('plan.bothDevices'),
+      items: plan.conflicts.map((conflict) => ({
+        path: conflict.path,
+        size: conflict.local_size || conflict.remote_size || 0,
+        time: 0,
+        conflict,
+      })),
+    });
+  }
+  for (const side of ['local', 'remote']) {
+    for (const kind of PLAN_KINDS) {
+      if (filter !== 'all' && filter !== kind) continue;
+      const items = (plan[side] || [])
+        .filter((change) => change.kind === kind)
+        .map((change) => ({
+          path: change.path,
+          size: change.size || 0,
+          time: change.mtime_ns ? Math.round(change.mtime_ns / 1e6) : 0,
+          change,
+        }));
+      if (!items.length) continue;
+      groups.push({
+        key: `${side}:${kind}`,
+        side,
+        kind,
+        title: t(`plan.filter.${kind}`),
+        source: planSourceName(plan, side),
+        items,
+      });
+    }
+  }
+  return groups;
+}
+
+function planGroupPaths() {
+  const map = new Map();
+  planGroups('all').forEach((group) => {
+    map.set(group.key, new Set(group.items.map((item) => item.path)));
+  });
+  return map;
+}
+
+function reconcilePlanSelection() {
+  const selection = state.planSelection;
+  if (!selection) return;
+  const groups = planGroupPaths();
+  const allowed = groups.get(selection.group);
+  if (!allowed) {
+    state.planSelection = null;
+    return;
+  }
+  const kept = [...selection.paths].filter((path) => allowed.has(path));
+  if (!kept.length) {
+    state.planSelection = null;
+    return;
+  }
+  selection.paths = new Set(kept);
+}
+
+function planDecision(group, action) {
+  if (group === 'conflict') {
+    return action === 'keep' ? 'keep' : action === 'keep_both' ? 'keep_both' : 'accept';
+  }
+  const kind = group.split(':')[1];
+  if (kind === 'deleted') {
+    return action === 'revert' ? 'keep_in_library' : action === 'only_here' ? 'only_here' : 'delete_everywhere';
+  }
+  if (action === 'revert') return 'revert';
+  if (action === 'only_here') return 'only_here';
+  return 'accept';
+}
+
+function planActions(group, kind) {
+  if (group === 'conflict') {
+    return [
+      { action: 'keep', label: t('plan.action.conflict.keep') },
+      { action: 'accept', label: t('plan.action.conflict.accept') },
+      { action: 'keep_both', label: t('plan.action.conflict.keepBoth') },
+    ];
+  }
+  const actions = [
+    { action: 'accept', label: t(`plan.action.${kind}.accept`) },
+    { action: 'revert', label: t(`plan.action.${kind}.revert`) },
+  ];
+  if (kind === 'added' || kind === 'deleted') {
+    actions.push({ action: 'only_here', label: t(`plan.action.${kind}.onlyHere`) });
+  }
+  return actions;
+}
+
+function planItemMeta(item) {
+  const parts = [];
+  if (item.size) parts.push(sizeText(item.size));
+  if (item.time) parts.push(ago(item.time));
+  if (item.conflict) {
+    const resolved = planSummary().plan
+      && planSummary().plan.decisions
+      && planSummary().plan.decisions.entries
+      && planSummary().plan.decisions.entries[item.path];
+    parts.push(resolved ? t('plan.decisionSet') : t('plan.needsDecision'));
+  }
+  return parts.join(' · ');
+}
+
+function renderPlan() {
+  const snap = snapshot();
+  const summary = planSummary();
+  const status = snap.status;
+  const session = (status && status.session) || null;
+  const readonly = !!(session && session.read_only);
+  const diverged = !!(session && session.diverged);
+  const connected = summary.connected;
+  const stale = summary.stale;
+  const busy = state.busy || !!(status && status.state === 'syncing');
+  const lockDecisions = readonly || busy;
+  const canCommit = connected && !stale && !diverged && !readonly && !busy
+    && summary.unresolved === 0 && summary.paths > 0;
+  const peerName = (status && status.connection && status.connection.name)
+    || (summary.plan && summary.plan.peer_name)
+    || '';
+
+  const head = viewHead(
+    t('plan.kicker'),
+    t('nav.plan'),
+    t('plan.sub'),
+    `<span class="tag ${connected ? 'tag--good' : 'tag--warn'}">${esc(connected && peerName ? t('conn.connectedTo', { name: peerName }) : t('plan.offline'))}</span>
+     ${summary.unresolved ? `<span class="tag tag--warn">${esc(tp('plan.unresolved', summary.unresolved))}</span>` : ''}
+     <button class="btn btn--primary" data-act="plan-commit" ${canCommit ? '' : 'disabled'}>${icon('sync')}${esc(t('plan.commit'))}</button>`,
+  );
+
+  const notices = [];
+  if (!connected) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico warn">${icon('warn')}</div>
+      <div class="alert-body"><b>${esc(t('plan.offlineTitle'))}</b><p>${esc(t('plan.offlineText'))}</p></div>
+      <button class="btn btn--sm" data-view="devices">${esc(t('plan.connect'))}</button>
+    </div>`);
+  }
+  if (stale) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico warn">${icon('warn')}</div>
+      <div class="alert-body"><b>${esc(t('plan.stale.title'))}</b><p>${esc(t('plan.stale.text'))}</p></div>
+      <button class="btn btn--sm" data-act="plan-refresh">${esc(t('plan.stale.action'))}</button>
+    </div>`);
+  }
+  if (diverged) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico bad">${icon('alert')}</div>
+      <div class="alert-body"><b>${esc(t('plan.diverged.title'))}</b><p>${esc(t('plan.diverged.text'))}</p></div>
+      <button class="btn btn--sm" data-act="plan-refresh">${esc(t('plan.stale.action'))}</button>
+    </div>`);
+  }
+  if (readonly) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico">${icon('sync')}</div>
+      <div class="alert-body"><b>${esc(t('plan.readonly.title'))}</b><p>${esc(t('plan.readonly.text'))}</p></div>
+    </div>`);
+  }
+  if (summary.error) {
+    notices.push(`<div class="alert">
+      <div class="alert-ico bad">${icon('alert')}</div>
+      <div class="alert-body"><b>${esc(t('plan.errorTitle'))}</b><p>${esc(summary.error)}</p></div>
+    </div>`);
+  }
+
+  const filters = `<div class="plan-filters">${PLAN_FILTERS.map((filter) => {
+    const on = state.planFilter === filter ? ' is-on' : '';
+    return `<button class="plan-filter${on}" data-plan-filter="${filter}">${esc(t(`plan.filter.${filter}`))}</button>`;
+  }).join('')}</div>`;
+
+  const groups = planGroups();
+  const selection = state.planSelection;
+  const selectedPaths = selection ? selection.paths : new Set();
+
+  const body = groups.length
+    ? groups.map((group) => {
+      const allSelected = group.items.length > 0 && group.items.every((item) => selectedPaths.has(item.path) && selection && selection.group === group.key);
+      const someSelected = group.items.some((item) => selectedPaths.has(item.path) && selection && selection.group === group.key);
+      const items = group.items.map((item) => {
+        const checked = !!(selection && selection.group === group.key && selectedPaths.has(item.path));
+        return `<label class="plan-item${checked ? ' is-selected' : ''}">
+          <input class="plan-check" type="checkbox" data-plan-path="${esc(item.path)}" data-plan-group="${esc(group.key)}" ${checked ? 'checked' : ''} ${lockDecisions ? 'disabled' : ''}>
+          <span class="plan-item-body">
+            <span class="plan-item-path">${esc(item.path)}</span>
+            <span class="plan-item-meta">${esc(planItemMeta(item))}</span>
+          </span>
+        </label>`;
+      }).join('');
+      return `<section class="plan-group">
+        <div class="plan-group-head">
+          <input class="plan-check" type="checkbox" data-plan-group="${esc(group.key)}" aria-label="${esc(t('plan.selectAll'))}" ${allSelected ? 'checked' : ''} ${someSelected && !allSelected ? 'data-indeterminate="1"' : ''} ${lockDecisions ? 'disabled' : ''}>
+          <div class="plan-group-title"><b>${esc(group.title)}</b><span>${esc(group.source)}</span></div>
+          <span class="tag">${group.items.length}</span>
+        </div>
+        <div class="plan-items">${items}</div>
+      </section>`;
+    }).join('')
+    : emptyState('check', t('plan.emptyTitle'), connected ? t('plan.emptyText') : t('plan.emptyLocalText'));
+
+  let plate = '';
+  if (selection && selection.paths.size) {
+    const group = groups.find((entry) => entry.key === selection.group)
+      || planGroups('all').find((entry) => entry.key === selection.group);
+    const actions = group ? planActions(group.key, group.kind) : [];
+    const disabled = !connected || stale || diverged || readonly || busy;
+    plate = `<div class="plan-plate">
+      <div class="plan-plate-count">${esc(tp('plan.selected', selection.paths.size))}</div>
+      <div class="plan-plate-actions">
+        ${actions.map((entry) => `<button class="btn btn--sm${entry.action === 'accept' ? ' btn--primary' : ''}" data-plan-action="${entry.action}" ${disabled ? 'disabled' : ''}>${esc(entry.label)}</button>`).join('')}
+      </div>
+      <div class="plan-plate-tools">
+        <button class="btn btn--sm btn--ghost" data-plan-all="${esc(selection.group)}" ${lockDecisions ? 'disabled' : ''}>${esc(t('plan.selectAll'))}</button>
+        <button class="btn btn--sm btn--ghost" data-plan-clear>${esc(t('plan.clear'))}</button>
+      </div>
+      ${disabled ? `<div class="plan-plate-note">${esc(!connected ? t('plan.offlineActions') : stale || diverged ? t('plan.stale.actions') : t('plan.readonlyActions'))}</div>` : ''}
+    </div>`;
+  }
+
+  return head
+    + (notices.length ? `<section class="panel plan-notices"><div class="alert-list">${notices.join('')}</div></section>` : '')
+    + `<section class="panel">
+        <div class="panel-head"><div class="panel-title">${esc(t('plan.changes'))}</div>${filters}</div>
+        ${body}
+      </section>`
+    + plate;
+}
+
 // ------------------------------------------------------------------ каркас
 
 function navHtml(snap) {
+  const planPaths = planSummary().paths;
   const items = [
     { id: 'overview', icon: 'disc' },
-    { id: 'pending', icon: 'clock', count: snap.pending.length },
-    { id: 'conflicts', icon: 'split', count: snap.conflicts.length },
+    { id: 'plan', icon: 'clock', count: planPaths },
     { id: 'vault', icon: 'box', count: snap.vault.length },
     { id: 'devices', icon: 'devices', count: snap.known.length },
     { id: 'pair', icon: 'qr' },
@@ -228,7 +501,7 @@ function navHtml(snap) {
   return items.map((item) => {
     const active = state.view === item.id ? ' active' : '';
     const count = item.count
-      ? `<span class="nav-count${item.id === 'pending' || item.id === 'conflicts' ? ' hot' : ''}">${item.count}</span>`
+      ? `<span class="nav-count${item.id === 'plan' ? ' hot' : ''}">${item.count}</span>`
       : '';
     return `<button class="nav-item${active}" data-view="${item.id}">
       ${icon(item.icon, 'nav-ico')}<span class="nav-label">${esc(t(`nav.${item.id}`))}</span>${count}
@@ -403,22 +676,14 @@ function renderOverview() {
       action: `<button class="btn btn--sm" data-act="disk-check">${esc(t('alert.lowDisk.action'))}</button>`,
     });
   }
-  if (snap.pending.length) {
+  const plan = planSummary();
+  if (plan.paths || plan.unresolved) {
     alerts.push({
       icon: 'clock',
-      tone: '',
-      title: tp('alert.pending.title', snap.pending.length),
-      text: t('alert.pending.text'),
-      action: `<button class="btn btn--sm" data-view="pending">${esc(t('alert.pending.action'))}</button>`,
-    });
-  }
-  if (snap.conflicts.length) {
-    alerts.push({
-      icon: 'split',
-      tone: 'bad',
-      title: tp('alert.conflicts.title', snap.conflicts.length),
-      text: t('alert.conflicts.text'),
-      action: `<button class="btn btn--sm" data-view="conflicts">${esc(t('alert.pending.action'))}</button>`,
+      tone: plan.unresolved ? 'bad' : '',
+      title: tp('alert.plan.title', plan.paths || plan.unresolved),
+      text: plan.unresolved ? t('alert.plan.conflicts') : t('alert.plan.text'),
+      action: `<button class="btn btn--sm" data-view="plan">${esc(t('alert.plan.action'))}</button>`,
     });
   }
   if (snap.running && status.last_error) {
@@ -518,66 +783,6 @@ function renderOverview() {
     ${stats}
     <div class="grid grid-2">${signal}${attention}</div>
     <div class="grid">${peers}</div>`;
-}
-
-// ------------------------------------------------------------------ удаления
-
-function renderPending() {
-  const snap = snapshot();
-  const rows = snap.pending.map((pending) => `<div class="row">
-      <div class="row-body">
-        <div class="row-path">${esc(pending.path)}</div>
-        <div class="row-meta"><span class="dot warn"></span>${esc(t('pending.rowMeta', { ago: ago(pending.detected_at) }))}</div>
-      </div>
-      <div class="row-side">
-        <button class="btn btn--sm" data-act="pending-only" data-path="${esc(pending.path)}">${esc(t('pending.keep'))}</button>
-        <button class="btn btn--sm btn--danger" data-act="pending-everywhere" data-path="${esc(pending.path)}">${esc(t('pending.delete'))}</button>
-        <button class="btn btn--sm btn--ghost" data-act="pending-forget" data-path="${esc(pending.path)}">${esc(t('pending.dismiss'))}</button>
-      </div>
-    </div>`).join('');
-
-  const content = snap.pending.length
-    ? `<div class="rows">${rows}</div><p class="view-sub" style="margin-top:14px">${esc(t('pending.hint'))}</p>`
-    : emptyState('check', t('pending.emptyTitle'), t('pending.emptyText'));
-
-  return viewHead(
-    t('pending.kicker'),
-    t('pending.title'),
-    t('pending.sub'),
-    snap.pending.length ? `<button class="btn btn--sm" data-view="vault">${icon('box')}${esc(t('nav.vault'))}</button>` : '',
-  ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${esc(t('panel.waiting'))}</div><span class="tag ${snap.pending.length ? 'tag--warn' : 'tag--good'}">${snap.pending.length}</span></div>
-    ${content}
-  </section>`;
-}
-
-// ------------------------------------------------------------------ конфликты
-
-function renderConflicts() {
-  const snap = snapshot();
-  const rows = snap.conflicts.map((path) => `<div class="row">
-      <div class="row-body">
-        <div class="row-path">${esc(path)}</div>
-        <div class="row-meta"><span class="dot bad"></span>${esc(t('conflicts.rowMeta'))}</div>
-      </div>
-      <div class="row-side">
-        <button class="btn btn--sm" data-act="open-conflict" data-path="${esc(path)}">${icon('folder')}${esc(t('conflicts.open'))}</button>
-      </div>
-    </div>`).join('');
-
-  const content = snap.conflicts.length
-    ? `<div class="rows">${rows}</div>`
-    : emptyState('check', t('conflicts.emptyTitle'), t('conflicts.emptyText'));
-
-  return viewHead(
-    t('conflicts.kicker'),
-    t('nav.conflicts'),
-    t('conflicts.sub'),
-    `<button class="btn btn--sm" data-act="open-root" ${snap.root ? '' : 'disabled'}>${icon('folder')}${esc(t('conflicts.openLibrary'))}</button>`,
-  ) + `<section class="panel">
-    <div class="panel-head"><div class="panel-title">${esc(t('panel.conflicts'))}</div><span class="tag ${snap.conflicts.length ? 'tag--bad' : 'tag--good'}">${snap.conflicts.length}</span></div>
-    ${content}
-  </section>`;
 }
 
 // ------------------------------------------------------------------ хранилище
@@ -881,8 +1086,7 @@ function renderOnboarding() {
 
 function renderView() {
   switch (state.view) {
-    case 'pending': return renderPending();
-    case 'conflicts': return renderConflicts();
+    case 'plan': return renderPlan();
     case 'vault': return renderVault();
     case 'devices': return renderDevices();
     case 'pair': return renderPair();
@@ -909,6 +1113,9 @@ function render() {
   if (html !== state.lastHtml) {
     $('#view').innerHTML = html;
     state.lastHtml = html;
+    $('#view').querySelectorAll('.plan-check[data-indeterminate]').forEach((box) => {
+      box.indeterminate = true;
+    });
   }
 
   main.scrollTop = viewChanged || !state.keepScroll ? 0 : previous;
@@ -981,6 +1188,28 @@ async function refreshStatus() {
   }
 }
 
+async function loadPlan() {
+  if (!state.running) {
+    state.plan = null;
+    state.planSelection = null;
+    return;
+  }
+  if (state.planLoading) return;
+  state.planLoading = true;
+  try {
+    state.plan = await invoke('daemon_plan');
+    state.planError = null;
+    reconcilePlanSelection();
+  } catch (error) {
+    const message = errText(error);
+    state.plan = { connected: false, local_only: true, stale: false, plan: null, error: message };
+    state.planSelection = null;
+    state.planError = message;
+  } finally {
+    state.planLoading = false;
+  }
+}
+
 async function refreshInfo() {
   state.info = await invoke('app_info');
 }
@@ -1020,6 +1249,7 @@ async function runBusy(task, fallback = null) {
   try {
     const message = await task();
     await refreshStatus();
+    await loadPlan();
     toast(message || fallback || t('toast.done'));
   } catch (error) {
     toast(errText(error), 'bad');
@@ -1045,9 +1275,41 @@ async function startAndWait() {
   throw new Error(t('toast.serviceNoAnswer'));
 }
 
+async function applyPlanDecision(action) {
+  const selection = state.planSelection;
+  if (!selection || !selection.paths.size) return;
+  const summary = planSummary();
+  if (!summary.connected || summary.stale || state.busy) return;
+
+  const decision = planDecision(selection.group, action);
+  const paths = [...selection.paths];
+  state.busy = true;
+  render();
+  try {
+    for (const path of paths) {
+      await invoke('daemon_action', {
+        name: 'decision',
+        payload: { path, action: decision },
+      });
+    }
+    state.planSelection = null;
+    await refreshStatus();
+    await loadPlan();
+    toast(tp('toast.decisionsSaved', paths.length));
+  } catch (error) {
+    toast(errText(error), 'bad');
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
 function navigate(view) {
   state.view = view;
   state.keepScroll = false;
+  if (view === 'plan') {
+    loadPlan().then(render);
+  }
   if (view === 'pair') {
     loadPair().then(render);
   }
@@ -1160,20 +1422,19 @@ async function handleAction(action, dataset) {
         run: () => daemonCommand('gc', null, t('toast.vaultCleaned')),
       });
       break;
-    case 'pending-only':
-      await daemonCommand('pending_resolve', { path, action: 'only_here' }, t('toast.keptHere'));
+    case 'plan-refresh':
+      await daemonCommand('plan_refresh', null, t('toast.planRefreshed'));
+      state.planSelection = null;
+      await loadPlan();
+      render();
       break;
-    case 'pending-forget':
-      await daemonCommand('pending_forget', { path }, t('toast.dismissed'));
-      break;
-    case 'pending-everywhere':
+    case 'plan-commit':
       openConfirm({
-        title: t('modal.delete.title'),
-        text: t('modal.delete.text'),
-        path,
-        label: t('modal.delete.label'),
-        danger: true,
-        run: () => daemonCommand('pending_resolve', { path, action: 'delete_everywhere' }, t('toast.deleteConfirmed')),
+        title: t('modal.commit.title'),
+        text: t('modal.commit.text'),
+        label: t('plan.commit'),
+        danger: false,
+        run: () => daemonCommand('commit', null, t('toast.commitDone')),
       });
       break;
     case 'restore':
@@ -1360,6 +1621,43 @@ document.addEventListener('click', (event) => {
     return;
   }
 
+  const filterButton = event.target.closest('[data-plan-filter]');
+  if (filterButton) {
+    state.planFilter = filterButton.dataset.planFilter;
+    const visible = new Set(planGroups(state.planFilter).map((group) => group.key));
+    if (state.planSelection && !visible.has(state.planSelection.group)) {
+      state.planSelection = null;
+    }
+    render();
+    return;
+  }
+
+  const planAll = event.target.closest('[data-plan-all]');
+  if (planAll) {
+    const group = planGroups('all').find((entry) => entry.key === planAll.dataset.planAll);
+    if (group) {
+      state.planSelection = {
+        group: group.key,
+        paths: new Set(group.items.map((item) => item.path)),
+      };
+      render();
+    }
+    return;
+  }
+
+  const planClear = event.target.closest('[data-plan-clear]');
+  if (planClear) {
+    state.planSelection = null;
+    render();
+    return;
+  }
+
+  const planAction = event.target.closest('[data-plan-action]');
+  if (planAction && !planAction.disabled) {
+    applyPlanDecision(planAction.dataset.planAction);
+    return;
+  }
+
   const navButton = event.target.closest('[data-view]');
   if (navButton) {
     navigate(navButton.dataset.view);
@@ -1371,6 +1669,36 @@ document.addEventListener('click', (event) => {
     const dataset = { ...actionButton.dataset };
     handleAction(dataset.act, dataset);
   }
+});
+
+document.addEventListener('change', (event) => {
+  const box = event.target.closest('.plan-check');
+  if (!box) return;
+  const groupKey = box.dataset.planGroup;
+  if (!groupKey) return;
+
+  if (box.dataset.planPath) {
+    let selection = state.planSelection;
+    if (!selection || selection.group !== groupKey) {
+      selection = { group: groupKey, paths: new Set() };
+    }
+    if (box.checked) selection.paths.add(box.dataset.planPath);
+    else selection.paths.delete(box.dataset.planPath);
+    state.planSelection = selection.paths.size ? selection : null;
+    render();
+    return;
+  }
+
+  const group = planGroups('all').find((entry) => entry.key === groupKey);
+  if (box.checked && group) {
+    state.planSelection = {
+      group: groupKey,
+      paths: new Set(group.items.map((item) => item.path)),
+    };
+  } else if (state.planSelection && state.planSelection.group === groupKey) {
+    state.planSelection = null;
+  }
+  render();
 });
 
 document.addEventListener('submit', async (event) => {
@@ -1393,6 +1721,7 @@ document.addEventListener('keydown', (event) => {
 async function poll() {
   if (!state.info || state.busy) return;
   await refreshStatus();
+  await loadPlan();
   render();
 }
 
@@ -1426,6 +1755,7 @@ async function boot() {
   }
 
   if (state.running) await loadPair();
+  await loadPlan();
   render();
   setInterval(poll, 3000);
 }

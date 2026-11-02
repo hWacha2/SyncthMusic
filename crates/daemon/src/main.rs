@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::Watcher;
-use syncth_core::plan::{Decision, PathDecision};
+use syncth_core::plan::{self, Decision, PathDecision};
 use syncth_core::{net, resolve, scan, vault, Action, Hlc, Replica};
 
 mod tray;
@@ -1503,20 +1503,56 @@ fn api_plan(ctx: &UiCtx) -> Value {
         .active_peer
         .as_ref()
         .map(|p| p.dev.clone());
-    let Some(dev) = dev else {
-        return json!({ "connected": false, "plan": Value::Null });
-    };
     let r = ctx.read.lock().unwrap();
+    let Some(dev) = dev else {
+        // Без пира план всё равно нужен: человек должен видеть, что изменилось
+        // локально. Решения и commit в таком плане недоступны.
+        return match plan::build(&r, "", &syncth_core::device_name(), &[]) {
+            Ok(plan) => json!({
+                "connected": false,
+                "local_only": true,
+                "stale": false,
+                "plan": plan,
+                "hash": plan.decisions_hash(),
+                "unresolved": plan.unresolved().len(),
+                "paths": plan.path_count(),
+            }),
+            Err(e) => json!({
+                "connected": false,
+                "local_only": true,
+                "stale": false,
+                "plan": Value::Null,
+                "error": format!("{e:#}"),
+            }),
+        };
+    };
     match r.load_plan(&dev, Hlc::wall_ms()) {
-        Ok(Some(plan)) => json!({
+        Ok(Some(plan)) => {
+            // План мог устареть: скан или правка файла после его построения.
+            let stale = !plan.local_is_current(&r).unwrap_or(false);
+            json!({
+                "connected": true,
+                "local_only": false,
+                "stale": stale,
+                "plan": plan,
+                "hash": plan.decisions_hash(),
+                "unresolved": plan.unresolved().len(),
+                "paths": plan.path_count(),
+            })
+        }
+        Ok(None) => json!({
             "connected": true,
-            "plan": plan,
-            "hash": plan.decisions_hash(),
-            "unresolved": plan.unresolved().len(),
-            "paths": plan.path_count(),
+            "local_only": false,
+            "stale": false,
+            "plan": Value::Null,
         }),
-        Ok(None) => json!({ "connected": true, "plan": Value::Null }),
-        Err(e) => json!({ "connected": true, "plan": Value::Null, "error": format!("{e:#}") }),
+        Err(e) => json!({
+            "connected": true,
+            "local_only": false,
+            "stale": false,
+            "plan": Value::Null,
+            "error": format!("{e:#}"),
+        }),
     }
 }
 

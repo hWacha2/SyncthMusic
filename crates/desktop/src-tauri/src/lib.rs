@@ -223,6 +223,20 @@ async fn daemon_pair_code() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn daemon_plan() -> Value {
+    match blocking(|| http("GET", "/api/plan", None)).await {
+        Ok(plan) => plan,
+        Err(error) => json!({
+            "connected": false,
+            "local_only": true,
+            "stale": false,
+            "plan": Value::Null,
+            "error": error,
+        }),
+    }
+}
+
+#[tauri::command]
 async fn daemon_action(name: String, payload: Option<Value>) -> Result<Value, String> {
     let payload = payload.unwrap_or(Value::Null);
     let field = |key: &str| -> Result<String, String> {
@@ -260,6 +274,12 @@ async fn daemon_action(name: String, payload: Option<Value>) -> Result<Value, St
             Some(json!({ "path": field("path")? })),
         ),
         "restore" => ("/api/restore", Some(json!({ "path": field("path")? }))),
+        "plan_refresh" => ("/api/plan/refresh", None),
+        "decision" => (
+            "/api/decision",
+            Some(json!({ "path": field("path")?, "action": field("action")? })),
+        ),
+        "commit" => ("/api/commit", None),
         "ignore" => (
             "/api/ignore",
             Some(json!({
@@ -577,6 +597,7 @@ pub fn run() {
             app_info,
             daemon_status,
             daemon_pair_code,
+            daemon_plan,
             daemon_action,
             start_daemon,
             stop_daemon,

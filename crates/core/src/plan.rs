@@ -851,6 +851,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_becomes_stale_after_a_local_change() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("track.flac", "b3:one")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_present("track.flac").unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+        assert!(plan.local_is_current(&a).unwrap());
+
+        let changed = a.make_op(put("track.flac", "b3:two")).unwrap();
+        a.apply(&changed).unwrap();
+        a.mark_present("track.flac").unwrap();
+        assert!(!plan.local_is_current(&a).unwrap());
+    }
+
+    #[test]
     fn local_deletion_is_kept_by_default() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         synced(&mut a, "gone.flac", "b3:aa");
