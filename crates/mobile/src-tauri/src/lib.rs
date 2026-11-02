@@ -137,6 +137,63 @@ fn root_candidates() -> Vec<Value> {
     out
 }
 
+fn browse_start() -> PathBuf {
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0")
+    } else {
+        PathBuf::from(default_root())
+    }
+}
+
+/// Обычный список папок для выбора библиотеки. Android SAF отдаёт URI, а ядру
+/// нужен путь, поэтому телефон использует собственный браузер каталогов.
+#[tauri::command]
+async fn browse_dirs(path: Option<String>) -> Result<Value, String> {
+    blocking(move || {
+        let dir = path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(browse_start);
+
+        if !dir.is_dir() {
+            return Err(format!("папка не найдена: {}", dir.display()));
+        }
+
+        let parent = dir.parent().and_then(|candidate| {
+            if candidate.is_dir() && candidate != dir.as_path() {
+                Some(candidate.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        });
+
+        let mut entries: Vec<(String, PathBuf)> = std::fs::read_dir(&dir)
+            .map_err(|e| format!("не удалось прочитать {}: {e}", dir.display()))?
+            .flatten()
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                (!name.starts_with('.')).then(|| (name, entry.path()))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let entries: Vec<Value> = entries
+            .into_iter()
+            .map(|(name, path)| json!({ "name": name, "path": path.to_string_lossy() }))
+            .collect();
+
+        Ok(json!({
+            "path": dir.to_string_lossy(),
+            "parent": parent,
+            "entries": entries,
+        }))
+    })
+    .await
+}
+
 fn status_json(replica: &Replica) -> Value {
     let root = replica.root().ok().flatten();
     let root_text = root.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -721,6 +778,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            browse_dirs,
             status,
             sync_plan,
             set_plan_decision,
