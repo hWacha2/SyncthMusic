@@ -343,6 +343,199 @@ fn first_contact_with_same_path_keeps_both_versions() {
 }
 
 #[test]
+fn commit_applies_accepted_additions_and_clears_the_plan() {
+    let ctx = setup();
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+
+    let outcome = session.commit(&mut b).unwrap();
+    assert!(outcome.accepted >= 2, "{outcome:?}");
+    assert!(session.finished);
+    assert!(b
+        .load_plan("dev-a", syncth_core::Hlc::wall_ms())
+        .unwrap()
+        .is_none());
+
+    drop(session);
+    let _ = handle.finish();
+
+    assert_eq!(
+        fs::read(ctx.root_b.join("Album/01.flac")).unwrap(),
+        b"alpha-bytes"
+    );
+    assert_eq!(
+        fs::read(ctx.root_b.join("Album/02.flac")).unwrap(),
+        b"beta-bytes"
+    );
+    assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
+}
+
+#[test]
+fn commit_with_a_different_decisions_hash_is_rejected() {
+    use syncth_core::plan::Decision;
+
+    let ctx = setup();
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+
+    // Решение записано локально, но пиру ещё не отправлено: хэши разошлись.
+    let path = session.plan.remote[0].path.clone();
+    session
+        .record_decision(&mut b, &path, Decision::Keep)
+        .unwrap();
+    let err = session.commit(&mut b).unwrap_err().to_string();
+    assert!(err.contains("разошёлся"), "{err}");
+    assert!(!session.finished, "неудачный commit не завершает сессию");
+    drop(session);
+    let _ = handle.finish();
+}
+
+#[test]
+fn commit_resumes_a_partial_download_from_the_same_offset() {
+    let ctx = setup();
+    let blob = syncth_core::scan::hash_file(&ctx.root_a.join("Album/01.flac")).unwrap();
+    let key = blob.trim_start_matches("b3:");
+    let incoming = ctx.data_b.join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    // Телефон успел скачать только половину файла.
+    fs::write(incoming.join(format!("{key}.part")), b"alpha").unwrap();
+
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    session.commit(&mut b).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    assert_eq!(
+        fs::read(ctx.root_b.join("Album/01.flac")).unwrap(),
+        b"alpha-bytes",
+        "файл должен докачаться с пятого байта"
+    );
+    assert!(
+        !incoming.join(format!("{key}.part")).exists(),
+        ".part исчезает только после проверки"
+    );
+    assert!(
+        !incoming.join(format!("{key}.blob")).exists(),
+        "проверенная загрузка убрана после раскладки"
+    );
+}
+
+#[test]
+fn keep_both_puts_both_versions_on_both_devices() {
+    use syncth_core::plan::Decision;
+
+    let ctx = setup();
+    session(&ctx);
+
+    let rel = "Album/01.flac";
+    fs::write(ctx.root_a.join(rel), b"pc-version").unwrap();
+    fs::write(ctx.root_b.join(rel), b"phone-version").unwrap();
+    let mut a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    drop(a);
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    scan::scan(&ctx.root_b, &mut b).unwrap();
+
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    assert_eq!(session.plan.conflicts.len(), 1);
+    let path = session.plan.conflicts[0].path.clone();
+    session
+        .record_decision(&mut b, &path, Decision::KeepBoth)
+        .unwrap();
+    // Решение должно доехать до сервера до commit.
+    session.poll(&mut b).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.poll(&mut b).unwrap();
+
+    session.commit(&mut b).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    for root in [&ctx.root_a, &ctx.root_b] {
+        let mut contents = Vec::new();
+        for e in walkdir::WalkDir::new(root) {
+            let e = e.unwrap();
+            if e.file_type().is_file() {
+                contents.push(fs::read(e.path()).unwrap());
+            }
+        }
+        assert!(
+            contents.iter().any(|c| c == b"pc-version"),
+            "{}",
+            root.display()
+        );
+        assert!(
+            contents.iter().any(|c| c == b"phone-version"),
+            "{}",
+            root.display()
+        );
+    }
+    assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
+}
+
+#[test]
+fn keep_in_library_restores_from_the_peer_vault() {
+    use syncth_core::plan::Decision;
+
+    let ctx = setup();
+    session(&ctx);
+
+    // ПК удалил трек навсегда: файл ушёл в корзину, операция удаления уехала.
+    let mut a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    fs::remove_file(ctx.root_a.join("Album/02.flac")).unwrap();
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    syncth_core::resolve::resolve(
+        &mut a,
+        "Album/02.flac",
+        syncth_core::Action::DeleteEverywhere,
+    )
+    .unwrap();
+    drop(a);
+
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    let path = session
+        .plan
+        .remote
+        .iter()
+        .find(|c| c.path == "Album/02.flac")
+        .expect("удаление должно быть в плане")
+        .path
+        .clone();
+    session
+        .record_decision(&mut b, &path, Decision::KeepInLibrary)
+        .unwrap();
+    session.poll(&mut b).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.poll(&mut b).unwrap();
+
+    session.commit(&mut b).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    assert_eq!(
+        fs::read(ctx.root_b.join("Album/02.flac")).unwrap(),
+        b"beta-bytes"
+    );
+    assert_eq!(
+        fs::read(ctx.root_a.join("Album/02.flac")).unwrap(),
+        b"beta-bytes",
+        "решение возвращает файл и на источнике удаления"
+    );
+    assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
+}
+#[test]
 fn wrong_token_is_rejected() {
     let ctx = setup();
     let a = Replica::open(&ctx.data_a, "dev-a").unwrap();

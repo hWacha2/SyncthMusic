@@ -179,7 +179,8 @@ powershell -ExecutionPolicy Bypass -File scripts\e2e-daemon.ps1
 ```
 
 Чего ещё нет: входящих сеансов на Android, foreground service, MediaScanner,
-живого экрана плана с commit и снапшотов журнала.
+готового экрана плана с групповыми решениями (серверный commit и докачка уже
+есть) и снапшотов журнала.
 
 Все пограничные случаи (удаление + перенос, одновременная правка, первый контакт,
 битый блоб, занятый файл) разобраны в [docs/sync-situations.md](docs/sync-situations.md).

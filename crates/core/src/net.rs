@@ -21,11 +21,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::commit;
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
@@ -102,6 +103,18 @@ enum Msg {
     Commit {
         decisions_hash: String,
     },
+    /// Пир принял хэш и готов к обмену операциями commit.
+    CommitGo,
+    CommitPlan {
+        ops: Vec<Op>,
+        needs: Vec<String>,
+    },
+    /// Все нужные блобы скачаны и проверены; можно применять.
+    CommitReady,
+    CommitDone {
+        accepted: usize,
+        rejected: usize,
+    },
     CommitAck {
         accepted: usize,
         rejected: usize,
@@ -113,10 +126,16 @@ enum Msg {
     },
     Want {
         blobs: Vec<String>,
+        /// Сколько байт уже лежит в `.part`: с этого места продолжать.
+        #[serde(default)]
+        offsets: HashMap<String, u64>,
     },
     BlobHead {
         blob: String,
         size: u64,
+        /// Смещение, с которого пойдут байты.
+        #[serde(default)]
+        offset: u64,
     },
     Done,
     Error {
@@ -240,20 +259,30 @@ fn local_path_for(replica: &Replica, root: &Path, blob: &str) -> Result<Option<P
 }
 
 fn send_blob<W: Write>(w: &mut W, path: &Path, blob: &str) -> Result<u64> {
+    send_blob_from(w, path, blob, 0)
+}
+
+/// Отдать блоб начиная с `start`. Нужно для докачки: получатель говорит,
+/// сколько байт у него уже лежит в `.part`.
+fn send_blob_from<W: Write>(w: &mut W, path: &Path, blob: &str, start: u64) -> Result<u64> {
     let mut f =
         std::fs::File::open(path).with_context(|| format!("открытие {}", path.display()))?;
     let size = f.metadata()?.len();
+    anyhow::ensure!(start <= size, "смещение {start} больше размера {size}");
+    f.seek(SeekFrom::Start(start))?;
     send_msg(
         w,
         &Msg::BlobHead {
             blob: blob.to_string(),
             size,
+            offset: start,
         },
     )?;
-    let mut limited = (&mut f).take(size);
+    let left = size - start;
+    let mut limited = (&mut f).take(left);
     let n = std::io::copy(&mut limited, w)?;
     anyhow::ensure!(
-        n == size,
+        n == left,
         "файл изменился во время передачи: {}",
         path.display()
     );
@@ -573,7 +602,7 @@ fn serve_wants<R: Read, W: Write>(
     stats: &mut SyncStats,
 ) -> Result<()> {
     match recv_msg(r)? {
-        Msg::Want { blobs } => {
+        Msg::Want { blobs, .. } => {
             for blob in blobs {
                 match local_path_for(replica, root, &blob)? {
                     Some(p) => {
@@ -598,10 +627,16 @@ fn request_wants<R: Read, W: Write>(
     stats: &mut SyncStats,
 ) -> Result<()> {
     let want = missing_blobs(replica)?;
-    send_msg(w, &Msg::Want { blobs: want })?;
+    send_msg(
+        w,
+        &Msg::Want {
+            blobs: want,
+            offsets: HashMap::new(),
+        },
+    )?;
     loop {
         match recv_msg(r)? {
-            Msg::BlobHead { blob, size } => {
+            Msg::BlobHead { blob, size, .. } => {
                 let (bytes, placed) = receive_blob(r, replica, root, &blob, size)?;
                 stats.received_bytes += bytes;
                 stats.received_blobs += 1;
@@ -610,6 +645,107 @@ fn request_wants<R: Read, W: Write>(
             Msg::Done => return Ok(()),
             other => bail!("неожиданное сообщение при передаче: {other:?}"),
         }
+    }
+}
+
+/// Принять блоб с докачкой. `.part` не удаляется при обрыве: следующий commit
+/// попросит пира продолжить с его длины. В библиотеку блоб попадает только
+/// после полной проверки BLAKE3 — и уже оттуда его ставит `commit::apply`.
+fn receive_blob_resumable<R: Read>(
+    r: &mut R,
+    replica: &Replica,
+    blob: &str,
+    size: u64,
+    offset: u64,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    if size == 0 {
+        bail!("пустой блоб {blob}");
+    }
+    let part = commit::part_path(replica, blob)?;
+    if let Some(parent) = part.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    anyhow::ensure!(
+        have == offset,
+        "рассинхрон докачки {blob}: у нас {have} байт, пир начал с {offset}"
+    );
+    anyhow::ensure!(offset <= size, "смещение больше размера блоба {blob}");
+
+    let mut file = if offset == 0 {
+        std::fs::File::create(&part)?
+    } else {
+        std::fs::OpenOptions::new().append(true).open(&part)?
+    };
+    let mut remaining = size - offset;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match r.read(&mut buf[..want]) {
+            Ok(0) => {
+                // Обрыв: файл остаётся, чтобы в следующий раз продолжить.
+                let _ = file.sync_all();
+                bail!("соединение закрыто посреди блоба {blob}; докачаем позже");
+            }
+            Ok(n) => n,
+            Err(e) => {
+                let _ = file.sync_all();
+                return Err(e.into());
+            }
+        };
+        file.write_all(&buf[..n])?;
+        remaining -= n as u64;
+        stats.received_bytes += n as u64;
+    }
+    file.sync_all()?;
+    drop(file);
+
+    let got = scan::hash_file(&part)?;
+    if got != blob {
+        let _ = std::fs::remove_file(&part);
+        bail!("хеш не совпал: ожидали {blob}, получили {got}");
+    }
+    let staged = commit::staged_path(replica, blob)?;
+    let _ = std::fs::remove_file(&staged);
+    std::fs::rename(&part, &staged)?;
+    stats.received_blobs += 1;
+    Ok(())
+}
+
+/// Отдать блобы, которые просит commit. В отличие от обычного синка, здесь
+/// можно отдавать и содержимое корзины — оно нужно для `Revert`.
+fn serve_wants_resumable<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    replica: &Replica,
+    root: &Path,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    match recv_msg(r)? {
+        Msg::Want { blobs, offsets } => {
+            for blob in blobs {
+                let start = offsets.get(&blob).copied().unwrap_or(0);
+                match commit::blob_source(replica, root, &blob)? {
+                    Some(path) => {
+                        stats.sent_bytes += send_blob_from(w, &path, &blob, start)?;
+                        stats.sent_blobs += 1;
+                    }
+                    None => {
+                        let message = format!("у пира нет блоба {blob}");
+                        let _ = send_msg(
+                            w,
+                            &Msg::Error {
+                                message: message.clone(),
+                            },
+                        );
+                        bail!("{message}");
+                    }
+                }
+            }
+            send_msg(w, &Msg::Done)
+        }
+        other => bail!("ожидали список блобов commit, получили {other:?}"),
     }
 }
 
@@ -674,7 +810,7 @@ pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<
 
 /// Серверная сторона: принять одно соединение и обслужить его.
 pub fn serve_stream(stream: TcpStream, replica: &mut Replica, token: &str) -> Result<SyncStats> {
-    serve_one(stream, replica, token, &mut |_| {})
+    serve_one(stream, replica, token, &mut |_, _| {})
 }
 
 /// То же, но с уведомлением о состоянии живой preview-сессии. Callback
@@ -683,7 +819,7 @@ pub fn serve_stream_with(
     stream: TcpStream,
     replica: &mut Replica,
     token: &str,
-    on_session: &mut dyn FnMut(&PreviewSession),
+    on_session: &mut dyn FnMut(&mut PreviewSession, &mut Replica),
 ) -> Result<SyncStats> {
     serve_one(stream, replica, token, on_session)
 }
@@ -711,7 +847,7 @@ fn serve_one(
     stream: TcpStream,
     replica: &mut Replica,
     token: &str,
-    on_session: &mut dyn FnMut(&PreviewSession),
+    on_session: &mut dyn FnMut(&mut PreviewSession, &mut Replica),
 ) -> Result<SyncStats> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
@@ -785,10 +921,10 @@ fn serve_one(
     match next {
         // Новый режим: сначала манифест и план, ничего не применяем.
         Msg::Preview { ops, decisions } => {
-            let server = PreviewSession::accept(
+            let mut server = PreviewSession::accept(
                 r, w, replica, &peer_dev, &peer_name, &ops, decisions, &peer_have,
             )?;
-            on_session(&server);
+            on_session(&mut server, replica);
             server.run_with(replica, on_session)
         }
         // Старый полный обмен оставлен до этапа commit: он ещё используется
@@ -823,6 +959,8 @@ pub struct PreviewSession {
     pub read_only: bool,
     /// Наборы решений разошлись: хэш пира не совпал с нашим.
     pub diverged: bool,
+    /// Commit завершён: сессия больше не принимает решения.
+    pub finished: bool,
     w: BufWriter<TcpStream>,
     r: BufReader<TcpStream>,
     /// Решения, о которых пир уже знает. Нужны, чтобы не слать их повторно.
@@ -958,6 +1096,7 @@ impl PreviewSession {
             plan,
             read_only: false,
             diverged: false,
+            finished: false,
             w,
             r,
             announced,
@@ -988,6 +1127,7 @@ impl PreviewSession {
             !self.read_only,
             "передача уже началась — решения заморожены"
         );
+        anyhow::ensure!(!self.finished, "сессия уже завершена");
         let blob = self
             .plan
             .blob_for(path)
@@ -1012,6 +1152,9 @@ impl PreviewSession {
     /// Один шаг живой сессии: отправить новые локальные решения, принять
     /// входящие, сравнить сводки, при необходимости послать heartbeat.
     pub fn poll(&mut self, replica: &mut Replica) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         self.pump_local(replica)?;
 
         match try_recv_msg(&mut self.r)? {
@@ -1035,18 +1178,13 @@ impl PreviewSession {
                 self.diverged = hash != self.plan.decisions_hash();
             }
             Some(Msg::Heartbeat) => {}
-            Some(Msg::Commit { .. }) => {
-                // Этап 4: здесь будет применение выбранного. Пока честно
-                // отказываем, чтобы старая кнопка не притворялась commit.
-                self.send(&Msg::CommitAck {
-                    accepted: 0,
-                    rejected: 0,
-                    message: "commit появится на следующем этапе".into(),
-                })?;
+            Some(Msg::Commit { decisions_hash }) => {
+                self.accept_commit(replica, decisions_hash)?;
+                return Ok(());
             }
             Some(Msg::BlobNeed { .. }) => {
                 self.send(&Msg::Error {
-                    message: "обмен блобами в сессии ещё не включён".into(),
+                    message: "обмен блобами идёт внутри commit".into(),
                 })?;
             }
             Some(Msg::Error { message }) => bail!("пир вернул ошибку: {message}"),
@@ -1100,20 +1238,220 @@ impl PreviewSession {
         Ok(())
     }
 
+    // ------------------------------------------------------------ commit
+
+    /// Клиентская сторона commit: проверить план, обменяться операциями и
+    /// блобами, применить только после полной загрузки. При обрыве `.part`
+    /// остаётся на диске, решения — в БД, commit можно повторить.
+    pub fn commit(&mut self, replica: &mut Replica) -> Result<commit::Outcome> {
+        anyhow::ensure!(!self.finished, "сессия уже завершена");
+        anyhow::ensure!(!self.read_only, "передача уже началась");
+        commit::validate(replica, &self.plan)?;
+        self.read_only = true;
+
+        let hash = self.plan.decisions_hash();
+        self.commit_timeout()?;
+        let result = (|| -> Result<commit::Outcome> {
+            self.send(&Msg::Commit {
+                decisions_hash: hash,
+            })?;
+            match recv_msg(&mut self.r)? {
+                Msg::CommitGo => {}
+                Msg::Error { message } => bail!("пир отказал в commit: {message}"),
+                other => bail!("ожидали commit_go, получили {other:?}"),
+            }
+
+            let prepared = commit::prepare(replica, &self.plan)?;
+            self.send(&Msg::CommitPlan {
+                ops: prepared.ops.clone(),
+                needs: prepared.needs.clone(),
+            })?;
+            let peer_ops = match recv_msg(&mut self.r)? {
+                Msg::CommitPlan { ops, .. } => ops,
+                Msg::Error { message } => bail!("пир отказал в плане commit: {message}"),
+                other => bail!("ожидали commit_plan, получили {other:?}"),
+            };
+
+            let mut stats = SyncStats::default();
+            // 1. Тянем то, чего нет у нас.
+            self.receive_wanted(replica, &prepared.needs, &mut stats)?;
+            // 2. Отдаём то, что нужно пиру.
+            let root = replica.root()?.context("корень библиотеки не задан")?;
+            serve_wants_resumable(&mut self.r, &mut self.w, replica, &root, &mut stats)?;
+
+            self.send(&Msg::CommitReady)?;
+            match recv_msg(&mut self.r)? {
+                Msg::CommitReady => {}
+                Msg::Error { message } => bail!("пир не готов к commit: {message}"),
+                other => bail!("ожидали commit_ready, получили {other:?}"),
+            }
+
+            commit::apply_local(replica, &self.plan, &prepared)?;
+            let outcome = commit::finalize(replica, &self.plan, &peer_ops)?;
+            self.send(&Msg::CommitDone {
+                accepted: outcome.accepted,
+                rejected: outcome.rejected,
+            })?;
+            match recv_msg(&mut self.r)? {
+                Msg::CommitDone { .. } => {}
+                Msg::Error { message } => bail!("пир сообщил об ошибке commit: {message}"),
+                other => bail!("ожидали commit_done, получили {other:?}"),
+            }
+
+            commit::cleanup_staged(replica, &prepared.needs);
+            self.finish(replica)?;
+            Ok(outcome)
+        })();
+
+        let _ = self.session_tick();
+        result
+    }
+
+    /// Серверная сторона: пир прислал `Commit`. Проверяем хэш и план, затем
+    /// проходим тот же обмен, что и клиент, в зеркальном порядке.
+    fn accept_commit(&mut self, replica: &mut Replica, decisions_hash: String) -> Result<()> {
+        if self.read_only || self.finished {
+            let message = "commit уже начат или завершён".to_string();
+            let _ = self.send(&Msg::Error {
+                message: message.clone(),
+            });
+            bail!("{message}");
+        }
+        if decisions_hash != self.plan.decisions_hash() {
+            let message = "план разошёлся — обновите его".to_string();
+            let _ = self.send(&Msg::Error {
+                message: message.clone(),
+            });
+            bail!("{message}");
+        }
+        if let Err(e) = commit::validate(replica, &self.plan) {
+            let message = format!("{e:#}");
+            let _ = self.send(&Msg::Error {
+                message: message.clone(),
+            });
+            return Err(e);
+        }
+        self.read_only = true;
+        self.commit_timeout()?;
+
+        let result = (|| -> Result<()> {
+            self.send(&Msg::CommitGo)?;
+            let prepared = commit::prepare(replica, &self.plan)?;
+            self.send(&Msg::CommitPlan {
+                ops: prepared.ops.clone(),
+                needs: prepared.needs.clone(),
+            })?;
+            let peer_ops = match recv_msg(&mut self.r)? {
+                Msg::CommitPlan { ops, .. } => ops,
+                Msg::Error { message } => bail!("пир отказал: {message}"),
+                other => bail!("ожидали commit_plan, получили {other:?}"),
+            };
+
+            let mut stats = SyncStats::default();
+            // Зеркальный порядок: сначала отдаём то, что просит пир.
+            let root = replica.root()?.context("корень библиотеки не задан")?;
+            serve_wants_resumable(&mut self.r, &mut self.w, replica, &root, &mut stats)?;
+            // Потом тянем своё.
+            self.receive_wanted(replica, &prepared.needs, &mut stats)?;
+
+            self.send(&Msg::CommitReady)?;
+            match recv_msg(&mut self.r)? {
+                Msg::CommitReady => {}
+                Msg::Error { message } => bail!("пир не готов к commit: {message}"),
+                other => bail!("ожидали commit_ready, получили {other:?}"),
+            }
+
+            commit::apply_local(replica, &self.plan, &prepared)?;
+            let outcome = commit::finalize(replica, &self.plan, &peer_ops)?;
+            self.send(&Msg::CommitDone {
+                accepted: outcome.accepted,
+                rejected: outcome.rejected,
+            })?;
+            match recv_msg(&mut self.r)? {
+                Msg::CommitDone { .. } => {}
+                Msg::Error { message } => bail!("пир сообщил об ошибке commit: {message}"),
+                other => bail!("ожидали commit_done, получили {other:?}"),
+            }
+
+            commit::cleanup_staged(replica, &prepared.needs);
+            self.finish(replica)?;
+            Ok(())
+        })();
+
+        let _ = self.session_tick();
+        result
+    }
+
+    /// Попросить у пира блобы и принять их с докачкой.
+    fn receive_wanted(
+        &mut self,
+        replica: &mut Replica,
+        blobs: &[String],
+        stats: &mut SyncStats,
+    ) -> Result<()> {
+        let offsets: HashMap<String, u64> = blobs
+            .iter()
+            .map(|blob| (blob.clone(), commit::partial_offset(replica, blob)))
+            .collect();
+        self.send(&Msg::Want {
+            blobs: blobs.to_vec(),
+            offsets,
+        })?;
+        loop {
+            match recv_msg(&mut self.r)? {
+                Msg::BlobHead { blob, size, offset } => {
+                    receive_blob_resumable(&mut self.r, replica, &blob, size, offset, stats)?;
+                }
+                Msg::Done => return Ok(()),
+                Msg::Error { message } => bail!("пир не отдал блоб: {message}"),
+                other => bail!("ожидали блоб, получили {other:?}"),
+            }
+        }
+    }
+
+    /// Снять замороженный план и решения после успешного commit.
+    fn finish(&mut self, replica: &mut Replica) -> Result<()> {
+        replica.clear_plan(&self.peer_dev)?;
+        replica.clear_decisions(&self.peer_dev)?;
+        self.finished = true;
+        self.read_only = true;
+        Ok(())
+    }
+
+    fn commit_timeout(&self) -> Result<()> {
+        self.r
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(120)))?;
+        self.w
+            .get_ref()
+            .set_write_timeout(Some(Duration::from_secs(120)))?;
+        Ok(())
+    }
+
+    fn session_tick(&self) -> Result<()> {
+        self.r.get_ref().set_read_timeout(Some(SESSION_TICK))?;
+        Ok(())
+    }
+
     fn send(&mut self, msg: &Msg) -> Result<()> {
         send_msg(&mut self.w, msg)
     }
 
-    /// Серверный цикл: живёт, пока пир не закроет соединение.
+    /// Серверный цикл: живёт, пока commit не завершится или пир не закроет
+    /// соединение.
     fn run_with(
         mut self,
         replica: &mut Replica,
-        on_session: &mut dyn FnMut(&PreviewSession),
+        on_session: &mut dyn FnMut(&mut PreviewSession, &mut Replica),
     ) -> Result<SyncStats> {
         loop {
             self.poll(replica)?;
-            on_session(&self);
+            on_session(&mut self, replica);
+            if self.finished {
+                break;
+            }
         }
+        Ok(SyncStats::default())
     }
 
     pub fn close(&mut self) {
@@ -1138,7 +1476,7 @@ pub fn serve(
         match stream {
             Ok(s) => {
                 let peer = s.peer_addr().ok();
-                match serve_one(s, replica, token, &mut |_| {}) {
+                match serve_one(s, replica, token, &mut |_, _| {}) {
                     Ok(stats) => {
                         println!("сеанс {peer:?}: {}", stats.summary());
                         on_connection(&stats);
@@ -1174,7 +1512,7 @@ pub fn spawn_one(replica: Replica, bind: &str, token: String) -> Result<ServerHa
     let join = std::thread::spawn(move || {
         let mut replica = replica;
         let (stream, _) = listener.accept()?;
-        serve_one(stream, &mut replica, &token, &mut |_| {})
+        serve_one(stream, &mut replica, &token, &mut |_, _| {})
     });
     Ok(ServerHandle { addr, join })
 }
@@ -1399,12 +1737,13 @@ mod tests {
             &Msg::BlobHead {
                 blob: "b3:ab".into(),
                 size: 42,
+                offset: 0,
             },
         )
         .unwrap();
         let mut r = &buf[..];
         match recv_msg(&mut r).unwrap() {
-            Msg::BlobHead { blob, size } => {
+            Msg::BlobHead { blob, size, .. } => {
                 assert_eq!(blob, "b3:ab");
                 assert_eq!(size, 42);
             }

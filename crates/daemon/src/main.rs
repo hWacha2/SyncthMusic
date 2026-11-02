@@ -186,6 +186,8 @@ struct Runtime {
     peers: BTreeMap<String, PeerStatus>,
     active_peer: Option<ActivePeer>,
     session: Option<SessionStatus>,
+    /// Запрос commit для входящей сессии: её поток заберёт его на ближайшем шаге.
+    pending_commit: Option<Sender<Result<String, String>>>,
 }
 
 type Shared = Arc<Mutex<Runtime>>;
@@ -205,6 +207,7 @@ type Reply = Sender<Result<String, String>>;
 enum Cmd {
     Scan(Reply),
     Sync(Reply),
+    Commit(Reply),
     Connect {
         dev: String,
         reply: Reply,
@@ -384,8 +387,11 @@ fn run() -> Result<()> {
                     let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                     let seen_in_cb = seen.clone();
                     let runtime_in_cb = runtime.clone();
-                    let result =
-                        net::serve_stream_with(stream, &mut replica, &token, &mut |session| {
+                    let result = net::serve_stream_with(
+                        stream,
+                        &mut replica,
+                        &token,
+                        &mut |session, replica| {
                             *seen_in_cb.lock().unwrap() = Some(session.peer_dev.clone());
                             let snapshot =
                                 session_snapshot(session, peer_addr.clone(), since, "incoming");
@@ -406,7 +412,39 @@ fn run() -> Result<()> {
                                 since,
                             });
                             rt.session = Some(snapshot);
-                        });
+                            // На этой стороне сессия входящая: commit запускает
+                            // её же поток по запросу из UI.
+                            let request = rt.pending_commit.take();
+                            drop(rt);
+
+                            if let Some(reply) = request {
+                                match session.commit(replica) {
+                                    Ok(o) => {
+                                        let mut rt = runtime_in_cb.lock().unwrap();
+                                        rt.last_sync = Some(Hlc::wall_ms());
+                                        if !rt.disk_low {
+                                            rt.last_error = None;
+                                        }
+                                        if let Some(info) = rt.session.as_mut() {
+                                            info.read_only = true;
+                                        }
+                                        drop(rt);
+                                        let _ = reply.send(Ok(format!(
+                                            "Синхронизация завершена: принято {}, отклонено {}",
+                                            o.accepted, o.rejected
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        runtime_in_cb
+                                            .lock()
+                                            .unwrap()
+                                            .error(format!("commit: {e:#}"));
+                                        let _ = reply.send(Err(format!("{e:#}")));
+                                    }
+                                }
+                            }
+                        },
+                    );
                     let peer = seen.lock().unwrap().clone();
                     match result {
                         Ok(stats) => {
@@ -428,8 +466,11 @@ fn run() -> Result<()> {
                         }
                     }
                     // Сессия закончилась: не оставляем «подключено» висеть.
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(reply) = rt.pending_commit.take() {
+                        let _ = reply.send(Err("сессия завершилась до commit".into()));
+                    }
                     if let Some(peer) = peer {
-                        let mut rt = runtime.lock().unwrap();
                         let same = rt.active_peer.as_ref().is_some_and(|p| p.dev == peer);
                         let incoming = rt.session.as_ref().is_some_and(|s| s.source == "incoming");
                         if same && incoming {
@@ -517,6 +558,58 @@ fn worker(
             }
             Ok(Cmd::Sync(reply)) => {
                 let res = do_sync(&mut replica, &cfg, &runtime, true);
+                respond(reply, res, &runtime);
+            }
+            Ok(Cmd::Commit(reply)) => {
+                if session.is_none() {
+                    let mut rt = runtime.lock().unwrap();
+                    let incoming = rt.session.as_ref().is_some_and(|s| s.source == "incoming");
+                    if incoming {
+                        // Входящую сессию обслуживает другой поток; передаём
+                        // ему запрос и не отвечаем здесь.
+                        rt.pending_commit = Some(reply);
+                        continue;
+                    }
+                    drop(rt);
+                    respond(
+                        reply,
+                        Err(anyhow::anyhow!(
+                            "Нет соединения: сначала подключитесь к устройству"
+                        )),
+                        &runtime,
+                    );
+                    continue;
+                }
+                let (res, used) = match session.as_mut() {
+                    Some(active) => {
+                        let outcome = active.commit(&mut replica);
+                        match &outcome {
+                            Ok(o) => (
+                                Ok(format!(
+                                    "Синхронизация завершена: принято {}, отклонено {}",
+                                    o.accepted, o.rejected
+                                )),
+                                true,
+                            ),
+                            Err(e) => (Err(anyhow::anyhow!("{e:#}")), active.read_only),
+                        }
+                    }
+                    None => (Ok(String::new()), false),
+                };
+                if used {
+                    if let Some(mut old) = session.take() {
+                        old.close();
+                    }
+                    let mut rt = runtime.lock().unwrap();
+                    rt.session = None;
+                    rt.active_peer = None;
+                    if res.is_ok() {
+                        rt.last_sync = Some(Hlc::wall_ms());
+                        if !rt.disk_low {
+                            rt.last_error = None;
+                        }
+                    }
+                }
                 respond(reply, res, &runtime);
             }
             Ok(Cmd::Connect { dev, reply }) => {
@@ -1309,6 +1402,7 @@ fn api_action(ctx: &UiCtx, path: &str, request: &mut tiny_http::Request) -> Resu
     match path {
         "/api/scan" => run_cmd(&ctx.commands, Cmd::Scan),
         "/api/sync" => run_cmd(&ctx.commands, Cmd::Sync),
+        "/api/commit" => run_cmd(&ctx.commands, Cmd::Commit),
         "/api/plan/refresh" => run_cmd(&ctx.commands, Cmd::RefreshPlan),
         "/api/decision" => {
             let path = str_field(&body, "path")?;

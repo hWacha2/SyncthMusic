@@ -9,6 +9,7 @@
 //! Сканер только складывает пропажу в `pending_deletes`, а `entry_del`
 //! появляется после явного решения пользователя (`resolve`).
 
+pub mod commit;
 pub mod hlc;
 pub mod net;
 pub mod op;

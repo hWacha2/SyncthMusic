@@ -269,10 +269,14 @@ impl Plan {
     /// блоба: если изменится любой, решение устареет.
     pub fn blob_for(&self, path: &str) -> Option<String> {
         if let Some(conflict) = self.conflict(path) {
-            return Some(format!(
-                "{}|{}",
-                conflict.local_blob, conflict.remote_blob
-            ));
+            // Порядок блобов должен быть одинаковым на обеих сторонах:
+            // у каждой свой local/remote, но пара — одна и та же.
+            let (a, b) = if conflict.local_blob <= conflict.remote_blob {
+                (&conflict.local_blob, &conflict.remote_blob)
+            } else {
+                (&conflict.remote_blob, &conflict.local_blob)
+            };
+            return Some(format!("{a}|{b}"));
         }
         self.change(path).map(|change| change.blob.clone())
     }
@@ -381,6 +385,11 @@ impl Plan {
             .into_iter()
             .map(|row| row.path)
             .collect();
+        let conflicts: HashSet<&str> = self
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.path.as_str())
+            .collect();
 
         for change in &self.local {
             let Some(row) = by_path.get(change.path.as_str()) else {
@@ -406,6 +415,9 @@ impl Plan {
         // Появившийся новый локальный путь тоже делает план неполным.
         for row in &rows {
             if row.ignored || row.deleted {
+                continue;
+            }
+            if conflicts.contains(row.path.as_str()) {
                 continue;
             }
             let changed = row.blob != row.synced_blob;

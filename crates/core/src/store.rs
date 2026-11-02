@@ -869,6 +869,22 @@ impl Replica {
         )?)
     }
 
+    /// То же, но только для выбранных путей: commit не должен объявлять
+    /// согласованными отклонённые изменения и отложенные удаления.
+    pub fn confirm_synced_paths(&self, paths: &[String]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut changed = 0;
+        for path in paths {
+            changed += tx.execute(
+                "UPDATE entries SET synced_blob = blob
+                 WHERE path = ?1 AND deleted = 0 AND local_present = 1 AND synced_blob <> blob",
+                params![path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn ignored_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
