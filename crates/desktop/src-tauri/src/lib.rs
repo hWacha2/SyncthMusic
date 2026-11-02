@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PROTO};
+use syncth_core::transport::Transport;
 use syncth_core::Replica;
 
 const UI_ADDR: &str = "127.0.0.1:47889";
@@ -28,10 +30,25 @@ struct Desktop {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+struct AgentLink {
+    dev: String,
+    name: String,
+    addr: String,
+    token: String,
+    root: Option<String>,
+    /// Серийный номер ADB, если связь идёт по USB. Тогда адрес получается
+    /// через `adb forward` и обновляется при каждом подключении.
+    serial: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Config {
     root: Option<String>,
     data_dir: Option<String>,
     daemon_bin: Option<String>,
+    /// Сопряжённый Android-агент. Путь к папке хранится здесь, на ПК.
+    agent: Option<AgentLink>,
 }
 
 // ------------------------------------------------------------------ paths
@@ -187,6 +204,397 @@ where
     tauri::async_runtime::spawn_blocking(f)
         .await
         .map_err(|e| format!("Фоновая задача упала: {e}"))?
+}
+
+// ------------------------------------------------------------------ android agent
+
+#[derive(Debug, Clone)]
+struct HelloInfo {
+    dev: String,
+    name: String,
+    root: Option<String>,
+    token: String,
+    /// `true`, если соединение уже было сопряжено и токен пришёл из конфига.
+    remembered: bool,
+}
+
+fn pc_identity() -> Result<AgentIdentity, String> {
+    let config = load_config();
+    let data_dir = effective_data_dir(&config);
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let replica = Replica::open(&data_dir, &default_device_id(&data_dir))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(AgentIdentity {
+        dev: replica.device_id().to_string(),
+        name: replica.device_name().to_string(),
+        pk: replica.public_key(),
+    })
+}
+
+fn agent_stream(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
+    let address: SocketAddr = addr
+        .parse()
+        .map_err(|_| format!("некорректный адрес: {addr}"))?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(4))
+        .map_err(|e| format!("не удалось подключиться к {addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    Ok(stream)
+}
+
+/// Открывает соединение, здоровается и при необходимости проводит сопряжение.
+///
+/// ПК всегда инициатор. Телефон только подтверждает запрос, поэтому вызов
+/// может ждать ответа пользователя на телефоне.
+fn agent_open(
+    addr: &str,
+    link: Option<&AgentLink>,
+    timeout: Duration,
+) -> Result<(Box<dyn Transport>, HelloInfo), String> {
+    let identity = pc_identity()?;
+    let stream = agent_stream(addr, timeout)?;
+    let mut transport: Box<dyn Transport> = Box::new(stream);
+
+    agent::send(
+        transport.as_mut(),
+        &AgentMsg::Hello {
+            dev: identity.dev.clone(),
+            name: identity.name.clone(),
+            pk: identity.pk.clone(),
+            proto: AGENT_PROTO,
+            token: link.map(|link| link.token.clone()),
+        },
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    let ack = agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))?;
+    let (remote_dev, remote_name, paired, remote_root) = match ack {
+        AgentMsg::HelloAck {
+            dev,
+            name,
+            proto,
+            paired,
+            root,
+            ..
+        } => {
+            if proto != AGENT_PROTO {
+                return Err(format!(
+                    "версия протокола не совпадает: {proto} вместо {AGENT_PROTO}"
+                ));
+            }
+            (dev, name, paired, root)
+        }
+        AgentMsg::Error { message } => return Err(message),
+        other => return Err(format!("телефон ответил неожиданно: {other:?}")),
+    };
+
+    if let Some(link) = link {
+        if link.dev != remote_dev {
+            return Err("подключилось другое устройство".to_string());
+        }
+    }
+
+    if !paired {
+        agent::send(
+            transport.as_mut(),
+            &AgentMsg::PairAsk {
+                dev: identity.dev.clone(),
+                name: identity.name.clone(),
+                pk: identity.pk.clone(),
+            },
+        )
+        .map_err(|e| format!("{e:#}"))?;
+
+        let token = match agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))? {
+            AgentMsg::PairOk { token } => token,
+            AgentMsg::PairNo { reason } => return Err(reason),
+            AgentMsg::Error { message } => return Err(message),
+            other => return Err(format!("телефон ответил неожиданно: {other:?}")),
+        };
+
+        return Ok((
+            transport,
+            HelloInfo {
+                dev: remote_dev,
+                name: remote_name,
+                root: remote_root,
+                token,
+                remembered: false,
+            },
+        ));
+    }
+
+    let token = link
+        .map(|link| link.token.clone())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "телефон считает ПК сопряжённым, но токена нет".to_string())?;
+
+    Ok((
+        transport,
+        HelloInfo {
+            dev: remote_dev,
+            name: remote_name,
+            root: remote_root,
+            token,
+            remembered: true,
+        },
+    ))
+}
+
+fn save_agent_link(link: AgentLink) -> Result<(), String> {
+    let mut config = load_config();
+    config.agent = Some(link);
+    save_config(&config)
+}
+
+fn run_adb(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("adb")
+        .args(args)
+        .output()
+        .map_err(|e| format!("adb не найден: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "adb вернул ошибку".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn adb_forward(serial: &str) -> Result<String, String> {
+    let text = run_adb(&["-s", serial, "forward", "tcp:0", "tcp:47890"])?;
+    let port = text
+        .trim()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("adb не выдал порт: {}", text.trim()))?;
+    Ok(format!("127.0.0.1:{port}"))
+}
+
+fn link_addr(link: &AgentLink) -> Result<String, String> {
+    if let Some(serial) = link.serial.as_deref().filter(|value| !value.is_empty()) {
+        return adb_forward(serial);
+    }
+    if link.addr.is_empty() {
+        return Err("адрес устройства не сохранён".to_string());
+    }
+    Ok(link.addr.clone())
+}
+
+#[tauri::command]
+async fn discover_adb() -> Result<Value, String> {
+    blocking(|| {
+        let text = run_adb(&["devices", "-l"])?;
+        let mut devices = Vec::new();
+        for line in text.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(serial) = parts.next() else {
+                continue;
+            };
+            let state = parts.next().unwrap_or_default();
+            if !matches!(state, "device" | "unauthorized" | "offline") {
+                continue;
+            }
+            let mut model = String::new();
+            for field in parts {
+                if let Some(value) = field.strip_prefix("model:") {
+                    model = value.replace('_', " ");
+                }
+            }
+            devices.push(json!({
+                "serial": serial,
+                "model": if model.is_empty() { serial.to_string() } else { model },
+                "state": state,
+            }));
+        }
+        Ok(json!({ "devices": devices }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn discover_agents() -> Result<Value, String> {
+    blocking(|| {
+        let devices = agent::discover(Duration::from_millis(1400))
+            .map_err(|e| format!("{e:#}"))?;
+        let linked = load_config().agent.map(|link| link.dev);
+        Ok(json!({ "devices": devices, "linked": linked }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn agent_connect(addr: String, dev: Option<String>) -> Result<Value, String> {
+    blocking(move || {
+        let config = load_config();
+        let link = config.agent.as_ref();
+        let link = match (link, dev.as_deref()) {
+            (Some(link), Some(dev)) if link.dev == dev => Some(link.clone()),
+            (Some(_), None) => link.cloned(),
+            _ => None,
+        };
+
+        let (mut transport, info) = agent_open(
+            addr.trim(),
+            link.as_ref(),
+            Duration::from_secs(125),
+        )?;
+
+        save_agent_link(AgentLink {
+            dev: info.dev.clone(),
+            name: info.name.clone(),
+            addr: addr.trim().to_string(),
+            token: info.token.clone(),
+            root: info.root.clone(),
+            serial: None,
+        })?;
+
+        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+
+        Ok(json!({
+            "dev": info.dev,
+            "name": info.name,
+            "addr": addr.trim(),
+            "root": info.root,
+            "remembered": info.remembered,
+            "needs_root": info.root.is_none(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn agent_connect_adb(serial: String) -> Result<Value, String> {
+    blocking(move || {
+        let config = load_config();
+        let link = config
+            .agent
+            .as_ref()
+            .filter(|link| link.serial.as_deref() == Some(serial.as_str()))
+            .cloned();
+
+        let addr = adb_forward(&serial)?;
+        let (mut transport, info) =
+            agent_open(&addr, link.as_ref(), Duration::from_secs(125))?;
+
+        save_agent_link(AgentLink {
+            dev: info.dev.clone(),
+            name: info.name.clone(),
+            addr: addr.clone(),
+            token: info.token.clone(),
+            root: info.root.clone(),
+            serial: Some(serial.clone()),
+        })?;
+
+        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+
+        Ok(json!({
+            "dev": info.dev,
+            "name": info.name,
+            "addr": addr,
+            "serial": serial,
+            "root": info.root,
+            "remembered": info.remembered,
+            "needs_root": info.root.is_none(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn agent_request_root_change() -> Result<Value, String> {
+    blocking(move || {
+        let link = load_config()
+            .agent
+            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
+        let addr = link_addr(&link)?;
+        let (mut transport, _) = agent_open(&addr, Some(&link), Duration::from_secs(310))?;
+        agent::send(transport.as_mut(), &AgentMsg::RequestRootChange)
+            .map_err(|e| format!("{e:#}"))?;
+
+        let root = match agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))? {
+            AgentMsg::RootChanged { path } => path,
+            AgentMsg::Error { message } => return Err(message),
+            other => return Err(format!("телефон ответил неожиданно: {other:?}")),
+        };
+        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+
+        let mut updated = link;
+        updated.root = Some(root.clone());
+        save_agent_link(updated)?;
+        Ok(json!({ "root": root }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn agent_scan() -> Result<Value, String> {
+    blocking(move || {
+        let link = load_config()
+            .agent
+            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
+        let addr = link_addr(&link)?;
+        let (mut transport, _) = agent_open(&addr, Some(&link), Duration::from_secs(610))?;
+        agent::send(transport.as_mut(), &AgentMsg::Scan).map_err(|e| format!("{e:#}"))?;
+
+        let (root, entries) = match agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))? {
+            AgentMsg::Manifest { root, entries } => (root, entries),
+            AgentMsg::Error { message } => return Err(message),
+            other => return Err(format!("телефон ответил неожиданно: {other:?}")),
+        };
+        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+
+        let total: u64 = entries.iter().map(|entry| entry.size).sum();
+        let preview = entries
+            .iter()
+            .take(200)
+            .map(|entry| json!({ "path": entry.path, "size": entry.size }))
+            .collect::<Vec<_>>();
+
+        let mut updated = link;
+        updated.root = Some(root.clone());
+        save_agent_link(updated)?;
+
+        Ok(json!({
+            "root": root,
+            "count": entries.len(),
+            "total": total,
+            "preview": preview,
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+fn agent_link() -> Value {
+    match load_config().agent {
+        Some(link) => json!({
+            "linked": true,
+            "dev": link.dev,
+            "name": link.name,
+            "addr": link.addr,
+            "root": link.root,
+            "serial": link.serial,
+        }),
+        None => json!({ "linked": false }),
+    }
+}
+
+#[tauri::command]
+fn agent_forget() -> Result<Value, String> {
+    let mut config = load_config();
+    config.agent = None;
+    save_config(&config)?;
+    Ok(json!({ "linked": false }))
 }
 
 // ------------------------------------------------------------------ commands
@@ -595,6 +1003,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            discover_agents,
+            discover_adb,
+            agent_connect,
+            agent_connect_adb,
+            agent_request_root_change,
+            agent_scan,
+            agent_link,
+            agent_forget,
             daemon_status,
             daemon_pair_code,
             daemon_plan,

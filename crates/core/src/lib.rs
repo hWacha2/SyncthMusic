@@ -9,6 +9,7 @@
 //! Сканер только складывает пропажу в `pending_deletes`, а `entry_del`
 //! появляется после явного решения пользователя (`resolve`).
 
+pub mod agent;
 pub mod commit;
 pub mod hlc;
 pub mod net;
@@ -19,6 +20,7 @@ pub mod plan;
 pub mod resolve;
 pub mod scan;
 pub mod store;
+pub mod transport;
 pub mod vault;
 
 pub use hlc::Hlc;

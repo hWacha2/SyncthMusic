@@ -18,6 +18,7 @@ use syncth_core::plan::{self, Decision, PathDecision};
 use syncth_core::{net, resolve, scan, store::Replica, Action, Hlc};
 use tauri::Manager;
 
+mod agent;
 mod media;
 mod server;
 
@@ -753,6 +754,7 @@ fn probe_root(path: String) -> Value {
 pub fn run() {
     tauri::Builder::default()
         .manage(Mobile::default())
+        .manage(agent::AgentRuntime::default())
         // Отладочный канал для прогона интерфейса без кликов; в релизе нет.
         .setup(|app| {
             // Сессия живёт только пока приложение открыто: сокет не переживает
@@ -760,8 +762,8 @@ pub fn run() {
             if let Ok(replica) = open(app.handle()) {
                 let _ = replica.set_meta("session_peer", "");
             }
-            // Пока приложение открыто, ПК может подключиться первым.
-            server::ensure_started(app.handle().clone());
+            // Запускаем минимальный агент: он слушает ПК и отдаёт выбранную папку.
+            agent::init(app.handle().clone());
             #[cfg(debug_assertions)]
             if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
                 use tauri::Manager;
@@ -779,6 +781,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             browse_dirs,
+            agent::agent_info,
+            agent::agent_set_root,
+            agent::agent_pair_decision,
+            agent::agent_forget,
             status,
             sync_plan,
             set_plan_decision,

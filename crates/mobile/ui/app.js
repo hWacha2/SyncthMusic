@@ -9,6 +9,9 @@ const state = {
   note: '',
   error: false,
   pickerOpen: false,
+  pickerReason: 'request',
+  rootChangeSeen: false,
+  pairBusy: false,
   browser: {
     path: null,
     parent: null,
@@ -46,17 +49,10 @@ function iconFolder() {
   </svg>`;
 }
 
-function iconMonitor() {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <rect x="3.5" y="4.5" width="17" height="12" rx="2"/>
-    <path d="M9 20h6M12 16.5V20"/>
-  </svg>`;
-}
-
 function iconPhone() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <rect x="7" y="3" width="10" height="18" rx="2.4"/>
-    <path d="M10.5 18h3"/>
+    <rect x="7.5" y="2.5" width="9" height="19" rx="2.6"/>
+    <path d="M10.5 18.5h3"/>
   </svg>`;
 }
 
@@ -75,51 +71,62 @@ function topbar() {
   </header>`;
 }
 
-function devicesView() {
-  return `<aside class="devices" aria-hidden="true">
-    <div class="device">
-      <span class="device-icon">${iconMonitor()}</span>
-      <span class="device-label">${esc(t('map.this'))}</span>
-    </div>
-    <span class="device-line"></span>
-    <div class="device">
-      <span class="device-icon">${iconPhone()}</span>
-      <span class="device-label">${esc(t('map.peer'))}</span>
-    </div>
-    <p class="devices-note">${esc(t('map.note'))}</p>
-  </aside>`;
-}
+function waitingView() {
+  const info = state.info || {};
+  const statusError = info.error
+    ? `<p class="agent-error" role="alert">${esc(t('agent.error', { error: info.error }))}</p>`
+    : '';
 
-function welcomeView() {
-  const note = state.error
-    ? `<p class="welcome-note is-error" role="alert">${esc(state.note)}</p>`
-    : `<p class="welcome-note">${esc(state.note)}</p>`;
-
-  return `<section class="welcome">
+  return `<section class="wait">
     ${topbar()}
-    <div class="welcome-copy">
-      <h1 class="welcome-title">${esc(t('start.title'))}</h1>
-      <p class="welcome-text">${esc(t('start.text'))}</p>
-      ${devicesView()}
+    <div class="wait-center">
+      <div class="wait-orb">
+        <span class="wait-ring" aria-hidden="true"></span>
+        <span class="wait-ring wait-ring--late" aria-hidden="true"></span>
+        ${iconPhone()}
+      </div>
+      <div class="wait-copy">
+        <h1 class="wait-title">${esc(t('wait.title'))}</h1>
+        <p class="wait-hint">${esc(t('wait.hint'))}</p>
+      </div>
+      ${statusError}
     </div>
-    <div class="welcome-actions">
-      ${note}
-      <button class="choose" id="choose" ${state.busy ? 'disabled' : ''}>
-        ${iconFolder()}
-        <span>${esc(state.busy ? t('start.scanning') : t('start.action'))}</span>
-      </button>
-    </div>
+    <div class="wait-foot">${esc(info.name || '')}</div>
   </section>`;
 }
 
-function workspaceView() {
-  return `<section class="workspace">
+function readyView() {
+  const info = state.info || {};
+  const pairs = Array.isArray(info.pairs) ? info.pairs : [];
+  const pairRows = pairs.length
+    ? pairs.map((pair) => `<div class="pair-row">
+        <span class="status-dot is-on" aria-hidden="true"></span>
+        <span class="pair-name">${esc(pair.name || pair.dev)}</span>
+      </div>`).join('')
+    : '';
+
+  const statusError = info.error
+    ? `<p class="agent-error" role="alert">${esc(t('agent.error', { error: info.error }))}</p>`
+    : '';
+
+  return `<section class="ready">
     ${topbar()}
-    <div class="workspace-head">
-      <span class="workspace-label">${esc(t('workspace.label'))}</span>
-      <span class="workspace-path">${esc(state.root)}</span>
+    <div class="ready-head">
+      <span class="status-dot is-on" aria-hidden="true"></span>
+      <h1 class="ready-title">${esc(t('ready.title'))}</h1>
     </div>
-    <div class="workspace-body"></div>
+    ${statusError}
+    <div class="ready-field">
+      <div class="field-label">${esc(t('agent.folder'))}</div>
+      <div class="folder-path">${esc(state.root || '')}</div>
+      <button class="ghost" id="change-root" ${state.busy ? 'disabled' : ''}>
+        ${esc(t('agent.change'))}
+      </button>
+    </div>
+    <div class="ready-field">
+      <div class="field-label">${esc(t('agent.paired'))}</div>
+      ${pairRows || `<div class="pair-empty">${esc(t('agent.no_pairs'))}</div>`}
+    </div>
   </section>`;
 }
 
@@ -151,12 +158,15 @@ function pickerView() {
       </button>`
     : '';
 
+  const banner = `<div class="picker-banner">${esc(t('picker.request'))}</div>`;
+
   return `<section class="picker">
     <header class="picker-head">
       <button class="picker-close" data-picker-close aria-label="${esc(t('picker.cancel'))}">${iconClose()}</button>
-      <span class="picker-title">${esc(t('picker.title'))}</span>
+      <span class="picker-title">${esc(t('picker.change'))}</span>
       <span></span>
     </header>
+    ${banner}
     <div class="picker-path">${esc(browser.path || '')}</div>
     <div class="picker-list">
       ${up}
@@ -170,18 +180,38 @@ function pickerView() {
   </section>`;
 }
 
+function pairView() {
+  const pending = state.info?.pending;
+  if (!pending) return '';
+  return `<div class="pair">
+    <div class="pair-card">
+      <div class="pair-label">${esc(t('pair.title'))}</div>
+      <div class="pair-title">${esc(pending.name || pending.dev)}</div>
+      <div class="pair-actions">
+        <button class="choose" data-pair-accept ${state.pairBusy ? 'disabled' : ''}>${esc(t('pair.accept'))}</button>
+        <button class="ghost" data-pair-reject ${state.pairBusy ? 'disabled' : ''}>${esc(t('pair.reject'))}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function render() {
   const screen = document.getElementById('screen');
   const picker = document.getElementById('picker');
-  if (!screen || !picker) return;
+  const pair = document.getElementById('pair');
+  if (!screen || !picker || !pair) return;
 
-  if (state.view === 'welcome') screen.innerHTML = welcomeView();
-  else if (state.view === 'workspace') screen.innerHTML = workspaceView();
+  if (state.view === 'ready') screen.innerHTML = readyView();
+  else if (state.view === 'waiting') screen.innerHTML = waitingView();
   else if (state.view === 'error') screen.innerHTML = `<div class="fatal">${esc(state.note)}</div>`;
   else screen.innerHTML = '';
 
   picker.hidden = !state.pickerOpen;
   picker.innerHTML = state.pickerOpen ? pickerView() : '';
+
+  const pending = state.info?.pending;
+  pair.hidden = !pending;
+  pair.innerHTML = pending ? pairView() : '';
 }
 
 async function browse(path) {
@@ -209,7 +239,7 @@ async function browse(path) {
 }
 
 function openPicker() {
-  if (state.busy || !invoke) return;
+  if (state.busy || !invoke || state.pickerOpen) return;
   state.pickerOpen = true;
   state.browser = { path: null, parent: null, entries: [], loading: true, error: '' };
   if (!window.history.state?.syncthPicker) window.history.pushState({ syncthPicker: true }, '');
@@ -230,21 +260,58 @@ async function useFolder() {
   closePicker();
   state.busy = true;
   state.error = false;
-  state.note = path;
-  state.view = 'welcome';
   render();
 
   try {
-    const result = await invoke('init_library', { root: path });
-    state.root = result?.status?.root || path;
-    state.view = 'workspace';
+    state.info = await invoke('agent_set_root', { path });
+    state.root = state.info?.root || path;
+    state.view = 'ready';
     state.note = '';
   } catch (error) {
     state.error = true;
-    state.note = t('error.init', { error: message(error) });
-    state.view = 'welcome';
+    state.note = t('error.root', { error: message(error) });
+    state.view = state.root ? 'ready' : 'waiting';
   } finally {
     state.busy = false;
+    render();
+  }
+}
+
+async function pairDecision(accept) {
+  if (state.pairBusy) return;
+  state.pairBusy = true;
+  render();
+  try {
+    state.info = await invoke('agent_pair_decision', { accept });
+  } catch (error) {
+    state.error = true;
+    state.note = message(error);
+  } finally {
+    state.pairBusy = false;
+    render();
+  }
+}
+
+async function refresh() {
+  if (!invoke) return;
+  try {
+    const info = await invoke('agent_info');
+    state.info = info;
+    state.root = info.root || null;
+    if (state.view !== 'loading' && state.view !== 'error') {
+      state.view = info.root ? 'ready' : 'waiting';
+    }
+
+    if (info.root_change && !state.rootChangeSeen && !state.pickerOpen && !state.busy) {
+      state.rootChangeSeen = true;
+      openPicker();
+    }
+    if (!info.root_change) state.rootChangeSeen = false;
+
+    render();
+  } catch (error) {
+    state.view = 'error';
+    state.note = message(error);
     render();
   }
 }
@@ -260,18 +327,19 @@ async function boot() {
   }
 
   try {
-    state.info = await invoke('app_info');
-    state.root = state.info?.info?.root || null;
-    state.view = state.root ? 'workspace' : 'welcome';
+    state.info = await invoke('agent_info');
+    state.root = state.info?.root || null;
+    state.view = state.root ? 'ready' : 'waiting';
   } catch (error) {
     state.view = 'error';
     state.note = message(error);
   }
   render();
+  setInterval(refresh, 1000);
 }
 
 document.addEventListener('click', (event) => {
-  if (event.target.closest('#choose')) {
+  if (event.target.closest('#change-root')) {
     openPicker();
     return;
   }
@@ -294,6 +362,16 @@ document.addEventListener('click', (event) => {
 
   if (event.target.closest('[data-picker-use]')) {
     useFolder();
+    return;
+  }
+
+  if (event.target.closest('[data-pair-accept]')) {
+    pairDecision(true);
+    return;
+  }
+
+  if (event.target.closest('[data-pair-reject]')) {
+    pairDecision(false);
   }
 });
 
@@ -308,6 +386,6 @@ window.addEventListener('popstate', () => {
   }
 });
 
-window.__syncth = { state, boot, render, openPicker, closePicker, browse, useFolder };
+window.__syncth = { state, boot, render, openPicker, closePicker, browse, useFolder, pairDecision, refresh };
 
 boot();

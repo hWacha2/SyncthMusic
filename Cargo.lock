@@ -4158,6 +4158,8 @@ dependencies = [
 name = "syncth-mobile"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "getrandom 0.4.3",
  "jni",
  "ndk-context",
  "serde",

@@ -1521,16 +1521,39 @@ pub fn spawn_one(replica: Replica, bind: &str, token: String) -> Result<ServerHa
 
 const DISCOVERY_MAGIC: &[u8] = b"SYNCTH-DISCOVER-V1";
 
+/// Устройство, ответившее на broadcast-запрос.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Discovered {
+    pub dev: String,
+    #[serde(default)]
+    pub name: String,
+    pub addr: String,
+    /// `agent` — минимальный Android-агент, `sync` — старый демон синхронизации.
+    #[serde(default)]
+    pub role: String,
+}
+
 pub fn start_discovery(dev: String, port: u16) -> Result<()> {
+    start_discovery_with(dev, String::new(), port, "sync".into())
+}
+
+/// Отвечает на broadcast-запросы, добавляя имя и роль устройства.
+pub fn start_discovery_with(dev: String, name: String, port: u16, role: String) -> Result<()> {
     std::thread::spawn(move || {
         let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
             return;
         };
         let _ = sock.set_broadcast(true);
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 512];
         while let Ok((n, from)) = sock.recv_from(&mut buf) {
             if &buf[..n] == DISCOVERY_MAGIC {
-                let reply = format!("{{\"dev\":\"{dev}\",\"port\":{port}}}");
+                let reply = serde_json::json!({
+                    "dev": dev,
+                    "name": name,
+                    "port": port,
+                    "role": role,
+                })
+                .to_string();
                 let _ = sock.send_to(reply.as_bytes(), from);
             }
         }
@@ -1538,15 +1561,15 @@ pub fn start_discovery(dev: String, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Ищет устройства в локальной сети. Возвращает (dev, адрес).
-pub fn discover(timeout: Duration) -> Result<Vec<(String, String)>> {
+/// Ищет все устройства в локальной сети, сохраняя имя, адрес и роль.
+pub fn discover_all(timeout: Duration) -> Result<Vec<Discovered>> {
     let sock = UdpSocket::bind(("0.0.0.0", 0))?;
     sock.set_broadcast(true)?;
     sock.send_to(DISCOVERY_MAGIC, ("255.255.255.255", DISCOVERY_PORT))?;
     sock.set_read_timeout(Some(timeout))?;
 
     let mut found = Vec::new();
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 512];
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         match sock.recv_from(&mut buf) {
@@ -1556,7 +1579,20 @@ pub fn discover(timeout: Duration) -> Result<Vec<(String, String)>> {
                         v.get("dev").and_then(|x| x.as_str()),
                         v.get("port").and_then(|x| x.as_u64()),
                     ) {
-                        found.push((dev.to_string(), format!("{}:{port}", from.ip())));
+                        found.push(Discovered {
+                            dev: dev.to_string(),
+                            name: v
+                                .get("name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            addr: format!("{}:{port}", from.ip()),
+                            role: v
+                                .get("role")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("sync")
+                                .to_string(),
+                        });
                     }
                 }
             }
@@ -1564,6 +1600,14 @@ pub fn discover(timeout: Duration) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(found)
+}
+
+/// Ищет устройства в локальной сети. Возвращает (dev, адрес).
+pub fn discover(timeout: Duration) -> Result<Vec<(String, String)>> {
+    Ok(discover_all(timeout)?
+        .into_iter()
+        .map(|item| (item.dev, item.addr))
+        .collect())
 }
 
 /// Отклонить входящее соединение понятной ошибкой (например, мало места).
