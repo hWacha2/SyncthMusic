@@ -39,6 +39,7 @@ const I18N = (() => {
     'time.hoursAgo': '{n} ч назад',
     'time.daysAgo': '{n} дн назад',
 
+    'nav.overview': 'Обзор',
     'tab.overview': 'Обзор',
     'tab.pending': 'Удаления',
     'tab.conflicts': 'Конфликты',
@@ -211,6 +212,7 @@ const I18N = (() => {
     'time.hoursAgo': '{n} h ago',
     'time.daysAgo': '{n} d ago',
 
+    'nav.overview': 'Overview',
     'tab.overview': 'Overview',
     'tab.pending': 'Deletions',
     'tab.conflicts': 'Conflicts',

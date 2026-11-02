@@ -149,7 +149,6 @@ function setupScreen() {
   const picks = candidates.slice(0, 8).map((c) =>
     `<button class="pick" data-pick="${esc(c.path)}">${esc(c.name)}</button>`).join('');
   return `<section class="panel">
-    <div class="kicker">${esc(t('setup.kicker'))}</div>
     <h1 class="hero-title">${esc(t('setup.title'))}</h1>
     <p class="hero-hint">${esc(t('setup.hint'))}</p>
     <div class="field">
@@ -200,7 +199,7 @@ function overviewView(snap) {
   <section class="panel">
     <div class="hero">
       <div class="hero-text">
-        <div class="kicker">${esc(t('overview.kicker'))}</div>
+        <div class="kicker">${esc(t('nav.overview'))}${root ? ` <span class="kicker-path">${esc(root)}</span>` : ''}</div>
         <h1 class="hero-title">${esc(title)}</h1>
         <p class="hero-hint">${esc(hint)}</p>
       </div>
@@ -293,8 +292,7 @@ function pendingView(snap) {
     </div>`).join('');
 
   return `<section class="panel">
-      <div class="kicker">${esc(t('queue.kicker'))}</div>
-      <h1 class="hero-title">${esc(snap.pending.length ? t('queue.title') : t('queue.titleEmpty'))}</h1>
+      <h1 class="hero-title">${esc(t('queue.title'))}</h1>
       <p class="hero-hint">${esc(t('queue.hint'))}</p>
     </section>
     <section class="panel panel--flat">
@@ -354,7 +352,7 @@ function moreView(snap) {
     </div>`).join('');
 
   return `<section class="panel">
-      <h1 class="hero-title">${esc(t('pair.title'))}</h1>
+      <h1 class="hero-title">${esc(t('tab.more'))}</h1>
       <p class="hero-hint">${esc(t('pair.hint'))}</p>
       <div class="actions">
         <button class="btn btn--primary" data-act="pair-code">${icon('qr')}${esc(t('pair.myCode'))}</button>
@@ -403,7 +401,7 @@ function moreView(snap) {
     </section>
 
     <section class="panel panel--flat">
-      <div class="panel-head"><span class="kicker">${esc(t('pair.about'))}</span></div>
+      <div class="panel-head"><span class="panel-title">${esc(t('pair.about'))}</span></div>
       <div class="row-meta">${esc(t('pair.version', { v: (state.info && state.info.version) || '' }))}</div>
       <div class="row-meta">${esc(t('pair.device', { dev: snap.device || '' }))}</div>
       <div class="row-meta">${esc(t('pair.port', { port: (state.info && state.info.sync_port) || 47887 }))}</div>

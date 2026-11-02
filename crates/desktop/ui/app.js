@@ -270,12 +270,9 @@ function chrome(snap, copy) {
   $('#progress').hidden = !state.busy;
 }
 
-function viewHead(kicker, title, sub, actions = '') {
-  const plain = (value) => String(value == null ? '' : value).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-  const showKicker = plain(kicker).toLowerCase() !== plain(title).toLowerCase();
+function viewHead(_kicker, title, sub, actions = '') {
   return `<div class="view-head">
     <div>
-      ${showKicker ? `<div class="eyebrow">${esc(kicker)}</div>` : ''}
       <h1 class="view-title">${title}</h1>
       ${sub ? `<p class="view-sub">${sub}</p>` : ''}
     </div>
@@ -356,7 +353,7 @@ function renderOverview() {
         <div class="node-ico hot">${icon('pc')}</div>
         <div><b>${esc(t('node.thisPc'))}</b><span>${esc(snap.device || t('common.dash'))}</span></div>
       </div>
-      <div class="wire ${connected ? '' : 'is-idle'}">
+      <div class="wire ${connected ? '' : 'is-idle'} ${status && status.state === 'syncing' ? 'is-live' : ''}">
         <span class="pulse"></span><span class="pulse"></span><span class="pulse"></span>
       </div>
       <div class="node">
