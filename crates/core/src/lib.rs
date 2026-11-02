@@ -14,6 +14,7 @@ pub mod net;
 pub mod op;
 pub mod path;
 pub mod pipe;
+pub mod plan;
 pub mod resolve;
 pub mod scan;
 pub mod store;
@@ -21,9 +22,13 @@ pub mod vault;
 
 pub use hlc::Hlc;
 pub use op::{Op, OpKind};
+pub use plan::{
+    build as build_plan, Change, ChangeKind, Conflict, ConflictReason, Decision, DecisionSet, Plan,
+    PathDecision, Side, PLAN_TTL_MS,
+};
 pub use resolve::{resolve, Action, Outcome};
 pub use scan::{scan, ScanReport};
-pub use store::{EntryRow, Peer, PendingDelete, Replica, VaultRow};
+pub use store::{EntryRow, Peer, PendingDelete, PlanRow, Replica, VaultRow};
 
 /// Понятное человеку имя устройства. Не заменяет `device_id`: тот остаётся
 /// стабильным, а имя можно менять (переименование ПК, `SYNCTH_DEVICE_NAME`).

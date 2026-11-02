@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
+use crate::plan::{Decision, DecisionSet, PathDecision, Plan};
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -97,6 +98,30 @@ CREATE TABLE IF NOT EXISTS peers (
     addr     TEXT NOT NULL,
     added_at INTEGER NOT NULL
 );
+
+-- Замороженный план сеанса: один на пару устройств. Живёт 15 минут и
+-- перестраивается при новом скане или изменении блоба.
+CREATE TABLE IF NOT EXISTS sync_plans (
+    peer_dev   TEXT PRIMARY KEY,
+    plan_json  TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+-- Решения человека по путям. Не операции журнала: своя таблица, своя жизнь.
+-- `blob` фиксирует содержимое, к которому относится решение: если блоб
+-- изменился или путь исчез, решение больше не применяется.
+CREATE TABLE IF NOT EXISTS plan_decisions (
+    peer_dev    TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    blob        TEXT NOT NULL,
+    hlc_ms      INTEGER NOT NULL,
+    hlc_counter INTEGER NOT NULL,
+    dev         TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (peer_dev, path)
+);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +165,21 @@ pub struct Peer {
     pub dev: String,
     pub addr: String,
     pub name: String,
+}
+
+/// Полное состояние пути для построения плана. В отличие от `EntryRow`
+/// здесь видны локальные флаги и согласованная база `synced_blob`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRow {
+    pub path: String,
+    pub blob: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub added_at: u64,
+    pub deleted: bool,
+    pub present: bool,
+    pub ignored: bool,
+    pub synced_blob: String,
 }
 
 impl Replica {
@@ -198,7 +238,7 @@ impl Replica {
                 [],
             )?;
         }
-        self.set_meta("schema_version", "4")?;
+        self.set_meta("schema_version", "5")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
                 // Идентичность устройства стабильна: она важнее аргумента CLI.
@@ -333,6 +373,160 @@ impl Replica {
             .conn
             .execute("DELETE FROM peers WHERE dev = ?1", params![dev])?
             > 0)
+    }
+
+    // ---------------------------------------------------------------- plan
+
+    /// Все пути с локальными флагами — вход для построения плана.
+    pub fn plan_rows(&self) -> Result<Vec<PlanRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, blob, size, mtime_ns, added_at, deleted,
+                    local_present, local_ignored, synced_blob
+             FROM entries ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PlanRow {
+                path: r.get(0)?,
+                blob: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime_ns: r.get(3)?,
+                added_at: r.get::<_, i64>(4)? as u64,
+                deleted: r.get::<_, i64>(5)? != 0,
+                present: r.get::<_, i64>(6)? != 0,
+                ignored: r.get::<_, i64>(7)? != 0,
+                synced_blob: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Сохранить замороженный план. Решения в JSON не входят: они живут
+    /// отдельно и подмешиваются при загрузке.
+    pub fn save_plan(&self, plan: &Plan) -> Result<()> {
+        let json = serde_json::to_string(plan)?;
+        self.conn.execute(
+            "INSERT INTO sync_plans(peer_dev, plan_json, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer_dev) DO UPDATE SET
+                 plan_json = excluded.plan_json,
+                 created_at = excluded.created_at,
+                 expires_at = excluded.expires_at",
+            params![
+                plan.peer_dev,
+                json,
+                plan.created_at as i64,
+                plan.expires_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Загрузить план, если он ещё не истёк. Просроченный план удаляется и
+    /// не возвращается: применять его нельзя.
+    pub fn load_plan(&self, peer_dev: &str, now: u64) -> Result<Option<Plan>> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT plan_json, expires_at FROM sync_plans WHERE peer_dev = ?1",
+                params![peer_dev],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((json, expires_at)) = row else {
+            return Ok(None);
+        };
+        if now >= expires_at as u64 {
+            self.clear_plan(peer_dev)?;
+            return Ok(None);
+        }
+        let mut plan: Plan = serde_json::from_str(&json)?;
+        let mut decisions = self.load_decisions(peer_dev)?;
+        decisions.retain_valid(&plan);
+        plan.decisions = decisions;
+        Ok(Some(plan))
+    }
+
+    pub fn clear_plan(&self, peer_dev: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM sync_plans WHERE peer_dev = ?1", params![peer_dev])?
+            > 0)
+    }
+
+    pub fn clear_all_plans(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM sync_plans", [])?)
+    }
+
+    pub fn load_decisions(&self, peer_dev: &str) -> Result<DecisionSet> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, action, blob, hlc_ms, hlc_counter, dev
+             FROM plan_decisions WHERE peer_dev = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![peer_dev], |r| {
+            let action: String = r.get(1)?;
+            Ok(PathDecision {
+                path: r.get(0)?,
+                action: Decision::parse(&action).unwrap_or(Decision::Keep),
+                blob: r.get(2)?,
+                hlc: Hlc::new(r.get::<_, i64>(3)? as u64, r.get::<_, i64>(4)? as u32),
+                dev: r.get(5)?,
+            })
+        })?;
+        let mut set = DecisionSet::default();
+        for decision in rows {
+            let decision = decision?;
+            set.entries.insert(decision.path.clone(), decision);
+        }
+        Ok(set)
+    }
+
+    /// Записать набор решений целиком. Вызывается после ручного изменения
+    /// или после слияния с пиром.
+    pub fn save_decisions(&mut self, peer_dev: &str, set: &DecisionSet) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM plan_decisions WHERE peer_dev = ?1",
+            params![peer_dev],
+        )?;
+        for decision in set.entries.values() {
+            tx.execute(
+                "INSERT INTO plan_decisions(peer_dev, path, action, blob, hlc_ms, hlc_counter, dev, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    peer_dev,
+                    decision.path,
+                    decision.action.as_str(),
+                    decision.blob,
+                    decision.hlc.ms as i64,
+                    decision.hlc.counter as i64,
+                    decision.dev,
+                    Hlc::wall_ms() as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Слить решения пира с локальными по HLC и сохранить результат.
+    /// Возвращает итоговый набор и число изменённых путей.
+    pub fn merge_decisions(
+        &mut self,
+        peer_dev: &str,
+        incoming: &DecisionSet,
+    ) -> Result<(DecisionSet, usize)> {
+        let mut merged = self.load_decisions(peer_dev)?;
+        let changed = merged.merge(incoming);
+        if changed > 0 {
+            self.save_decisions(peer_dev, &merged)?;
+        }
+        Ok((merged, changed))
+    }
+
+    pub fn clear_decisions(&self, peer_dev: &str) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM plan_decisions WHERE peer_dev = ?1", params![peer_dev])?)
     }
 
     // ---------------------------------------------------------------- clock
