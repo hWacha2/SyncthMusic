@@ -1,9 +1,16 @@
 <script setup>
-import { nextTick, ref, watch } from 'vue';
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { t } from '../i18n/index.js';
 import { closeModal, confirmModal, state } from '../store.js';
 
 const confirmButton = ref(null);
+
+function onKeydown(event) {
+  if (event.key === 'Escape' && state.modal) closeModal();
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown));
+onUnmounted(() => window.removeEventListener('keydown', onKeydown));
 
 watch(
   () => state.modal,

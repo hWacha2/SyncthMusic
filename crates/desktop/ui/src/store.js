@@ -1,6 +1,7 @@
 import { reactive } from 'vue';
 import { hasBridge, invoke } from './bridge.js';
 import { chosen, setLang, t } from './i18n/index.js';
+import { isWorkspaceGeneration, nextWorkspaceGeneration } from './workspace/generation.js';
 
 // Общее состояние приложения. Экраны читают его напрямую, а действия
 // меняют через функции ниже — так проще переносить старую логику по кускам.
@@ -30,9 +31,8 @@ export const state = reactive({
   modal: null,
 });
 
-// Номер поколения данных рабочей области. Ответы старых запросов не должны
-// перетирать состояние нового устройства или новой папки.
-let workspaceGen = 0;
+// Ответы старых запросов не должны перетирать состояние нового устройства
+// или новой папки: все они сверяются с общим номером поколения.
 let workspacePendingRefresh = false;
 let polling = false;
 
@@ -43,7 +43,7 @@ export function errorMessage(error) {
 }
 
 export function resetWorkspace() {
-  workspaceGen += 1;
+  nextWorkspaceGeneration();
   workspacePendingRefresh = false;
   state.workspace.data = null;
   state.workspace.error = '';
@@ -293,12 +293,12 @@ export async function refreshWorkspace(options = {}) {
   state.workspace.refreshing = true;
   state.workspace.error = '';
   state.workspace.statusError = '';
-  const gen = ++workspaceGen;
+  const gen = nextWorkspaceGeneration();
   try {
     const data = await invoke('workspace_refresh');
-    if (gen === workspaceGen) state.workspace.data = data;
+    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
   } catch (error) {
-    if (gen === workspaceGen) state.workspace.error = errorMessage(error);
+    if (isWorkspaceGeneration(gen)) state.workspace.error = errorMessage(error);
   } finally {
     state.workspace.refreshing = false;
     if (workspacePendingRefresh) {
@@ -364,10 +364,26 @@ async function pollStatus() {
   if (status.name) state.phone.name = status.name;
 }
 
+async function pollWorkspace() {
+  if (!hasBridge || state.view !== 'workspace') return;
+  if (!state.workspace.data || state.workspace.refreshing || state.workspace.action || state.modal) return;
+  const gen = nextWorkspaceGeneration();
+  try {
+    const data = await invoke('workspace_status');
+    if (!isWorkspaceGeneration(gen)) return;
+    state.workspace.data = data;
+    state.workspace.statusError = '';
+  } catch (error) {
+    if (!isWorkspaceGeneration(gen)) return;
+    state.workspace.statusError = errorMessage(error);
+  }
+}
+
 function startPolling() {
   if (polling) return;
   polling = true;
   setInterval(pollStatus, 2500);
+  setInterval(pollWorkspace, 3200);
 }
 
 // ---------------------------------------------------------------- modal

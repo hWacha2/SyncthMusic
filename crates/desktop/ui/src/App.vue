@@ -6,14 +6,14 @@ import ErrorView from './views/ErrorView.vue';
 import LanguageView from './views/LanguageView.vue';
 import LibraryView from './views/LibraryView.vue';
 import DevicesView from './views/DevicesView.vue';
-import PlaceholderView from './views/PlaceholderView.vue';
+import WorkspaceView from './views/WorkspaceView.vue';
 import { boot, state } from './store.js';
 
 const views = {
   language: LanguageView,
   library: LibraryView,
   devices: DevicesView,
-  workspace: PlaceholderView,
+  workspace: WorkspaceView,
   error: ErrorView,
 };
 

@@ -1,0 +1,204 @@
+import { t } from '../i18n/index.js';
+import { ago, basename, formatSize, number, sizeParts } from '../format.js';
+import { state } from '../store.js';
+
+// Производные значения рабочей области. Здесь нет побочных эффектов: те же
+// правила, что в старом app.js, но без ручной сборки HTML.
+
+export function workspaceData() {
+  return state.workspace.data;
+}
+
+export function planData(data = workspaceData()) {
+  return data && data.plan ? data.plan : null;
+}
+
+export function decisionItems(data = workspaceData()) {
+  const plan = planData(data);
+  if (!plan) return [];
+  const items = [];
+  const paths = new Set();
+
+  for (const conflict of plan.conflicts || []) {
+    paths.add(conflict.path);
+    items.push({
+      type: 'conflict',
+      path: conflict.path,
+      conflict,
+      decided: !conflict.unresolved,
+      decision: conflict.decision,
+      size: Math.max(Number(conflict.local_size) || 0, Number(conflict.remote_size) || 0),
+    });
+  }
+
+  const manual = Boolean(data && data.manual_additions);
+  for (const change of plan.changes || []) {
+    if (change.aligned) continue;
+    const addition = manual && change.kind === 'added';
+    const deletion = change.kind === 'deleted';
+    if (!addition && !deletion) continue;
+    if (paths.has(change.path)) continue;
+    paths.add(change.path);
+    items.push({
+      type: addition ? 'addition' : 'deletion',
+      path: change.path,
+      change,
+      decided: Boolean(change.decided),
+      decision: change.decision,
+      size: change.size,
+    });
+  }
+
+  return items;
+}
+
+export function pendingDecisions(data = workspaceData()) {
+  return decisionItems(data).filter((item) => !item.decided);
+}
+
+export function pendingCount(data = workspaceData()) {
+  return pendingDecisions(data).length;
+}
+
+export function workspaceConnected(data) {
+  return Boolean(data && data.phone && data.phone.connected);
+}
+
+export function sessionReady(data) {
+  return Boolean(data && data.session && data.session.open && !data.session.finished);
+}
+
+export function canCommit(data = workspaceData()) {
+  const plan = planData(data);
+  const paths = Number(plan?.paths) || 0;
+  const aligned = Number(plan?.aligned) || 0;
+  return Boolean(
+    data
+    && sessionReady(data)
+    && !data.session.read_only
+    && !data.session.diverged
+    && !data.session_error
+    && !state.workspace.refreshing
+    && !state.workspace.action
+    && plan
+    && (paths > 0 || aligned > 0)
+    && pendingCount(data) === 0,
+  );
+}
+
+export function headline(data = workspaceData()) {
+  if (!data && state.workspace.refreshing) {
+    return { title: t('workspace.status.checking'), text: t('workspace.sub.checking') };
+  }
+  if (!data) {
+    if (state.workspace.error) {
+      return { title: t('workspace.status.error'), text: t('workspace.sub.error') };
+    }
+    return { title: t('workspace.status.unknown'), text: t('workspace.sub.unknown') };
+  }
+  const plan = planData(data);
+  const pending = pendingCount(data);
+  const paths = Number(plan?.paths) || 0;
+  const aligned = Number(plan?.aligned) || 0;
+  if (data.session && data.session.diverged) {
+    return { title: t('workspace.status.diverged'), text: t('workspace.sub.diverged') };
+  }
+  if (data.session_error || (data.phone && !data.phone.connected)) {
+    return { title: t('workspace.status.offline'), text: t('workspace.sub.offline') };
+  }
+  if (pending > 0) {
+    return { title: t('workspace.status.attention'), text: t('workspace.sub.attention', { count: pending }) };
+  }
+  if (paths > 0) {
+    return {
+      title: t('workspace.status.ready'),
+      text: aligned > 0
+        ? t('workspace.sub.ready_aligned', { count: paths, aligned })
+        : t('workspace.sub.ready', { count: paths }),
+    };
+  }
+  if (aligned > 0) {
+    return { title: t('workspace.status.ready'), text: t('workspace.sub.aligned', { count: aligned }) };
+  }
+  if (sessionReady(data)) {
+    return { title: t('workspace.status.synced'), text: t('workspace.sub.synced') };
+  }
+  return { title: t('workspace.status.unknown'), text: t('workspace.sub.unknown') };
+}
+
+export function connectionState(data = workspaceData()) {
+  if (!data || !data.phone || !data.phone.linked) {
+    return { tone: 'off', label: t('workspace.status.offline') };
+  }
+  if (!data.phone.connected) {
+    return { tone: 'off', label: t('workspace.status.offline') };
+  }
+  if (sessionReady(data)) {
+    return { tone: 'on', label: t('workspace.status.connected') };
+  }
+  return { tone: 'warn', label: t('workspace.status.preparing') };
+}
+
+export function checkedText(data = workspaceData()) {
+  if (!data || !data.checked_at) return t('workspace.checked_never');
+  return ago(data.checked_at);
+}
+
+export function decisionLabel(decision) {
+  return decision ? t(`decision.${decision}`) : t('workspace.changes.undecided');
+}
+
+export function kindLabel(kind) {
+  return t(`kind.${kind}`);
+}
+
+export function decisionMeta(item) {
+  const parts = [];
+  if (item.type === 'conflict') {
+    parts.push(kindLabel('conflict'));
+    const local = Number(item.conflict?.local_size) || 0;
+    const remote = Number(item.conflict?.remote_size) || 0;
+    if (local && remote && local !== remote) {
+      parts.push(`${formatSize(local)} / ${formatSize(remote)}`);
+    } else if (local || remote) {
+      parts.push(formatSize(local || remote));
+    }
+  } else if (item.type === 'addition') {
+    parts.push(item.change?.side === 'remote'
+      ? t('workspace.attention.added_on_phone')
+      : t('workspace.attention.added_on_pc'));
+    if (item.size) parts.push(formatSize(item.size));
+  } else {
+    parts.push(item.change?.side === 'remote'
+      ? t('workspace.attention.deleted_on_phone')
+      : t('workspace.attention.deleted_on_pc'));
+    if (item.size) parts.push(formatSize(item.size));
+  }
+  return parts.join(' · ');
+}
+
+export function attentionKind(item) {
+  if (item.type === 'conflict') return { css: 'is-conflict', label: t('workspace.attention.conflict') };
+  if (item.type === 'addition') return { css: 'is-add', label: t('workspace.attention.addition') };
+  return { css: 'is-delete', label: t('workspace.attention.deletion') };
+}
+
+export function changeMeta(change, manual = false) {
+  const parts = [];
+  if (change.kind === 'moved' && change.from) {
+    parts.push(t('workspace.changes.from', { path: change.from }));
+  }
+  if (change.size) parts.push(formatSize(change.size));
+  if (change.kind === 'deleted') {
+    parts.push(change.decided ? decisionLabel(change.decision) : t('workspace.changes.undecided'));
+  } else if (change.decided) {
+    parts.push(decisionLabel(change.decision));
+  } else if (manual && change.kind === 'added') {
+    parts.push(t('workspace.changes.undecided'));
+  } else {
+    parts.push(t('workspace.changes.auto'));
+  }
+  return parts.join(' · ');
+}
+
+export { ago, basename, formatSize, number, sizeParts };
