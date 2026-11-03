@@ -5,31 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#151517">
 <title>SynctMusic</title>
-<link rel="stylesheet" href="app.css">
 </head>
 <body>
-<div class="app">
-  <header class="titlebar" data-tauri-drag-region>
-    <div class="brand" data-tauri-drag-region>
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">SynctMusic</span>
-    </div>
-    <div class="window-controls">
-      <button class="window-btn" data-window="minimize" aria-label="Свернуть">
-        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg>
-      </button>
-      <button class="window-btn" data-window="maximize" aria-label="Развернуть">
-        <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7"/></svg>
-      </button>
-      <button class="window-btn window-btn--close" data-window="close" aria-label="Закрыть">
-        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3L3 9"/></svg>
-      </button>
-    </div>
-  </header>
-  <main class="screen" id="screen"></main>
-  <div class="modal-layer" id="modal-layer" hidden></div>
-</div>
-<script src="i18n.js"></script>
-<script src="app.js"></script>
+<div id="app"></div>
+<script type="module" src="/src/main.js"></script>
 </body>
 </html>

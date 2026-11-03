@@ -232,7 +232,8 @@ cargo build --release -p syncth-daemon -p syncth-desktop
 переменная `APPDATA` уважается, так что для экспериментов достаточно
 `$env:APPDATA = "$env:TEMP\syncth-test"` — приложение не тронет основную установку.
 
-Интерфейс — обычные HTML/CSS/JS в `crates/desktop/ui`, собирать фронтенд не нужно.
+Интерфейс ПК — Vue 3 + Vite в `crates/desktop/ui` (собирается в `ui/dist`).
+Старый ванильный интерфейс сохранён как эталон в `crates/desktop/ui-archive`.
 Rust-часть (команды, прокси к демону, запуск процесса) — `crates/desktop/src-tauri`.
 
 ## Android
@@ -301,41 +302,49 @@ powershell -ExecutionPolicy Bypass -File scripts\android-setup.ps1
 
 ## Разработка и правка интерфейса
 
-Интерфейс — обычные HTML/CSS/JS, сборщика нет. Правится он в двух местах:
+Интерфейс ПК переезжает на Vue 3 + Vite; телефонный пока остаётся на ванильном
+HTML/CSS/JS.
 
 | Что | Где |
 |---|---|
-| ПК-клиент: тексты | `crates/desktop/ui/i18n.js` |
-| ПК-клиент: разметка, отрисовка, стили | `crates/desktop/ui/index.html`, `app.js`, `styles.css` |
+| ПК-клиент: тексты | `crates/desktop/ui/src/i18n/ru.js`, `en.js` |
+| ПК-клиент: экраны | `crates/desktop/ui/src/views/*.vue` |
+| ПК-клиент: общие компоненты | `crates/desktop/ui/src/components/*.vue` |
+| ПК-клиент: состояние и действия | `crates/desktop/ui/src/store.js` |
+| ПК-клиент: стили | `crates/desktop/ui/src/styles/app.css` |
+| ПК-клиент: старый интерфейс (эталон) | `crates/desktop/ui-archive/` |
 | Android-клиент: тексты | `crates/mobile/ui/i18n.js` |
 | Android-клиент: разметка, отрисовка, стили | `crates/mobile/ui/index.html`, `app.js`, `styles.css` |
 
-Тексты обоих клиентов лежат в `i18n.js` отдельными словарями `ru` и `en`.
-В разметке используется `data-i18n="ключ"`, в коде — `I18N.t(ключ)`. Язык
-переключается кнопкой в интерфейсе (ПК — в левой панели и в настройках,
-Android — в разделе «Ещё») и запоминается в `localStorage`; по умолчанию
-берётся язык системы. Новый ключ нужно добавить в оба словаря.
+Тексты ПК лежат в `src/i18n/ru.js` и `en.js`, доступ — `t('ключ')` из
+`src/i18n/index.js`. Новый ключ нужно добавить в оба словаря. На Android пока
+по-старому: `data-i18n="ключ"` в разметке и `I18N.t(ключ)` в коде.
 
-**ПК.** Запуск в режиме разработки (окно открывается сразу, Rust
-пересобирается при изменениях):
+**ПК.** Первый раз и после изменений в `package.json`:
+
+```powershell
+cd crates\desktop\ui
+npm install
+npm run build
+```
+
+Полное приложение (Tauri встраивает `ui/dist` в бинарник):
 
 ```powershell
 cd crates\desktop\src-tauri
 cargo tauri dev
 ```
 
-Правки CSS/JS подхватываются по `Ctrl+R` в окне, без перезапуска. Если удобнее
-в браузере — поднимите статику и смотрите её на большом экране:
+`cargo tauri build` сам вызывает `npm --prefix ui run build`; обычный
+`cargo build` — нет, поэтому перед ним нужно один раз выполнить `npm run build`.
+Для вёрстки без перезапуска удобнее Vite-сервер (моста к ядру в браузере нет,
+поэтому часть экранов покажет ошибку связи):
 
 ```powershell
 cd crates\desktop\ui
-python -m http.server 8123
-# http://127.0.0.1:8123
+npm run dev
+# http://127.0.0.1:1420
 ```
-
-В браузере нет моста к ядру, поэтому часть экранов покажет «Нет доступа к ядру
-Tauri» — для подбора шрифтов, отступов и цвета этого достаточно, данные лучше
-смотреть в `cargo tauri dev`.
 
 **Android.** Тот же интерфейс запускается на ПК в окне размером с телефон —
 это самый быстрый способ править тексты:

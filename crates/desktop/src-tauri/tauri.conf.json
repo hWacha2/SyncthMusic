@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "identifier": "org.syncth.music",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui/dist",
+    "beforeBuildCommand": "npm --prefix ui run build"
   },
   "app": {
     "withGlobalTauri": true,

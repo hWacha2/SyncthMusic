@@ -15,6 +15,10 @@
 .e2e/
 /data-a/
 /data-b/
+/crates/desktop/ui/node_modules/
+/crates/desktop/ui/dist/
+/crates/mobile/ui/node_modules/
+/crates/mobile/ui/dist/
 /crates/desktop/src-tauri/gen/
 /crates/mobile/src-tauri/gen/schemas/
 /crates/mobile/src-tauri/gen/android/app/src/main/jniLibs/
