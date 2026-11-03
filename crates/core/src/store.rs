@@ -29,11 +29,15 @@ CREATE TABLE IF NOT EXISTS ops (
     hlc_ms      INTEGER NOT NULL,
     hlc_counter INTEGER NOT NULL,
     dev         TEXT NOT NULL,
-    kind        TEXT NOT NULL
+    kind        TEXT NOT NULL,
+    -- Путь, которого касается операция. Нужен, чтобы забыть собственное
+    -- добавление, не разбирая JSON всего журнала.
+    path        TEXT NOT NULL DEFAULT ''
 );
 
 -- Для дельта-синка: «что у пира уже есть» по каждому устройству-автору.
 CREATE INDEX IF NOT EXISTS ops_by_dev_hlc ON ops(dev, hlc_ms, hlc_counter);
+CREATE INDEX IF NOT EXISTS ops_by_path ON ops(dev, path);
 
 -- TOFU: первый подписанный ключ устройства запоминается. Смена ключа у того же
 -- `dev` отклоняется — иначе подпись не защищает от подмены автора.
@@ -75,7 +79,10 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE TABLE IF NOT EXISTS pending_deletes (
     path        TEXT PRIMARY KEY,
     blob        TEXT NOT NULL,
-    detected_at INTEGER NOT NULL
+    detected_at INTEGER NOT NULL,
+    -- Полный HLC момента обнаружения: без счётчика синтетическое удаление
+    -- в preview могло оказаться не новее собственной операции за ту же мс.
+    hlc_counter INTEGER NOT NULL DEFAULT 0
 );
 
 -- Корзина: hardlink на блоб в data_dir/vault (0 байт на NTFS).
@@ -139,6 +146,14 @@ pub struct PendingDelete {
     pub path: String,
     pub blob: String,
     pub detected_at: u64,
+    pub counter: u32,
+}
+
+impl PendingDelete {
+    /// Мягкое удаление как HLC: та же миллисекунда, но сохранённый счётчик.
+    pub fn hlc(&self) -> Hlc {
+        Hlc::new(self.detected_at, self.counter)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +253,20 @@ impl Replica {
                 [],
             )?;
         }
-        self.set_meta("schema_version", "5")?;
+        if !self.has_column("pending_deletes", "hlc_counter")? {
+            self.conn.execute(
+                "ALTER TABLE pending_deletes ADD COLUMN hlc_counter INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !self.has_column("ops", "path")? {
+            self.conn.execute(
+                "ALTER TABLE ops ADD COLUMN path TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+            self.backfill_op_paths()?;
+        }
+        self.set_meta("schema_version", "6")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
                 // Идентичность устройства стабильна: она важнее аргумента CLI.
@@ -272,6 +300,29 @@ impl Replica {
 
     pub fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
+    }
+
+    /// Заполнить `ops.path` для журнала, созданного до появления колонки.
+    fn backfill_op_paths(&mut self) -> Result<()> {
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, op_json FROM ops WHERE path = ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tx = self.conn.transaction()?;
+        for (id, json) in rows {
+            let Ok(op) = Op::from_json(&json) else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE ops SET path = ?2 WHERE id = ?1",
+                params![id, op_path(&op.kind)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn has_column(&self, table: &str, column: &str) -> Result<bool> {
@@ -364,6 +415,16 @@ impl Replica {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Есть ли вообще сопряжённые устройства. Без них «мягкое удаление»
+    /// никому не нужно: расходиться не с кем.
+    pub fn has_peers(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM peers LIMIT 1", [], |r| r.get::<_, i64>(0))
+            .optional()?
+            .is_some())
     }
 
     /// Забыть устройство. Токен библиотеки не меняется: «забыть» — это убрать
@@ -564,6 +625,15 @@ impl Replica {
         Ok(op)
     }
 
+    /// Операция с заданным HLC. Нужна для синтетических preview-удалений:
+    /// их метка — момент обнаружения, а не текущие часы.
+    pub fn make_op_at(&mut self, hlc: Hlc, kind: OpKind) -> Result<Op> {
+        let kind = Op::canonicalize(kind)?;
+        let mut op = Op::new(self.dev.clone(), hlc, kind);
+        op.sign(&self.key);
+        Ok(op)
+    }
+
     /// Публичный ключ этого устройства (hex).
     pub fn public_key(&self) -> String {
         hex::encode(self.key.verifying_key().to_bytes())
@@ -626,15 +696,16 @@ impl Replica {
         }
 
         tx.execute(
-            "INSERT INTO ops(id, op_json, hlc_ms, hlc_counter, dev, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO ops(id, op_json, hlc_ms, hlc_counter, dev, kind, path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 op.id,
                 op.to_json(),
                 op.hlc.ms as i64,
                 op.hlc.counter as i64,
                 op.dev,
-                op.kind.name()
+                op.kind.name(),
+                op_path(&op.kind)
             ],
         )?;
 
@@ -646,7 +717,7 @@ impl Replica {
                 mtime_ns,
                 added_at,
             } => upsert_entry(&tx, op, path, blob, *size, *mtime_ns, *added_at)?,
-            OpKind::EntryDel { path } => delete_entry(&tx, op, path)?,
+            OpKind::EntryDel { path } => delete_entry(&tx, op, path, true)?,
             OpKind::EntryMove {
                 from,
                 to,
@@ -655,7 +726,9 @@ impl Replica {
                 mtime_ns,
                 added_at,
             } => {
-                let a = delete_entry(&tx, op, from)?;
+                // Перенос не отменяет наше «файл пропал»: решение по старому
+                // пути ещё должно найти трек по блобу уже под новым именем.
+                let a = delete_entry(&tx, op, from, false)?;
                 let b = upsert_entry(&tx, op, to, blob, *size, *mtime_ns, *added_at)?;
                 a || b
             }
@@ -716,6 +789,24 @@ impl Replica {
         Ok(map)
     }
 
+    /// Операции для preview. Собственные «призраки» — добавления, удалённые
+    /// до первой синхронизации, — пиру не показываем: файла больше нет, а в
+    /// общей базе его никогда не было. Иначе у пира появится строка плана,
+    /// которой у нас нет, и `decisions_hash` разойдётся.
+    pub fn preview_ops(&self, known: &HashMap<String, (i64, i64)>) -> Result<Vec<Op>> {
+        let mut ops = self.ops_since(known)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM entries WHERE deleted = 0 OR synced_blob <> ''")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let live: std::collections::HashSet<String> = rows.collect::<rusqlite::Result<_>>()?;
+        ops.retain(|op| {
+            let path = op_path(&op.kind);
+            op.dev != self.dev || path.is_empty() || live.contains(path)
+        });
+        Ok(ops)
+    }
+
     /// Операции, которых нет у пира согласно его `watermarks`.
     pub fn ops_since(&self, known: &HashMap<String, (i64, i64)>) -> Result<Vec<Op>> {
         if known.is_empty() {
@@ -754,6 +845,27 @@ impl Replica {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM ops", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// HLC последнего удаления, которое это устройство отправило по пути.
+    /// По нему видно, успел ли пир применить наше удаление: его watermark
+    /// должен покрывать эту метку.
+    pub fn last_delete_hlc(&self, dev: &str, path: &str) -> Result<Option<Hlc>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT hlc_ms, hlc_counter FROM ops
+                 WHERE dev = ?1 AND path = ?2 AND kind = 'entry_del'
+                 ORDER BY hlc_ms DESC, hlc_counter DESC LIMIT 1",
+                params![dev, path],
+                |r| {
+                    Ok(Hlc::new(
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as u32,
+                    ))
+                },
+            )
+            .optional()?)
     }
 
     /// Все записи, включая tombstone'ы (нужно для сверки реплик).
@@ -828,6 +940,34 @@ impl Replica {
         self.conn.execute(
             "UPDATE entries SET local_ignored = ?2, local_present = 0 WHERE path = ?1",
             params![path, ignored as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Локальное исключение для пути, которого ещё нет в таблице: это чужое
+    /// добавление, которое не хотят забирать. Создаём запись без локального
+    /// файла, чтобы план больше не предлагал этот путь.
+    pub fn ignore_missing(
+        &self,
+        path: &str,
+        blob: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO entries(path, blob, size, mtime_ns, added_at, deleted, \
+             hlc_ms, hlc_counter, dev, local_present, local_ignored) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, '', 0, 1) \
+             ON CONFLICT(path) DO UPDATE SET \
+                 local_ignored = 1, \
+                 local_present = 0",
+            params![
+                path,
+                blob,
+                size as i64,
+                mtime_ns,
+                Hlc::wall_ms() as i64
+            ],
         )?;
         Ok(())
     }
@@ -964,24 +1104,31 @@ impl Replica {
 
     // ---------------------------------------------------------------- pending deletes
 
-    pub fn record_pending_delete(&self, path: &str, blob: &str, detected_at: u64) -> Result<()> {
+    pub fn record_pending_delete(&self, path: &str, blob: &str, hlc: Hlc) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO pending_deletes(path, blob, detected_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO pending_deletes(path, blob, detected_at, hlc_counter)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO NOTHING",
-            params![path, blob, detected_at as i64],
+            params![
+                path,
+                blob,
+                hlc.ms as i64,
+                hlc.counter as i64
+            ],
         )?;
         Ok(())
     }
 
     pub fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, blob, detected_at FROM pending_deletes ORDER BY path")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT path, blob, detected_at, hlc_counter FROM pending_deletes ORDER BY path",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(PendingDelete {
                 path: r.get(0)?,
                 blob: r.get(1)?,
                 detected_at: r.get::<_, i64>(2)? as u64,
+                counter: r.get::<_, i64>(3)? as u32,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -991,6 +1138,68 @@ impl Replica {
         self.conn
             .execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
         Ok(())
+    }
+
+    /// Собственное добавление, которое ещё ни разу не входило в общую базу.
+    pub fn is_local_only(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM entries
+                 WHERE path = ?1 AND dev = ?2 AND deleted = 0 AND synced_blob = ''",
+                params![path, self.dev],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Забыть локальное добавление, удалённое до первой синхронизации.
+    ///
+    /// Возвращает `false`, если путь чужой или уже был в общей базе: такие
+    /// удаления обязаны пройти через решение человека, иначе можно стереть
+    /// чужой файл. Операции из журнала не удаляем: `preview_ops` просто не
+    /// показывает пиру пути, которых здесь больше нет.
+    pub fn forget_never_shared(&mut self, path: &str) -> Result<bool> {
+        if !self.is_local_only(path)? {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM entries WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Почистить «призраки» от старых сканов: ожидающие удаления, которые
+    /// относятся к собственным добавлениям без общей базы или к записям,
+    /// которых в дереве уже нет. Возвращает число забытых путей.
+    pub fn prune_ghost_deletes(&mut self) -> Result<usize> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT p.path FROM pending_deletes p
+                 LEFT JOIN entries e ON e.path = p.path
+                 WHERE e.path IS NULL
+                    OR e.deleted != 0
+                    OR (e.dev = ?1 AND e.synced_blob = '')",
+            )?;
+            let rows = stmt.query_map(params![self.dev], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut forgotten = 0;
+        for path in paths {
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
+            tx.execute(
+                "DELETE FROM entries WHERE path = ?1 AND dev = ?2 AND deleted = 0 AND synced_blob = ''",
+                params![path, self.dev],
+            )?;
+            tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
+            tx.commit()?;
+            forgotten += 1;
+        }
+        Ok(forgotten)
     }
 
     /// Полные метаданные записи, даже если она удалена. Нужно корзине:
@@ -1189,7 +1398,7 @@ fn upsert_entry(
     Ok(true)
 }
 
-fn delete_entry(tx: &Transaction<'_>, op: &Op, path: &str) -> Result<bool> {
+fn delete_entry(tx: &Transaction<'_>, op: &Op, path: &str, clear_pending: bool) -> Result<bool> {
     if !is_newer(tx, path, op)? {
         return Ok(false);
     }
@@ -1206,7 +1415,25 @@ fn delete_entry(tx: &Transaction<'_>, op: &Op, path: &str) -> Result<bool> {
              dev = excluded.dev",
         params![path, op.hlc.ms as i64, op.hlc.counter as i64, op.dev],
     )?;
+    // Подтверждённое удаление отменяет локальное «файл пропал»: иначе оно
+    // осталось бы в pending_deletes и всплывало в каждом следующем плане.
+    if clear_pending {
+        tx.execute(
+            "DELETE FROM pending_deletes WHERE path = ?1",
+            params![path],
+        )?;
+    }
     Ok(true)
+}
+
+/// Путь, которого касается операция. У переноса — целевой: исходный путь
+/// после применения уже удалён, и забывать нужно только цель.
+fn op_path(kind: &OpKind) -> &str {
+    match kind {
+        OpKind::EntryPut { path, .. } | OpKind::EntryDel { path } => path,
+        OpKind::EntryMove { to, .. } => to,
+        OpKind::BlobHave { .. } => "",
+    }
 }
 
 /// Обмен операциями между двумя репликами (для тестов и `syncth sync`).

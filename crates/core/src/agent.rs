@@ -110,6 +110,14 @@ pub enum AgentMsg {
         root: String,
         entries: Vec<ManifestEntry>,
     },
+    /// Готовность приёмника полной синхронизации на телефоне.
+    SyncInfo {
+        port: u16,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// ПК спрашивает, поднят ли на телефоне приём полной синхронизации.
+    GetSyncInfo,
     Error {
         message: String,
     },

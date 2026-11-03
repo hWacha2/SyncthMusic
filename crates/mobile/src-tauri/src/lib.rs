@@ -68,6 +68,41 @@ fn open(app: &tauri::AppHandle) -> Result<Replica, String> {
     Ok(replica)
 }
 
+/// Записывает корень в общий журнал и сразу сканирует папку.
+///
+/// Это нужно не только интерфейсу: полная синхронизация на телефоне живёт
+/// в том же реплике, поэтому выбранная папка должна быть видна и серверу
+/// `47887`, и агентскому соединению.
+pub(crate) fn sync_root(app: &tauri::AppHandle, root: &Path) -> Result<scan::ScanReport, String> {
+    if !root.is_dir() {
+        return Err(format!("Папка не найдена: {}", root.display()));
+    }
+    let mut replica = open(app)?;
+    replica.set_root(root).map_err(err)?;
+    let report = scan::scan(root, &mut replica).map_err(err)?;
+    let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
+    Ok(report)
+}
+
+/// Сканирует текущую папку телефона в реплику. Возвращает путь и отчёт.
+pub(crate) fn scan_phone(app: &tauri::AppHandle) -> Result<(PathBuf, scan::ScanReport), String> {
+    let mut replica = open(app)?;
+    let root = replica
+        .root()
+        .map_err(err)?
+        .ok_or("Папка на телефоне не выбрана")?;
+    let report = scan::scan(&root, &mut replica).map_err(err)?;
+    let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
+    Ok((root, report))
+}
+
+/// Привязывает токен полной синхронизации к токену агентской пары.
+/// Без этого `PreviewSession` с ПК не пройдёт проверку токена.
+pub(crate) fn set_sync_token(app: &tauri::AppHandle, token: &str) -> Result<(), String> {
+    let replica = open(app)?;
+    replica.set_token(token).map_err(err)
+}
+
 /// Читает системное свойство Android. На других платформах возвращает пустую строку.
 fn android_prop(name: &str) -> String {
     if !cfg!(target_os = "android") {
@@ -389,7 +424,7 @@ fn save_decision(
     Ok(())
 }
 
-async fn blocking<T, F>(f: F) -> Result<T, String>
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -778,26 +813,20 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Mobile::default())
         .manage(agent::AgentRuntime::default())
-        // Отладочный канал для прогона интерфейса без кликов; в релизе нет.
         .setup(|app| {
             // Сессия живёт только пока приложение открыто: сокет не переживает
             // перезапуск, поэтому «подключено» из прошлого запуска не сохраняем.
             if let Ok(replica) = open(app.handle()) {
                 let _ = replica.set_meta("session_peer", "");
             }
+            // Восстанавливаем выбранную папку и подставляем токен пары
+            // в общий реплик — без этого сеанс на 47887 не пройдёт.
+            agent::startup(app.handle().clone());
+            // Приёмник полной синхронизации живёт всё время работы окна:
+            // ПК подключается к нему сразу после агентского сеанса.
+            server::ensure_started(app.handle().clone());
             // Запускаем минимальный агент: он слушает ПК и отдаёт выбранную папку.
             agent::init(app.handle().clone());
-            #[cfg(debug_assertions)]
-            if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
-                use tauri::Manager;
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(2500));
-                    if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.eval(&script);
-                    }
-                });
-            }
             let _ = app;
             Ok(())
         })

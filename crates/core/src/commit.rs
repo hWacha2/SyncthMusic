@@ -222,7 +222,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
                         added_at,
                     )?);
                 }
-                Decision::Revert => {
+                Decision::Revert | Decision::DeleteEverywhere => {
                     // Добавление отменяется у источника: файл уходит в корзину,
                     // а запись закрывается собственной операцией удаления.
                     prepared.ops.push(replica.make_op(OpKind::EntryDel {
@@ -319,8 +319,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
 
     for conflict in &plan.conflicts {
         let decision = plan
-            .decisions
-            .get(&conflict.path)
+            .explicit_entry(&conflict.path)
             .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
         let chooser = decision.dev == me;
         match decision.action {
@@ -417,6 +416,19 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
         if wanted && !has_blob(replica, &root, &change.blob) {
             need(&mut prepared, &mut seen, &change.blob);
         }
+        // Чужое добавление можно не забирать, а удалить везде. Решение
+        // исполняет только его автор: источник удалит файл у себя, а мы
+        // отправим операцию удаления, чтобы он не вернулся с другой стороны.
+        if change.kind == ChangeKind::Added
+            && decision == Decision::DeleteEverywhere
+            && plan
+                .explicit_entry(&change.path)
+                .is_some_and(|decision| decision.dev == me)
+        {
+            prepared.ops.push(replica.make_op(OpKind::EntryDel {
+                path: change.path.clone(),
+            })?);
+        }
     }
 
     Ok(prepared)
@@ -429,6 +441,41 @@ fn write_blob(root: &Path, rel: &str, src: &Path, mtime_ns: i64) -> Result<()> {
     }
     std::fs::copy(src, &dst).with_context(|| format!("запись {}", dst.display()))?;
     crate::scan::restore_mtime(&dst, mtime_ns)?;
+    Ok(())
+}
+
+/// Убирает занятый путь в conflict-copy и публикует её как обычный файл,
+/// чтобы она не потерялась и уехала на другие устройства.
+pub(crate) fn save_conflict_copy(
+    replica: &mut Replica,
+    root: &Path,
+    existing: &Path,
+    rel: &str,
+) -> Result<()> {
+    let old_blob = crate::scan::hash_file(existing)?;
+    let meta = std::fs::metadata(existing)?;
+    let old_mtime = crate::scan::mtime_ns_public(&meta);
+    let old_size = meta.len();
+
+    let conflict_rel = path::conflict_name(rel, replica.device_id(), Hlc::wall_ms());
+    let conflict_abs = resolve::disk_path(root, &conflict_rel);
+    if let Some(parent) = conflict_abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(existing, &conflict_abs)
+        .with_context(|| format!("сохранение {}", conflict_abs.display()))?;
+
+    let kind = OpKind::EntryPut {
+        path: conflict_rel.clone(),
+        blob: old_blob,
+        size: old_size,
+        mtime_ns: old_mtime,
+        added_at: replica.next_hlc()?.ms,
+    };
+    let op = replica.make_op(kind)?;
+    replica.apply(&op)?;
+    // Файл уже лежит на диске под новым именем.
+    replica.mark_present(&conflict_rel)?;
     Ok(())
 }
 
@@ -485,7 +532,10 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
             .unwrap_or(Decision::Keep);
         match change.kind {
             ChangeKind::Added => match decision {
-                Decision::Revert => remove_to_vault(replica, &root, &change.path)?,
+                Decision::Revert | Decision::DeleteEverywhere => {
+                    remove_to_vault(replica, &root, &change.path)?;
+                    replica.clear_pending_delete(&change.path)?;
+                }
                 Decision::OnlyHere => replica.mark_present(&change.path)?,
                 _ => {}
             },
@@ -540,8 +590,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
 
     for conflict in &plan.conflicts {
         let decision = plan
-            .decisions
-            .get(&conflict.path)
+            .explicit_entry(&conflict.path)
             .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
         let chooser = decision.dev == me;
         match decision.action {
@@ -588,7 +637,10 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
             .effective_decision(&change.path)
             .unwrap_or(Decision::Keep);
         if decision == Decision::OnlyHere && change.kind == ChangeKind::Added {
-            replica.set_ignored(&change.path, true)?;
+            // У пира файл есть, а у нас записи может не быть вовсе. Без
+            // отдельной «пустой» записи исключение не сохранится и путь
+            // будет всплывать в каждом следующем плане.
+            replica.ignore_missing(&change.path, &change.blob, change.size, change.mtime_ns)?;
             replica.clear_pending_delete(&change.path)?;
         }
     }
@@ -635,7 +687,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
     }
 
     for conflict in &plan.conflicts {
-        let Some(decision) = plan.decisions.get(&conflict.path) else {
+        let Some(decision) = plan.explicit_entry(&conflict.path) else {
             continue;
         };
         if decision.action == Decision::KeepBoth && decision.dev != me {
@@ -673,6 +725,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
                 outcome.accepted += 1;
             }
             (ChangeKind::Added, Decision::Revert) => outcome.accepted += 1,
+            (ChangeKind::Added, Decision::DeleteEverywhere) => outcome.accepted += 1,
             (ChangeKind::Updated, Decision::Accept | Decision::Revert) => {
                 confirmed.insert(change.path.clone());
                 outcome.accepted += 1;
@@ -708,6 +761,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
             }
             (ChangeKind::Deleted, Decision::OnlyHere) => outcome.accepted += 1,
             (ChangeKind::Deleted, _) => outcome.rejected += 1,
+            (ChangeKind::Added, Decision::DeleteEverywhere) => outcome.accepted += 1,
             (_, Decision::OnlyHere) => outcome.accepted += 1,
             (_, Decision::Accept) => {
                 confirmed.insert(change.path.clone());
@@ -718,7 +772,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     }
 
     for conflict in &plan.conflicts {
-        let Some(decision) = plan.decisions.get(&conflict.path) else {
+        let Some(decision) = plan.explicit_entry(&conflict.path) else {
             bail!("конфликт без решения: {}", conflict.path);
         };
         match decision.action {
@@ -740,23 +794,67 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
         }
     }
 
-    // Ставим на диск всё, что уже скачано, но ещё не лежит по пути.
-    for entry in replica.live_entries()? {
-        if !confirmed.contains(&entry.path) {
+    // Раскладываем только то, что действительно могло измениться на диске:
+    // принятые чужие добавления/правки/переносы и выбранные версии конфликтов.
+    // Совпавшие файлы не хэшируем повторно — иначе первый коммит заново
+    // перечитывал бы всю библиотеку.
+    let mut place: HashSet<String> = HashSet::new();
+    for change in &plan.remote {
+        let decision = plan
+            .effective_decision(&change.path)
+            .unwrap_or(Decision::Keep);
+        if matches!(
+            change.kind,
+            ChangeKind::Added | ChangeKind::Updated | ChangeKind::Moved
+        ) && decision == Decision::Accept
+        {
+            place.insert(change.path.clone());
+        }
+    }
+    for conflict in &plan.conflicts {
+        let Some(decision) = plan.explicit_entry(&conflict.path) else {
+            continue;
+        };
+        place.insert(conflict.path.clone());
+        if decision.action == Decision::KeepBoth {
+            place.insert(keep_both_copy(plan, decision, &me));
+        }
+    }
+
+    for rel in place {
+        if !confirmed.contains(&rel) || replica.is_ignored(&rel)? {
             continue;
         }
-        if replica.is_present(&entry.path)? || replica.is_ignored(&entry.path)? {
+        let Some(entry) = replica.entry(&rel)? else {
+            continue;
+        };
+        if entry.deleted {
+            continue;
+        }
+        let dst = resolve::disk_path(&root, &rel);
+        let disk_blob = dst
+            .is_file()
+            .then(|| crate::scan::hash_file(&dst).ok())
+            .flatten();
+        if disk_blob.as_deref() == Some(entry.blob.as_str()) {
+            if !replica.is_present(&rel)? {
+                replica.mark_present(&rel)?;
+            }
             continue;
         }
         let Some(src) = blob_source(replica, &root, &entry.blob)? else {
-            bail!(
-                "не удалось получить содержимое «{}» ({})",
-                entry.path,
-                entry.blob
-            );
+            bail!("не удалось получить содержимое «{rel}» ({})", entry.blob);
         };
-        write_blob(&root, &entry.path, &src, entry.mtime_ns)?;
-        replica.mark_present(&entry.path)?;
+        // Файл на диске не совпадает с согласованной базой — значит, его
+        // изменили уже после скана. Не теряем такую правку.
+        if let Some(existing_blob) = disk_blob {
+            let base = replica.synced_blob(&rel)?;
+            if base.is_empty() || existing_blob != base {
+                save_conflict_copy(replica, &root, &dst, &rel)?;
+            }
+        }
+        write_blob(&root, &rel, &src, entry.mtime_ns)?;
+        replica.mark_present(&rel)?;
     }
 
     let paths: Vec<String> = confirmed.into_iter().collect();

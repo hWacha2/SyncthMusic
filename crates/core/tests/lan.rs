@@ -389,7 +389,10 @@ fn commit_with_a_different_decisions_hash_is_rejected() {
         .unwrap();
     let err = session.commit(&mut b).unwrap_err().to_string();
     assert!(err.contains("разошёлся"), "{err}");
-    assert!(!session.finished, "неудачный commit не завершает сессию");
+    assert!(
+        session.finished,
+        "неудачный commit завершает сессию, чтобы её можно было открыть заново"
+    );
     drop(session);
     let _ = handle.finish();
 }

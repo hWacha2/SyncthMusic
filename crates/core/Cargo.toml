@@ -18,6 +18,7 @@ tracing.workspace = true
 unicode-normalization = "0.1.26"
 ed25519-dalek = "2"
 hex = "0.4"
+if-addrs = "0.15"
 
 [dev-dependencies]
 proptest.workspace = true

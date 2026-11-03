@@ -63,9 +63,6 @@ fn listen(app: tauri::AppHandle) {
                 continue;
             }
         };
-        if let Ok(replica) = crate::open(&app) {
-            let _ = net::start_discovery(replica.device_id().to_string(), net::SYNC_PORT);
-        }
         state().lock().unwrap().error = None;
 
         for stream in listener.incoming() {
@@ -80,6 +77,9 @@ fn listen(app: tauri::AppHandle) {
 }
 
 fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
+    // Новое соединение означает, что слушатель жив. Ошибка прошлого сеанса
+    // не должна навсегда блокировать следующие попытки.
+    state().lock().unwrap().error = None;
     let mut replica = match crate::open(app) {
         Ok(replica) => replica,
         Err(e) => {

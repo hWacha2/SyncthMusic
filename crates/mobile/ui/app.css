@@ -404,6 +404,20 @@ button:focus-visible {
   text-align: center;
 }
 
+.language-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(260px, 100%);
+}
+
+.language-choice {
+  height: 46px;
+  margin-top: 0;
+  border-radius: 14px;
+  font-size: 14px;
+}
+
 /* ------------------------------------------------------------------ готово */
 
 .ready {

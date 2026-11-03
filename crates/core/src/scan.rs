@@ -209,12 +209,24 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
 
     // Пропавшие файлы: только те, что раньше были здесь. «Ещё не скачано» и
     // «намеренно не держим здесь» удалением не считается. Ничего не удаляем.
-    let now = replica.next_hlc()?.ms;
+    //
+    // Собственное добавление, которое ни разу не входило в общую базу, при
+    // удалении забывается целиком: пир о пути не знает, а мягкое удаление без
+    // общей базы только расходится с его представлением и блокирует commit.
+    let has_peers = replica.has_peers()?;
+    if has_peers {
+        replica.prune_ghost_deletes()?;
+    }
+    let hlc = replica.next_hlc()?;
     for e in replica.local_entries()? {
         if e.deleted || seen.contains(&e.path) || replica.is_ignored(&e.path)? {
             continue;
         }
-        replica.record_pending_delete(&e.path, &e.blob, now)?;
+        if has_peers && replica.is_local_only(&e.path)? {
+            replica.forget_never_shared(&e.path)?;
+            continue;
+        }
+        replica.record_pending_delete(&e.path, &e.blob, hlc)?;
         replica.mark_absent(&e.path)?;
         report.missing.push(e.path);
     }

@@ -49,12 +49,26 @@ const I18N = (() => {
     'error.unknown': 'Unknown error',
   };
 
-  const lang = (navigator.language || 'en').toLowerCase().startsWith('ru') ? 'ru' : 'en';
-  const dict = lang === 'ru' ? ru : en;
+  const saved = localStorage.getItem('syncth.lang');
+  const chosen = saved === 'ru' || saved === 'en';
+  let lang = chosen ? saved : ((navigator.language || 'en').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+  let dict = lang === 'ru' ? ru : en;
 
   function t(key, vars = {}) {
     const text = dict[key] ?? key;
     return text.replace(/\{(\w+)\}/g, (_, name) => (vars[name] ?? ''));
+  }
+
+  function setLang(next) {
+    lang = next === 'ru' ? 'ru' : 'en';
+    dict = lang === 'ru' ? ru : en;
+    try {
+      localStorage.setItem('syncth.lang', lang);
+    } catch {
+      // Выбор всё равно применится до перезапуска.
+    }
+    apply();
+    return lang;
   }
 
   function apply() {
@@ -67,7 +81,13 @@ const I18N = (() => {
     });
   }
 
-  return { lang, t, apply };
+  return {
+    get lang() { return lang; },
+    get chosen() { return chosen || localStorage.getItem('syncth.lang') === 'ru' || localStorage.getItem('syncth.lang') === 'en'; },
+    t,
+    setLang,
+    apply,
+  };
 })();
 
 window.I18N = I18N;

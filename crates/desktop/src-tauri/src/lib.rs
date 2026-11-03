@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PROTO};
+use syncth_core::net::{PreviewSession, SYNC_PORT};
+use syncth_core::plan::{ChangeKind, Plan};
 use syncth_core::transport::Transport;
-use syncth_core::Replica;
+use syncth_core::{scan, vault, Decision, Hlc, Replica};
 use tauri::Manager;
 
 const UI_ADDR: &str = "127.0.0.1:47889";
@@ -43,12 +45,61 @@ struct Desktop {
     /// Демон, запущенный именно этим окном. Нужен, чтобы не плодить процессы.
     child: Mutex<Option<std::process::Child>>,
     agent: Mutex<AgentState>,
+    workspace: Mutex<WorkspaceState>,
 }
 
 #[derive(Default)]
 struct AgentState {
     session: Option<LiveSession>,
     last_error: Option<String>,
+}
+
+/// Полный синк ПК↔телефон идёт поверх того же TCP-протокола, что у демона,
+/// но живёт прямо в приложении: отдельного процесса не нужно.
+#[derive(Default)]
+struct WorkspaceState {
+    session: Option<PreviewSession>,
+    /// ADB-туннель к приёмнику `47887`: серийник и локальный порт.
+    adb_sync: Option<(String, u16)>,
+    phone_scan: Option<PhoneScanView>,
+    pc_scan: Option<PcScanView>,
+    phone_error: Option<String>,
+    session_error: Option<String>,
+    checked_at: Option<u64>,
+}
+
+impl WorkspaceState {
+    fn close(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.close();
+        }
+        if let Some((serial, port)) = self.adb_sync.take() {
+            let _ = run_adb(&[
+                "-s",
+                &serial,
+                "forward",
+                "--remove",
+                &format!("tcp:{port}"),
+            ]);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PhoneScanView {
+    root: String,
+    count: usize,
+    total: u64,
+    at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PcScanView {
+    added: usize,
+    changed: usize,
+    renamed: usize,
+    missing: usize,
+    at: u64,
 }
 
 /// Постоянное соединение с телефоном. Живёт, пока открыт ПК-клиент.
@@ -80,6 +131,9 @@ struct Config {
     daemon_bin: Option<String>,
     /// Сопряжённый Android-агент. Путь к папке хранится здесь, на ПК.
     agent: Option<AgentLink>,
+    /// Новые файлы не переносятся автоматически: человек выбирает
+    /// «перенести» или «оставить только на другой стороне».
+    manual_additions: bool,
 }
 
 // ------------------------------------------------------------------ paths
@@ -488,14 +542,21 @@ fn close_session(app: &tauri::AppHandle) {
 /// процесс всё равно закроет сокет, и телефон увидит разрыв.
 fn close_session_now(app: &tauri::AppHandle) {
     let state = app.state::<Desktop>();
-    let Ok(mut guard) = state.agent.try_lock() else {
-        return;
-    };
-    if let Some(mut session) = guard.session.take() {
-        let _ = session.transport.set_write_timeout(Some(BYE_TIMEOUT));
-        let _ = agent::send(session.transport.as_mut(), &AgentMsg::Bye);
-        session.transport.shutdown();
+    {
+        let Ok(mut guard) = state.agent.try_lock() else {
+            return;
+        };
+        if let Some(mut session) = guard.session.take() {
+            let _ = session.transport.set_write_timeout(Some(BYE_TIMEOUT));
+            let _ = agent::send(session.transport.as_mut(), &AgentMsg::Bye);
+            session.transport.shutdown();
+        }
     }
+    // Полный сеанс тоже закрываем: иначе телефон будет ждать commit,
+    // пока ОС не прибьёт сокет, а ADB-туннель останется висеть.
+    if let Ok(mut workspace) = state.workspace.try_lock() {
+        workspace.close();
+    };
 }
 
 /// Выполняет команду на уже открытом сеансе.
@@ -627,6 +688,102 @@ async fn discover_agents() -> Result<Value, String> {
         Ok(json!({ "devices": devices, "linked": linked }))
     })
     .await
+}
+
+const FIREWALL_RULE: &str = "SynctMusic LAN discovery";
+
+/// Добавляет постоянное правило для входящих UDP-ответов discovery.
+///
+/// Приложение обычно запущено без прав администратора, поэтому правило
+/// добавляет этот же exe, перезапущенный через UAC с флагом
+/// `--allow-firewall`. Профиль `any` нужен потому, что Windows часто
+/// считает домашнюю сеть доменной.
+#[tauri::command]
+async fn allow_lan_discovery() -> Result<Value, String> {
+    #[cfg(not(windows))]
+    {
+        return Ok(json!({ "allowed": false, "reason": "unsupported" }));
+    }
+
+    #[cfg(windows)]
+    {
+        blocking(|| {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let exe_text = exe.to_string_lossy().replace('\'', "''");
+            let script = format!(
+                "$p = Start-Process -FilePath '{exe_text}' -ArgumentList '--allow-firewall' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+            );
+            let status = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    &script,
+                ])
+                .status()
+                .map_err(|e| format!("Не удалось запустить PowerShell: {e}"))?;
+            if !status.success() {
+                return Err(
+                    "Правило не добавлено: запрос администратора отменён или netsh вернул ошибку."
+                        .to_string(),
+                );
+            }
+            Ok(json!({ "allowed": true }))
+        })
+        .await
+    }
+}
+
+/// Выполняется в elevated-процессе. Возвращает код выхода.
+pub fn firewall_helper() -> i32 {
+    match add_firewall_rule() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn add_firewall_rule() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let program = format!("program={}", exe.to_string_lossy());
+
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={FIREWALL_RULE}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let output = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={FIREWALL_RULE}"),
+            "dir=in",
+            "action=allow",
+            &program,
+            "protocol=udp",
+            "profile=any",
+            "enable=yes",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("netsh: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 #[tauri::command]
@@ -778,47 +935,7 @@ async fn agent_request_root_change(app: tauri::AppHandle) -> Result<Value, Strin
 
 #[tauri::command]
 async fn agent_scan(app: tauri::AppHandle) -> Result<Value, String> {
-    blocking(move || {
-        let (root, entries) = with_session(&app, |session| {
-            session
-                .transport
-                .set_read_timeout(Some(Duration::from_secs(610)))
-                .map_err(|error| format!("{error:#}"))?;
-            agent::send(session.transport.as_mut(), &AgentMsg::Scan)
-                .map_err(|e| format!("{e:#}"))?;
-
-            match agent::recv(session.transport.as_mut()).map_err(|e| format!("{e:#}"))? {
-                AgentMsg::Manifest { root, entries } => {
-                    session.root = Some(root.clone());
-                    session.link.root = Some(root.clone());
-                    Ok(Ok((root, entries)))
-                }
-                AgentMsg::Error { message } => Ok(Err(message)),
-                other => Err(format!("телефон ответил неожиданно: {other:?}")),
-            }
-        })?;
-
-        let total: u64 = entries.iter().map(|entry| entry.size).sum();
-        let preview = entries
-            .iter()
-            .take(200)
-            .map(|entry| json!({ "path": entry.path, "size": entry.size }))
-            .collect::<Vec<_>>();
-
-        let mut updated = load_config()
-            .agent
-            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
-        updated.root = Some(root.clone());
-        save_agent_link(updated)?;
-
-        Ok(json!({
-            "root": root,
-            "count": entries.len(),
-            "total": total,
-            "preview": preview,
-        }))
-    })
-    .await
+    blocking(move || scan_phone_now(&app)).await
 }
 
 #[tauri::command]
@@ -884,6 +1001,614 @@ fn agent_forget(app: tauri::AppHandle) -> Result<Value, String> {
     }
     save_config(&config)?;
     Ok(json!({ "linked": false }))
+}
+
+// ------------------------------------------------------------------ workspace
+
+/// Реплика библиотеки на ПК. Соединение с телефоном живёт в памяти окна,
+/// поэтому каждая команда открывает свежий SQLite-хэндл: WAL это допускает.
+fn workspace_replica() -> Result<Replica, String> {
+    let config = load_config();
+    let root =
+        effective_root(&config).ok_or_else(|| "Сначала выберите папку с музыкой".to_string())?;
+    if !root.is_dir() {
+        return Err(format!("Папка библиотеки не найдена: {}", root.display()));
+    }
+    let data_dir = effective_data_dir(&config);
+    std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+    let replica = Replica::open(&data_dir, &default_device_id(&data_dir))
+        .map_err(|error| format!("{error:#}"))?;
+    let known = replica.root().map_err(|error| format!("{error:#}"))?;
+    if known.as_deref() != Some(root.as_path()) {
+        replica
+            .set_root(&root)
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(replica)
+}
+
+fn parse_decision(action: &str) -> Result<Decision, String> {
+    Ok(match action {
+        "accept" => Decision::Accept,
+        "revert" => Decision::Revert,
+        "keep" => Decision::Keep,
+        "delete_everywhere" => Decision::DeleteEverywhere,
+        "keep_in_library" => Decision::KeepInLibrary,
+        "only_here" => Decision::OnlyHere,
+        "keep_both" => Decision::KeepBoth,
+        other => return Err(format!("Неизвестное решение: {other}")),
+    })
+}
+
+fn plan_payload(plan: &Plan) -> Value {
+    let changes = plan
+        .local
+        .iter()
+        .chain(plan.remote.iter())
+        .map(|change| {
+            json!({
+                "path": &change.path,
+                "from": &change.from,
+                "kind": change.kind,
+                "side": change.side,
+                "size": change.size,
+                "present": change.present,
+                "ignored": change.ignored,
+                "decision": plan.effective_decision(&change.path).map(Decision::as_str),
+                // Удаление по умолчанию «оставить», поэтому одного decision
+                // мало: интерфейсу нужно знать, подтвердил ли это человек.
+                "decided": plan.explicit_entry(&change.path).is_some(),
+                // Совпавшие файлы нужны коммиту для фиксации базы, но в
+                // списке изменений и в счётчике их быть не должно.
+                "aligned": change.aligned,
+                "unresolved": plan.conflict(&change.path).is_some()
+                    && plan.explicit_entry(&change.path).is_none(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let conflicts = plan
+        .conflicts
+        .iter()
+        .map(|conflict| {
+            json!({
+                "path": &conflict.path,
+                "reason": conflict.reason,
+                "local_path": &conflict.local_path,
+                "remote_path": &conflict.remote_path,
+                "local_size": conflict.local_size,
+                "remote_size": conflict.remote_size,
+                "local_blob": &conflict.local_blob,
+                "remote_blob": &conflict.remote_blob,
+                "decision": plan.effective_decision(&conflict.path).map(Decision::as_str),
+                "unresolved": plan.explicit_entry(&conflict.path).is_none(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "peer": { "dev": &plan.peer_dev, "name": &plan.peer_name },
+        "created_at": plan.created_at,
+        "expires_at": plan.expires_at,
+        "version": plan.version,
+        "paths": plan.path_count(),
+        "aligned": plan.aligned_count(),
+        "unresolved": plan.unresolved(),
+        "changes": changes,
+        "conflicts": conflicts,
+    })
+}
+
+fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceState) -> Value {
+    let config = load_config();
+    let link = config.agent;
+    let live = replica.live_entries().unwrap_or_default();
+    let files = live.len();
+    let total = live.iter().map(|entry| entry.size).sum::<u64>();
+    let local = replica.local_entries().map(|rows| rows.len()).unwrap_or(0);
+    let vault_rows = replica.vault_rows().unwrap_or_default();
+    let vault_size = vault_rows.iter().map(|row| row.size).sum::<u64>();
+    let pending = replica
+        .pending_deletes()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| json!({ "path": row.path, "detected_at": row.detected_at }))
+        .collect::<Vec<_>>();
+    let peers = replica
+        .known_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|peer| json!({ "dev": peer.dev, "name": peer.name, "addr": peer.addr }))
+        .collect::<Vec<_>>();
+
+    let (agent_connected, agent_error) = {
+        let state = app.state::<Desktop>();
+        let values = match state.agent.try_lock() {
+            Ok(guard) => (guard.session.is_some(), guard.last_error.clone()),
+            // Команда уже держит сеанс — значит, связь есть.
+            Err(_) => (true, None),
+        };
+        values
+    };
+
+    let session = ws.session.as_ref().map(|session| {
+        json!({
+            "open": true,
+            "peer": { "dev": &session.peer_dev, "name": &session.peer_name },
+            "paths": session.paths(),
+            "unresolved": session.unresolved(),
+            "read_only": session.read_only,
+            "finished": session.finished,
+            "diverged": session.diverged,
+            "hash": session.decisions_hash(),
+        })
+    });
+
+    json!({
+        "pc": {
+            "root": replica.root().ok().flatten().map(|path| path.to_string_lossy().to_string()),
+            "device": replica.device_id(),
+            "name": replica.device_name(),
+            "files": files,
+            "local": local,
+            "total": total,
+            "vault_files": vault_rows.len(),
+            "vault_size": vault_size,
+            "pending": pending,
+            "peers": peers,
+        },
+        "manual_additions": config.manual_additions,
+        "phone": link.map(|link| json!({
+            "linked": true,
+            "connected": agent_connected,
+            "error": agent_error,
+            "dev": link.dev,
+            "name": link.name,
+            "addr": link.addr,
+            "root": link.root,
+            "serial": link.serial,
+        })).unwrap_or_else(|| json!({ "linked": false, "connected": false })),
+        "phone_scan": ws.phone_scan.as_ref(),
+        "pc_scan": ws.pc_scan.as_ref(),
+        "phone_error": ws.phone_error,
+        "session_error": ws.session_error,
+        "checked_at": ws.checked_at,
+        "session": session,
+        "plan": ws.session.as_ref().map(|session| plan_payload(&session.plan)),
+        "vault": vault_rows.into_iter().map(|row| json!({
+            "path": row.path,
+            "size": row.size,
+            "deleted_at": row.deleted_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Спрашивает телефон, поднят ли у него приём полной синхронизации.
+fn query_sync_info(app: &tauri::AppHandle) -> Result<(u16, Option<String>), String> {
+    with_session(app, |session| {
+        session
+            .transport
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("{error:#}"))?;
+        agent::send(session.transport.as_mut(), &AgentMsg::GetSyncInfo)
+            .map_err(|error| format!("{error:#}"))?;
+        loop {
+            match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
+                AgentMsg::SyncInfo { port, error } => return Ok(Ok((port, error))),
+                AgentMsg::Error { message } => return Ok(Err(message)),
+                _ => continue,
+            }
+        }
+    })
+}
+
+/// Адрес приёмника `47887` на телефоне. По Wi-Fi это тот же IP, что у агента;
+/// по USB — отдельный `adb forward`, который снимается при закрытии сеанса.
+fn phone_sync_addr(ws: &mut WorkspaceState) -> Result<String, String> {
+    let link = load_config()
+        .agent
+        .ok_or_else(|| "Телефон не подключён".to_string())?;
+    if let Some(serial) = link.serial.clone().filter(|value| !value.is_empty()) {
+        // Сначала создаём новый туннель и только потом убираем старый. Если
+        // снять порт заранее, adb может выдать тот же номер, но слушатель
+        // ещё не будет готов, и первый коннект получит отказ.
+        let previous = ws.adb_sync.clone();
+        let text = run_adb(&[
+            "-s",
+            &serial,
+            "forward",
+            "tcp:0",
+            &format!("tcp:{SYNC_PORT}"),
+        ])?;
+        let port = text
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("adb не выдал порт: {}", text.trim()))?;
+        if let Some((old_serial, old_port)) = previous {
+            if old_port != port {
+                let _ = run_adb(&[
+                    "-s",
+                    &old_serial,
+                    "forward",
+                    "--remove",
+                    &format!("tcp:{old_port}"),
+                ]);
+            }
+        }
+        ws.adb_sync = Some((serial, port));
+        return Ok(format!("127.0.0.1:{port}"));
+    }
+    let ip = link
+        .addr
+        .rsplit_once(':')
+        .map(|(ip, _)| ip)
+        .filter(|ip| !ip.is_empty())
+        .ok_or_else(|| "Адрес телефона не сохранён".to_string())?;
+    Ok(format!("{ip}:{SYNC_PORT}"))
+}
+
+/// Открывает preview-сеанс, если его нет, и забирает решения телефона.
+fn ensure_preview(
+    app: &tauri::AppHandle,
+    ws: &mut WorkspaceState,
+    replica: &mut Replica,
+) -> Result<(), String> {
+    let link = load_config()
+        .agent
+        .ok_or_else(|| "Телефон не подключён".to_string())?;
+
+    if let Some(session) = ws.session.as_mut() {
+        if !session.finished && session.peer_dev == link.dev {
+            if let Err(error) = session.poll(replica) {
+                ws.close();
+                return Err(format!("{error:#}"));
+            }
+            return Ok(());
+        }
+        ws.close();
+    }
+
+    // Ошибка в статусе приёмника может быть устаревшей: слушатель уже поднят,
+    // а прошлый сеанс оборвался. Пробуем подключиться в любом случае, а
+    // подсказку телефона показываем только если все попытки не удались.
+    let sync_hint = match query_sync_info(app) {
+        Ok((_port, Some(error))) => Some(error),
+        _ => None,
+    };
+
+    let addr = phone_sync_addr(ws)?;
+    let mut last = String::new();
+    for attempt in 0..4 {
+        match PreviewSession::open(replica, &addr, &link.token) {
+            Ok(mut session) => {
+                let _ = session.poll(replica);
+                ws.session = Some(session);
+                return Ok(());
+            }
+            Err(error) => {
+                last = format!("{error:#}");
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    match sync_hint {
+        Some(hint) => Err(format!(
+            "Не удалось открыть сеанс с телефоном: {last}. Приём на телефоне сообщает: {hint}"
+        )),
+        None => Err(format!("Не удалось открыть сеанс с телефоном: {last}")),
+    }
+}
+
+/// Скан телефона через агентский сеанс. Заодно обновляет сохранённый корень.
+fn scan_phone_now(app: &tauri::AppHandle) -> Result<Value, String> {
+    let (root, entries) = with_session(app, |session| {
+        session
+            .transport
+            .set_read_timeout(Some(Duration::from_secs(610)))
+            .map_err(|error| format!("{error:#}"))?;
+        agent::send(session.transport.as_mut(), &AgentMsg::Scan)
+            .map_err(|error| format!("{error:#}"))?;
+
+        match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
+            AgentMsg::Manifest { root, entries } => {
+                session.root = Some(root.clone());
+                session.link.root = Some(root.clone());
+                Ok(Ok((root, entries)))
+            }
+            AgentMsg::Error { message } => Ok(Err(message)),
+            other => Err(format!("телефон ответил неожиданно: {other:?}")),
+        }
+    })?;
+
+    let total = entries.iter().map(|entry| entry.size).sum::<u64>();
+    let mut config = load_config();
+    if let Some(link) = config.agent.as_mut() {
+        link.root = Some(root.clone());
+        save_config(&config)?;
+    }
+    Ok(json!({
+        "root": root,
+        "count": entries.len(),
+        "total": total,
+    }))
+}
+
+fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
+    let mut replica = workspace_replica()?;
+    let root = replica
+        .root()
+        .map_err(|error| format!("{error:#}"))?
+        .ok_or_else(|| "Корень библиотеки не задан".to_string())?;
+    let report = scan::scan(&root, &mut replica).map_err(|error| format!("{error:#}"))?;
+
+    let phone = scan_phone_now(app);
+    let desktop = app.state::<Desktop>();
+    let mut ws = desktop
+        .workspace
+        .lock()
+        .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+
+    ws.pc_scan = Some(PcScanView {
+        added: report.added,
+        changed: report.changed,
+        renamed: report.renamed,
+        missing: report.missing.len(),
+        at: Hlc::wall_ms(),
+    });
+
+    match phone {
+        Ok(value) => {
+            ws.phone_error = None;
+            ws.phone_scan = Some(PhoneScanView {
+                root: value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                count: value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
+                total: value.get("total").and_then(Value::as_u64).unwrap_or(0),
+                at: Hlc::wall_ms(),
+            });
+        }
+        Err(error) => {
+            ws.phone_scan = None;
+            ws.phone_error = Some(error);
+        }
+    }
+
+    ws.checked_at = Some(Hlc::wall_ms());
+    // «Проверить» пересобирает план по свежим сканам. Старый сеанс
+    // держал бы план, построенный до сканирования, поэтому закрываем его.
+    ws.close();
+    ws.session_error = match ensure_preview(app, &mut ws, &mut replica) {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+    Ok(workspace_payload(app, &replica, &ws))
+}
+
+#[tauri::command]
+async fn workspace_refresh(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || refresh_workspace(&app)).await
+}
+
+#[tauri::command]
+async fn workspace_status(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        if let Some(session) = ws.session.as_mut() {
+            if !session.finished {
+                if let Err(error) = session.poll(&mut replica) {
+                    ws.close();
+                    ws.session_error = Some(format!("{error:#}"));
+                }
+            }
+        }
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn workspace_decide(
+    app: tauri::AppHandle,
+    path: String,
+    action: String,
+) -> Result<Value, String> {
+    blocking(move || {
+        let decision = parse_decision(&action)?;
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        let Some(session) = ws.session.as_mut() else {
+            return Err("Сначала проверьте папки: сеанс ещё не открыт".to_string());
+        };
+        session
+            .record_decision(&mut replica, &path, decision)
+            .map_err(|error| format!("{error:#}"))?;
+        session
+            .poll(&mut replica)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn workspace_undecide(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        let Some(session) = ws.session.as_mut() else {
+            return Err("Сначала проверьте папки: сеанс ещё не открыт".to_string());
+        };
+        session
+            .forget_decision(&mut replica, &path)
+            .map_err(|error| format!("{error:#}"))?;
+        session
+            .poll(&mut replica)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
+/// Ручной режим добавлений. Настройка общая для всех сеансов, поэтому живёт
+/// в конфиге, а не в состоянии окна.
+#[tauri::command]
+fn workspace_set_manual(enabled: bool) -> Result<Value, String> {
+    let mut config = load_config();
+    config.manual_additions = enabled;
+    save_config(&config)?;
+    Ok(json!({ "enabled": enabled }))
+}
+
+#[tauri::command]
+async fn workspace_commit(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        let Some(session) = ws.session.as_mut() else {
+            return Err("Сеанс ещё не открыт".to_string());
+        };
+
+        // Удаление никогда не применяется по умолчанию: человек должен
+        // явно выбрать «удалить везде» или «оставить».
+        let undecided = session
+            .plan
+            .local
+            .iter()
+            .chain(session.plan.remote.iter())
+            .filter(|change| {
+                change.kind == ChangeKind::Deleted
+                    && session.plan.explicit_entry(&change.path).is_none()
+            })
+            .count();
+        if undecided > 0 {
+            return Err(format!(
+                "Удаления без решения: {undecided}. Подтвердите их в списке решений."
+            ));
+        }
+
+        // В ручном режиме новые файлы тоже ждут решения: иначе удалённый
+        // до первого скана файл молча вернулся бы с ПК на телефон.
+        if load_config().manual_additions {
+            let additions = session
+                .plan
+                .local
+                .iter()
+                .chain(session.plan.remote.iter())
+                .filter(|change| {
+                    change.kind == ChangeKind::Added
+                        && !change.aligned
+                        && session.plan.explicit_entry(&change.path).is_none()
+                })
+                .count();
+            if additions > 0 {
+                return Err(format!(
+                    "Новые файлы без решения: {additions}. Выберите «Перенести» \
+                     или «Оставить на другой стороне»."
+                ));
+            }
+        }
+
+        let outcome = match session.commit(&mut replica) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!("{error:#}");
+                ws.close();
+                ws.session_error = Some(message.clone());
+                return Err(message);
+            }
+        };
+        ws.close();
+        ws.session_error = None;
+
+        let mut scanned = None;
+        if let Ok(Some(root)) = replica.root() {
+            if let Ok(report) = scan::scan(&root, &mut replica) {
+                scanned = Some(PcScanView {
+                    added: report.added,
+                    changed: report.changed,
+                    renamed: report.renamed,
+                    missing: report.missing.len(),
+                    at: Hlc::wall_ms(),
+                });
+            }
+        }
+        ws.pc_scan = scanned;
+
+        Ok(json!({
+            "accepted": outcome.accepted,
+            "rejected": outcome.rejected,
+            "scan": ws.pc_scan.as_ref(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn workspace_restore(path: String) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        vault::restore(&mut replica, &path).map_err(|error| format!("{error:#}"))?;
+        let mut report = None;
+        if let Ok(Some(root)) = replica.root() {
+            report = scan::scan(&root, &mut replica).ok();
+        }
+        Ok(json!({
+            "path": path,
+            "added": report.as_ref().map(|report| report.added).unwrap_or(0),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn workspace_gc(ttl_days: Option<u64>) -> Result<Value, String> {
+    blocking(move || {
+        let replica = workspace_replica()?;
+        let report =
+            vault::gc(&replica, ttl_days.unwrap_or(30)).map_err(|error| format!("{error:#}"))?;
+        Ok(json!({
+            "rows": report.rows_removed,
+            "blobs": report.blobs_removed,
+            "orphans": report.orphans_removed,
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+fn workspace_close(app: tauri::AppHandle) -> Value {
+    let desktop = app.state::<Desktop>();
+    if let Ok(mut ws) = desktop.workspace.lock() {
+        ws.close();
+        ws.session_error = None;
+    }
+    json!({ "closed": true })
 }
 
 // ------------------------------------------------------------------ commands
@@ -1281,27 +2006,15 @@ pub fn run() {
                 close_session_now(window.app_handle());
             }
         })
-        // Отладочный канал: позволяет прогнать сценарий интерфейса без кликов.
-        // В релизе отсутствует.
         .setup(|app| {
             start_heartbeat(app.handle().clone());
-            #[cfg(debug_assertions)]
-            if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
-                use tauri::Manager;
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(2500));
-                    if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.eval(&script);
-                    }
-                });
-            }
             let _ = app;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
             discover_agents,
+            allow_lan_discovery,
             discover_adb,
             agent_connect,
             agent_connect_adb,
@@ -1312,6 +2025,15 @@ pub fn run() {
             agent_scan,
             agent_link,
             agent_forget,
+            workspace_refresh,
+            workspace_status,
+            workspace_decide,
+            workspace_undecide,
+            workspace_set_manual,
+            workspace_commit,
+            workspace_restore,
+            workspace_gc,
+            workspace_close,
             daemon_status,
             daemon_pair_code,
             daemon_plan,

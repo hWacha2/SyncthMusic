@@ -72,6 +72,8 @@ fn pair() -> (Ctx, Replica, Replica) {
     copy_tree(&ctx.root_a, &ctx.root_b);
     scan::scan(&ctx.root_b, &mut b).unwrap();
     sync(&mut a, &mut b, &ctx.pipe);
+    a.confirm_synced().unwrap();
+    b.confirm_synced().unwrap();
     assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
     (ctx, a, b)
 }

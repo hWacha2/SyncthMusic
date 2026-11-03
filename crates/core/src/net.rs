@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,8 +39,11 @@ const MAX_MSG: usize = 256 * 1024 * 1024;
 const DISCOVERY_PORT: u16 = 47_888;
 /// Порт, на котором телефон и ПК слушают синхронизацию по умолчанию.
 pub const SYNC_PORT: u16 = 47_887;
-/// Версия протокола. `2` отклоняется: там не было предварительного плана.
-pub const PROTO: u32 = 3;
+/// Версия протокола.
+///
+/// `2` отклоняется: там не было предварительного плана. `4` добавила отмену
+/// решений и передачу «мягких» удалений в предпросмотре.
+pub const PROTO: u32 = 5;
 /// Как часто живая сессия шлёт heartbeat и проверяет локальные решения.
 const SESSION_TICK: Duration = Duration::from_millis(100);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
@@ -373,7 +376,7 @@ fn receive_blob<R: Read>(
                 // Не совпало (или базы нет): правили оба — сохраняем копию.
                 let base = replica.synced_blob(&t.path)?;
                 if base.is_empty() || base != h {
-                    save_conflict_copy(replica, root, &dst, &t.path)?;
+                    commit::save_conflict_copy(replica, root, &dst, &t.path)?;
                 }
             }
         }
@@ -386,41 +389,6 @@ fn receive_blob<R: Read>(
 
     let _ = std::fs::remove_file(&part);
     Ok((received, placed))
-}
-
-/// Убирает занятый путь в conflict-copy и публикует её как обычный файл,
-/// чтобы она не потерялась и уехала на другие устройства.
-fn save_conflict_copy(
-    replica: &mut Replica,
-    root: &Path,
-    existing: &Path,
-    rel: &str,
-) -> Result<()> {
-    let old_blob = scan::hash_file(existing)?;
-    let meta = std::fs::metadata(existing)?;
-    let old_mtime = scan::mtime_ns_public(&meta);
-    let old_size = meta.len();
-
-    let conflict_rel = path::conflict_name(rel, replica.device_id(), Hlc::wall_ms());
-    let conflict_abs = disk_path(root, &conflict_rel);
-    if let Some(parent) = conflict_abs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::rename(existing, &conflict_abs)
-        .with_context(|| format!("сохранение {}", conflict_abs.display()))?;
-
-    let kind = OpKind::EntryPut {
-        path: conflict_rel.clone(),
-        blob: old_blob,
-        size: old_size,
-        mtime_ns: old_mtime,
-        added_at: replica.next_hlc()?.ms,
-    };
-    let op = replica.make_op(kind)?;
-    replica.apply(&op)?;
-    // Файл уже лежит на диске под новым именем.
-    replica.mark_present(&conflict_rel)?;
-    Ok(())
 }
 
 fn disk_path(root: &Path, rel: &str) -> PathBuf {
@@ -659,9 +627,6 @@ fn receive_blob_resumable<R: Read>(
     offset: u64,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    if size == 0 {
-        bail!("пустой блоб {blob}");
-    }
     let part = commit::part_path(replica, blob)?;
     if let Some(parent) = part.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1002,7 +967,8 @@ impl PreviewSession {
         };
 
         // Свой манифест и сохранённые решения — пиру. Он ответит тем же.
-        let local_ops = replica.ops_since(&peer_have)?;
+        let mut local_ops = replica.preview_ops(&peer_have)?;
+        Self::send_pending_deletes(replica, &mut local_ops)?;
         let local_decisions = replica.load_decisions(&peer_dev)?;
         send_msg(
             &mut w,
@@ -1023,7 +989,13 @@ impl PreviewSession {
 
         let mut merged = local_decisions;
         merged.merge(&peer_decisions);
-        let mut plan = plan::build(replica, &peer_dev, &peer_name, &remote_ops)?;
+        let mut plan = plan::build_with_peer_have(
+            replica,
+            &peer_dev,
+            &peer_name,
+            &remote_ops,
+            Some(&peer_have),
+        )?;
         if version > plan.version {
             plan.version = version;
         }
@@ -1051,11 +1023,18 @@ impl PreviewSession {
     ) -> Result<Self> {
         let mut merged = replica.load_decisions(peer_dev)?;
         merged.merge(&peer_decisions);
-        let mut plan = plan::build(replica, peer_dev, peer_name, remote_ops)?;
+        let mut plan = plan::build_with_peer_have(
+            replica,
+            peer_dev,
+            peer_name,
+            remote_ops,
+            Some(peer_have),
+        )?;
         merged.retain_valid(&plan);
         plan.decisions = merged.clone();
 
-        let local_ops = replica.ops_since(peer_have)?;
+        let mut local_ops = replica.preview_ops(peer_have)?;
+        Self::send_pending_deletes(replica, &mut local_ops)?;
         let ack = Msg::PreviewAck {
             ops: local_ops,
             decisions: merged.clone(),
@@ -1149,6 +1128,47 @@ impl PreviewSession {
         Ok(())
     }
 
+    /// Снять решение по пути: он снова становится нерешённым (или получает
+    /// действие по умолчанию). Отмена — такое же общее состояние, как и само
+    /// решение, поэтому она хранится как `Unset` со свежим HLC: переживает
+    /// переподключение и перебивает устаревшее решение пира.
+    pub fn forget_decision(&mut self, replica: &mut Replica, path: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only,
+            "передача уже началась — решения заморожены"
+        );
+        anyhow::ensure!(!self.finished, "сессия уже завершена");
+
+        let mut set = replica.load_decisions(&self.peer_dev)?;
+        let blob = self
+            .plan
+            .blob_for(path)
+            .or_else(|| set.get(path).map(|decision| decision.blob.clone()))
+            .unwrap_or_default();
+        let decision = PathDecision {
+            path: path.to_string(),
+            action: Decision::Unset,
+            blob,
+            hlc: replica.next_hlc()?,
+            dev: replica.device_id().to_string(),
+        };
+        set.entries.insert(path.to_string(), decision.clone());
+        replica.save_decisions(&self.peer_dev, &set)?;
+        self.plan.decisions = set;
+        replica.save_plan(&self.plan)?;
+        self.announced.insert(path.to_string(), decision.clone());
+
+        // Отмену шлём сразу, не дожидаясь poll: иначе набранная следом новая
+        // кнопка могла бы уйти раньше, чем пир забудет старое решение.
+        self.send(&Msg::Decision(decision))?;
+        let hash = self.plan.decisions_hash();
+        self.send(&Msg::DecisionState {
+            hash,
+            version: self.plan.version,
+        })?;
+        Ok(())
+    }
+
     /// Один шаг живой сессии: отправить новые локальные решения, принять
     /// входящие, сравнить сводки, при необходимости послать heartbeat.
     pub fn poll(&mut self, replica: &mut Replica) -> Result<()> {
@@ -1157,38 +1177,44 @@ impl PreviewSession {
         }
         self.pump_local(replica)?;
 
-        match try_recv_msg(&mut self.r)? {
-            None => {}
-            Some(Msg::Decision(decision)) => {
-                let mut one = DecisionSet::default();
-                one.entries.insert(decision.path.clone(), decision.clone());
-                let (merged, _) = replica.merge_decisions(&self.peer_dev, &one)?;
-                let mut merged = merged;
-                merged.retain_valid(&self.plan);
-                self.plan.decisions = merged;
-                self.announced.insert(decision.path.clone(), decision);
-                replica.save_plan(&self.plan)?;
-                let hash = self.plan.decisions_hash();
-                self.send(&Msg::DecisionState {
-                    hash,
-                    version: self.plan.version,
-                })?;
+        // Разбираем всё, что уже пришло: между решением и отменой пир успевает
+        // прислать несколько сводок, и одна из них не должна «застрять».
+        loop {
+            let Some(msg) = try_recv_msg(&mut self.r)? else {
+                break;
+            };
+            match msg {
+                Msg::Decision(decision) => {
+                    let mut one = DecisionSet::default();
+                    one.entries.insert(decision.path.clone(), decision.clone());
+                    let (merged, _) = replica.merge_decisions(&self.peer_dev, &one)?;
+                    let mut merged = merged;
+                    merged.retain_valid(&self.plan);
+                    self.plan.decisions = merged;
+                    self.announced.insert(decision.path.clone(), decision);
+                    replica.save_plan(&self.plan)?;
+                    let hash = self.plan.decisions_hash();
+                    self.send(&Msg::DecisionState {
+                        hash,
+                        version: self.plan.version,
+                    })?;
+                }
+                Msg::DecisionState { hash, .. } => {
+                    self.diverged = hash != self.plan.decisions_hash();
+                }
+                Msg::Heartbeat => {}
+                Msg::Commit { decisions_hash } => {
+                    self.accept_commit(replica, decisions_hash)?;
+                    return Ok(());
+                }
+                Msg::BlobNeed { .. } => {
+                    self.send(&Msg::Error {
+                        message: "обмен блобами идёт внутри commit".into(),
+                    })?;
+                }
+                Msg::Error { message } => bail!("пир вернул ошибку: {message}"),
+                other => bail!("неожиданное сообщение в сессии: {other:?}"),
             }
-            Some(Msg::DecisionState { hash, .. }) => {
-                self.diverged = hash != self.plan.decisions_hash();
-            }
-            Some(Msg::Heartbeat) => {}
-            Some(Msg::Commit { decisions_hash }) => {
-                self.accept_commit(replica, decisions_hash)?;
-                return Ok(());
-            }
-            Some(Msg::BlobNeed { .. }) => {
-                self.send(&Msg::Error {
-                    message: "обмен блобами идёт внутри commit".into(),
-                })?;
-            }
-            Some(Msg::Error { message }) => bail!("пир вернул ошибку: {message}"),
-            Some(other) => bail!("неожиданное сообщение в сессии: {other:?}"),
         }
 
         if self.last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
@@ -1238,7 +1264,41 @@ impl PreviewSession {
         Ok(())
     }
 
+    // ------------------------------------------------------------ pending
+
+    /// Отправляет пиру «мягкие» удаления из локального скана.
+    ///
+    /// Пока файл просто исчез, операция `EntryDel` не создаётся: сначала
+    /// пользователь должен решить, удалять ли его везде. Но вторая сторона
+    /// обязана увидеть удаление в плане — иначе решение примет только та
+    /// сторона, где файл пропал, а вторая даже не узнает о нём.
+    fn send_pending_deletes(replica: &mut Replica, ops: &mut Vec<Op>) -> Result<()> {
+        for pending in replica.pending_deletes()? {
+            ops.push(replica.make_op_at(
+                pending.hlc(),
+                OpKind::EntryDel {
+                    path: pending.path,
+                },
+            )?);
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------ commit
+
+    /// Ждём конкретный шаг commit, пропуская heartbeat.
+    ///
+    /// Пир шлёт heartbeat раз в 10 секунд и может успеть отправить его прямо
+    /// перед `Commit` — сообщение окажется в сокете раньше `CommitGo` и не
+    /// должно ломать рукопожатие.
+    fn recv_commit_msg(&mut self) -> Result<Msg> {
+        loop {
+            match recv_msg(&mut self.r)? {
+                Msg::Heartbeat => continue,
+                other => return Ok(other),
+            }
+        }
+    }
 
     /// Клиентская сторона commit: проверить план, обменяться операциями и
     /// блобами, применить только после полной загрузки. При обрыве `.part`
@@ -1255,7 +1315,7 @@ impl PreviewSession {
             self.send(&Msg::Commit {
                 decisions_hash: hash,
             })?;
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::CommitGo => {}
                 Msg::Error { message } => bail!("пир отказал в commit: {message}"),
                 other => bail!("ожидали commit_go, получили {other:?}"),
@@ -1266,7 +1326,7 @@ impl PreviewSession {
                 ops: prepared.ops.clone(),
                 needs: prepared.needs.clone(),
             })?;
-            let peer_ops = match recv_msg(&mut self.r)? {
+            let peer_ops = match self.recv_commit_msg()? {
                 Msg::CommitPlan { ops, .. } => ops,
                 Msg::Error { message } => bail!("пир отказал в плане commit: {message}"),
                 other => bail!("ожидали commit_plan, получили {other:?}"),
@@ -1280,7 +1340,7 @@ impl PreviewSession {
             serve_wants_resumable(&mut self.r, &mut self.w, replica, &root, &mut stats)?;
 
             self.send(&Msg::CommitReady)?;
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::CommitReady => {}
                 Msg::Error { message } => bail!("пир не готов к commit: {message}"),
                 other => bail!("ожидали commit_ready, получили {other:?}"),
@@ -1292,7 +1352,7 @@ impl PreviewSession {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,
             })?;
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::CommitDone { .. } => {}
                 Msg::Error { message } => bail!("пир сообщил об ошибке commit: {message}"),
                 other => bail!("ожидали commit_done, получили {other:?}"),
@@ -1304,6 +1364,9 @@ impl PreviewSession {
         })();
 
         let _ = self.session_tick();
+        if result.is_err() {
+            self.abort(replica);
+        }
         result
     }
 
@@ -1341,7 +1404,7 @@ impl PreviewSession {
                 ops: prepared.ops.clone(),
                 needs: prepared.needs.clone(),
             })?;
-            let peer_ops = match recv_msg(&mut self.r)? {
+            let peer_ops = match self.recv_commit_msg()? {
                 Msg::CommitPlan { ops, .. } => ops,
                 Msg::Error { message } => bail!("пир отказал: {message}"),
                 other => bail!("ожидали commit_plan, получили {other:?}"),
@@ -1355,7 +1418,7 @@ impl PreviewSession {
             self.receive_wanted(replica, &prepared.needs, &mut stats)?;
 
             self.send(&Msg::CommitReady)?;
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::CommitReady => {}
                 Msg::Error { message } => bail!("пир не готов к commit: {message}"),
                 other => bail!("ожидали commit_ready, получили {other:?}"),
@@ -1367,7 +1430,7 @@ impl PreviewSession {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,
             })?;
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::CommitDone { .. } => {}
                 Msg::Error { message } => bail!("пир сообщил об ошибке commit: {message}"),
                 other => bail!("ожидали commit_done, получили {other:?}"),
@@ -1379,6 +1442,9 @@ impl PreviewSession {
         })();
 
         let _ = self.session_tick();
+        if result.is_err() {
+            self.abort(replica);
+        }
         result
     }
 
@@ -1398,7 +1464,7 @@ impl PreviewSession {
             offsets,
         })?;
         loop {
-            match recv_msg(&mut self.r)? {
+            match self.recv_commit_msg()? {
                 Msg::BlobHead { blob, size, offset } => {
                     receive_blob_resumable(&mut self.r, replica, &blob, size, offset, stats)?;
                 }
@@ -1407,6 +1473,16 @@ impl PreviewSession {
                 other => bail!("ожидали блоб, получили {other:?}"),
             }
         }
+    }
+
+    /// Прервать сессию после ошибки commit. План и решения остаются в БД:
+    /// следующий `open` построит свежий план, а выбранные решения не придётся
+    /// выбирать заново. Главное — не оставлять `read_only` без `finished`:
+    /// иначе сессия навсегда замирает в состоянии «передача уже началась».
+    fn abort(&mut self, _replica: &mut Replica) {
+        self.finished = true;
+        self.read_only = true;
+        self.close();
     }
 
     /// Снять замороженный план и решения после успешного commit.
@@ -1565,41 +1641,95 @@ pub fn start_discovery_with(dev: String, name: String, port: u16, role: String) 
 pub fn discover_all(timeout: Duration) -> Result<Vec<Discovered>> {
     let sock = UdpSocket::bind(("0.0.0.0", 0))?;
     sock.set_broadcast(true)?;
-    sock.send_to(DISCOVERY_MAGIC, ("255.255.255.255", DISCOVERY_PORT))?;
-    sock.set_read_timeout(Some(timeout))?;
+
+    let targets = discovery_targets();
+    let deadline = std::time::Instant::now() + timeout;
+    sock.set_read_timeout(Some(Duration::from_millis(180)))?;
 
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
     let mut buf = [0u8; 512];
-    let deadline = std::time::Instant::now() + timeout;
+    let mut next_send = std::time::Instant::now();
     while std::time::Instant::now() < deadline {
+        if std::time::Instant::now() >= next_send {
+            // Повторяем: один broadcast-пакет легко теряется, особенно на
+            // Android, где Wi-Fi и мобильный интерфейс соседствуют.
+            for target in &targets {
+                let _ = sock.send_to(DISCOVERY_MAGIC, (*target, DISCOVERY_PORT));
+            }
+            next_send = std::time::Instant::now() + Duration::from_millis(320);
+        }
+
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
-                    if let (Some(dev), Some(port)) = (
-                        v.get("dev").and_then(|x| x.as_str()),
-                        v.get("port").and_then(|x| x.as_u64()),
-                    ) {
-                        found.push(Discovered {
-                            dev: dev.to_string(),
-                            name: v
-                                .get("name")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            addr: format!("{}:{port}", from.ip()),
-                            role: v
-                                .get("role")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("sync")
-                                .to_string(),
-                        });
-                    }
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) else {
+                    continue;
+                };
+                let (Some(dev), Some(port)) = (
+                    v.get("dev").and_then(|x| x.as_str()),
+                    v.get("port").and_then(|x| x.as_u64()),
+                ) else {
+                    continue;
+                };
+                if !seen.insert(dev.to_string()) {
+                    continue;
                 }
+                found.push(Discovered {
+                    dev: dev.to_string(),
+                    name: v
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    addr: format!("{}:{port}", from.ip()),
+                    role: v
+                        .get("role")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("sync")
+                        .to_string(),
+                });
             }
-            Err(_) => break,
+            Err(_) => continue,
         }
     }
     Ok(found)
+}
+
+/// Куда отправлять discovery-пакет: направленный broadcast каждого активного
+/// IPv4-интерфейса плюс глобальный `255.255.255.255` как запасной путь.
+///
+/// Только глобальный broadcast на Android/HyperOS часто не доходит: система
+/// привязывает сокет к Wi-Fi, а пакет уходит в никуда. Направленный адрес
+/// подсети (например, `192.168.8.255`) работает надёжно.
+fn discovery_targets() -> Vec<Ipv4Addr> {
+    let mut targets = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            if interface.is_loopback() {
+                continue;
+            }
+            let if_addrs::IfAddr::V4(v4) = interface.addr else {
+                continue;
+            };
+            if v4.ip.is_loopback() || v4.ip.is_unspecified() {
+                continue;
+            }
+            let target = v4
+                .broadcast
+                .unwrap_or_else(|| directed_broadcast(v4.ip, v4.netmask));
+            if !target.is_unspecified() {
+                targets.push(target);
+            }
+        }
+    }
+    targets.push(Ipv4Addr::BROADCAST);
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
 }
 
 /// Ищет устройства в локальной сети. Возвращает (dev, адрес).
@@ -1774,6 +1904,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directed_broadcast_uses_network_prefix() {
+        assert_eq!(
+            directed_broadcast(Ipv4Addr::new(192, 168, 8, 101), Ipv4Addr::new(255, 255, 255, 0)),
+            Ipv4Addr::new(192, 168, 8, 255)
+        );
+        assert_eq!(
+            directed_broadcast(Ipv4Addr::new(10, 20, 30, 40), Ipv4Addr::new(255, 255, 0, 0)),
+            Ipv4Addr::new(10, 20, 255, 255)
+        );
+    }
+
+    #[test]
     fn framing_roundtrip() {
         let mut buf = Vec::new();
         send_msg(
@@ -1852,6 +1994,23 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.dev == "dev-server"));
+    }
+
+    #[test]
+    fn zero_byte_blob_is_received_and_staged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        let replica = Replica::open(&tmp.path().join("state"), "dev-a").unwrap();
+        let blob = format!("b3:{}", blake3::hash(b"").to_hex());
+
+        let mut empty: &[u8] = &[];
+        let mut stats = SyncStats::default();
+        receive_blob_resumable(&mut empty, &replica, &blob, 0, 0, &mut stats).unwrap();
+
+        assert_eq!(stats.received_bytes, 0);
+        let staged = commit::verified(&replica, &blob).expect("пустой блоб должен быть принят");
+        assert_eq!(std::fs::metadata(staged).unwrap().len(), 0);
     }
 
     #[test]

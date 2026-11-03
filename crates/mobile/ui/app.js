@@ -75,9 +75,27 @@ function topbar() {
   </header>`;
 }
 
+function languageView() {
+  return `<section class="wait language">
+    ${topbar()}
+    <div class="wait-center">
+      <div class="wait-copy">
+        <h1 class="wait-title">SynctMusic</h1>
+        <p class="wait-hint">Выберите язык · Choose your language</p>
+      </div>
+      <div class="language-choices">
+        <button class="ghost language-choice" data-lang="ru">Русский</button>
+        <button class="ghost language-choice" data-lang="en">English</button>
+      </div>
+    </div>
+  </section>`;
+}
+
 function waitingView() {
   const info = state.info || {};
-  const statusError = info.error
+  // Пока связь установлена, ошибка прошлого сеанса не должна висеть рядом
+  // со статусом «подключено».
+  const statusError = info.error && !info.connected
     ? `<p class="agent-error" role="alert">${esc(t('agent.error', { error: info.error }))}</p>`
     : '';
 
@@ -108,7 +126,9 @@ function waitingView() {
 function readyView() {
   const info = state.info || {};
 
-  const statusError = info.error
+  // Пока связь установлена, ошибка прошлого сеанса не должна висеть рядом
+  // со статусом «подключено».
+  const statusError = info.error && !info.connected
     ? `<p class="agent-error" role="alert">${esc(t('agent.error', { error: info.error }))}</p>`
     : '';
 
@@ -211,7 +231,8 @@ function render() {
 
   const viewChanged = state.view !== painted.view;
   let main = '';
-  if (state.view === 'ready') main = readyView();
+  if (state.view === 'language') main = languageView();
+  else if (state.view === 'ready') main = readyView();
   else if (state.view === 'waiting') main = waitingView();
   else if (state.view === 'error') main = `<div class="fatal">${esc(state.note)}</div>`;
   if (main !== painted.screen) {
@@ -392,6 +413,13 @@ async function refresh() {
 async function boot() {
   window.I18N.apply();
 
+  // Первый запуск начинается с выбора языка, а не с папки.
+  if (!window.I18N.chosen) {
+    state.view = 'language';
+    render();
+    return;
+  }
+
   if (!invoke) {
     state.view = 'error';
     state.note = t('error.bridge');
@@ -414,6 +442,14 @@ async function boot() {
   setInterval(refresh, 1000);
 }
 document.addEventListener('click', (event) => {
+  const langButton = event.target.closest('[data-lang]');
+  if (langButton && !langButton.disabled) {
+    langButton.disabled = true;
+    window.I18N.setLang(langButton.dataset.lang);
+    boot();
+    return;
+  }
+
   if (event.target.closest('#change-root')) {
     openPicker();
     return;

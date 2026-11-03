@@ -198,9 +198,20 @@ fn handle(app: tauri::AppHandle, stream: TcpStream) {
     let mut transport: Box<dyn Transport> = Box::new(stream);
     let _ = transport.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = transport.set_write_timeout(Some(Duration::from_secs(120)));
+    // Новое соединение уже означает, что агент жив. Ошибка прошлого сеанса
+    // не должна висеть на экране, пока идёт успешная работа.
+    if let Some(runtime) = app.try_state::<AgentRuntime>() {
+        runtime.status.lock().unwrap().error = None;
+    }
     if let Err(error) = session(&app, transport.as_mut()) {
         if let Some(runtime) = app.try_state::<AgentRuntime>() {
-            runtime.status.lock().unwrap().error = Some(err(error));
+            // Обрыв сокета — штатное завершение сеанса, а не ошибка. Если же
+            // рядом есть другое живое соединение, его статус тоже не трогаем.
+            let disconnect = is_disconnect(&error);
+            let alone = runtime.connected.load(Ordering::SeqCst) == 0;
+            if !disconnect && alone {
+                runtime.status.lock().unwrap().error = Some(err(error));
+            }
         }
     }
     transport.shutdown();
@@ -270,6 +281,9 @@ fn session(app: &tauri::AppHandle, transport: &mut dyn Transport) -> anyhow::Res
 
     let _ = name;
     let _ = pk;
+    if let Some(value) = token.as_deref() {
+        crate::set_sync_token(app, value).map_err(|error| anyhow::anyhow!(error))?;
+    }
     command_loop(app, &runtime, transport)
 }
 
@@ -336,8 +350,35 @@ fn pair(
         let config = runtime.config.lock().unwrap();
         save_config(app, &config).map_err(anyhow::Error::msg)?;
     }
+    // Полная синхронизация на телефоне живёт в том же реплике, поэтому её
+    // токен должен совпасть с токеном пары до того, как ПК начнёт сеанс.
+    crate::set_sync_token(app, &token).map_err(anyhow::Error::msg)?;
     agent::send(transport, &AgentMsg::PairOk { token })?;
     Ok(())
+}
+
+/// Восстанавливает состояние после запуска приложения: сканирует уже
+/// выбранную папку, подставляет токен пары в общий реплик и поднимает
+/// приёмник полной синхронизации.
+pub(crate) fn startup(app: tauri::AppHandle) {
+    let config = load_config(&app);
+    // Токен нужен раньше скана: приёмник на 47887 может принять ПК в любую
+    // секунду после запуска, и он должен узнать тот же токен, что и агент.
+    if let Some(pair) = config.pairs.values().next() {
+        let _ = crate::set_sync_token(&app, &pair.token);
+    }
+    std::thread::spawn(move || {
+        let root = config.root.clone().or_else(|| {
+            crate::open(&app)
+                .ok()
+                .and_then(|replica| replica.root().ok().flatten())
+                .map(|path| path.to_string_lossy().to_string())
+        });
+        if let Some(root) = root {
+            let _ = crate::sync_root(&app, std::path::Path::new(&root));
+        }
+        crate::server::ensure_started(app);
+    });
 }
 
 /// Проверяет, что ошибка чтения — это истёкший таймаут, а не разрыв связи.
@@ -355,14 +396,37 @@ fn is_timeout(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Ошибка означает, что соединение просто закрылось: это не сбой агента.
+fn is_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                )
+            })
+            .unwrap_or(false)
+            || cause.to_string().contains("пир закрыл сеанс")
+    })
+}
+
 fn command_loop(
-    _app: &tauri::AppHandle,
+    app: &tauri::AppHandle,
     runtime: &AgentRuntime,
     transport: &mut dyn Transport,
 ) -> anyhow::Result<()> {
     // Сессия считается активной, пока ПК держит соединение и шлёт команды.
     // Во время сопряжения счётчик ещё не растёт: телефон показывает запрос.
     let _session = SessionGuard::new(&runtime.connected);
+    // Связь установлена — прошлая ошибка больше не актуальна.
+    runtime.status.lock().unwrap().error = None;
 
     // ПК шлёт heartbeat (GetRoot) каждые несколько секунд. Если сообщений нет
     // дольше AGENT_IDLE_TIMEOUT, считаем, что связь потеряна, и возвращаемся
@@ -426,8 +490,44 @@ fn command_loop(
                     )?;
                     continue;
                 };
-                let entries = agent::manifest(std::path::Path::new(&root))?;
-                agent::send(transport, &AgentMsg::Manifest { root, entries })?;
+                // Скан не только отдаёт список файлов ПК, но и обновляет
+                // общий реплик: именно из него читает сервер полной
+                // синхронизации на 47887. Ошибку скана не скрываем.
+                match crate::scan_phone(app) {
+                    Ok((root, _)) => {
+                        let entries = agent::manifest(&root)?;
+                        agent::send(
+                            transport,
+                            &AgentMsg::Manifest {
+                                root: root.to_string_lossy().to_string(),
+                                entries,
+                            },
+                        )?;
+                    }
+                    Err(error) => {
+                        agent::send(
+                            transport,
+                            &AgentMsg::Error {
+                                message: format!("{root}: {error}"),
+                            },
+                        )?;
+                    }
+                }
+            }
+            AgentMsg::GetSyncInfo => {
+                crate::server::ensure_started(app.clone());
+                let info = crate::server::info_json();
+                let error = info
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                agent::send(
+                    transport,
+                    &AgentMsg::SyncInfo {
+                        port: crate::SYNC_PORT,
+                        error,
+                    },
+                )?;
             }
             AgentMsg::Bye => break,
             AgentMsg::Error { message } => anyhow::bail!(message),
@@ -489,9 +589,19 @@ pub fn agent_info(app: tauri::AppHandle) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn agent_set_root(app: tauri::AppHandle, path: String) -> Result<serde_json::Value, String> {
+pub async fn agent_set_root(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<serde_json::Value, String> {
     let root = agent::ensure_root(&path).map_err(err)?;
     let root = root.to_string_lossy().to_string();
+
+    // Сканируем до сохранения: если папка недоступна, агент остаётся
+    // на прежнем корне, а не показывает выбранную, но пустую.
+    let scan_app = app.clone();
+    let scan_root = PathBuf::from(&root);
+    crate::blocking(move || crate::sync_root(&scan_app, &scan_root).map(|_| ())).await?;
+
     let runtime = app
         .try_state::<AgentRuntime>()
         .ok_or_else(|| "агент не запущен".to_string())?;

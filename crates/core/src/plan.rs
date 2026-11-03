@@ -68,6 +68,11 @@ pub struct Change {
     pub present: bool,
     /// Путь исключён локально («оставить только на другом устройстве»).
     pub ignored: bool,
+    /// Содержимое уже совпадает с пиром. Базы ещё может не быть, но передавать
+    /// файл не нужно: коммит только зафиксирует совпадение. Такие строки не
+    /// показываются как изменения.
+    #[serde(default)]
+    pub aligned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +123,9 @@ pub enum Decision {
     OnlyHere,
     /// Сохранить обе версии конфликта.
     KeepBoth,
+    /// Отмена решения. Хранится с новым HLC, чтобы пережить переподключение
+    /// и не дать пиру вернуть старое решение; для плана это «решения нет».
+    Unset,
 }
 
 impl Decision {
@@ -130,6 +138,7 @@ impl Decision {
             Decision::KeepInLibrary => "keep_in_library",
             Decision::OnlyHere => "only_here",
             Decision::KeepBoth => "keep_both",
+            Decision::Unset => "unset",
         }
     }
 
@@ -142,6 +151,7 @@ impl Decision {
             "keep_in_library" => Decision::KeepInLibrary,
             "only_here" => Decision::OnlyHere,
             "keep_both" => Decision::KeepBoth,
+            "unset" => Decision::Unset,
             _ => return None,
         })
     }
@@ -156,6 +166,7 @@ impl Decision {
             Decision::KeepInLibrary => 4,
             Decision::OnlyHere => 5,
             Decision::KeepBoth => 6,
+            Decision::Unset => 7,
         }
     }
 }
@@ -213,9 +224,14 @@ impl DecisionSet {
 
     /// Оставить только решения, которые всё ещё относятся к текущему плану.
     /// Путь исчез или блоб изменился — решение больше не применимо.
+    /// Исключение — `Unset`: это надгробие отмены, оно должно пережить
+    /// переподключение и перебить устаревшее решение пира.
     pub fn retain_valid(&mut self, plan: &Plan) -> usize {
         let before = self.entries.len();
         self.entries.retain(|path, decision| {
+            if decision.action == Decision::Unset {
+                return true;
+            }
             plan.blob_for(path)
                 .map(|blob| blob == decision.blob)
                 .unwrap_or(false)
@@ -243,13 +259,28 @@ impl Plan {
         now >= self.expires_at
     }
 
+    /// Пути, которые действительно отличаются. Совпавшие файлы не попадают
+    /// в счётчик, иначе первый сеанс показывал бы всю библиотеку как «новую».
     pub fn path_count(&self) -> usize {
         let mut paths: HashSet<&str> = HashSet::new();
         for change in self.local.iter().chain(self.remote.iter()) {
-            paths.insert(change.path.as_str());
+            if !change.aligned {
+                paths.insert(change.path.as_str());
+            }
         }
         for conflict in &self.conflicts {
             paths.insert(conflict.path.as_str());
+        }
+        paths.len()
+    }
+
+    /// Сколько путей уже совпадает по содержимому и будет только зафиксировано.
+    pub fn aligned_count(&self) -> usize {
+        let mut paths: HashSet<&str> = HashSet::new();
+        for change in self.local.iter().chain(self.remote.iter()) {
+            if change.aligned {
+                paths.insert(change.path.as_str());
+            }
         }
         paths.len()
     }
@@ -295,11 +326,22 @@ impl Plan {
         })
     }
 
-    /// Итоговое действие: явное решение человека важнее умолчания.
-    pub fn effective_decision(&self, path: &str) -> Option<Decision> {
+    /// Явное решение человека, если оно есть и не отменено через `Unset`.
+    pub fn explicit_entry(&self, path: &str) -> Option<&PathDecision> {
         self.decisions
             .get(path)
-            .map(|decision| decision.action)
+            .filter(|decision| decision.action != Decision::Unset)
+    }
+
+    /// Явное решение по пути. `None` и для отсутствующего решения, и для
+    /// отменённого: после «Отменить» путь снова считается нерешённым.
+    pub fn explicit_decision(&self, path: &str) -> Option<Decision> {
+        self.explicit_entry(path).map(|decision| decision.action)
+    }
+
+    /// Итоговое действие: явное решение человека важнее умолчания.
+    pub fn effective_decision(&self, path: &str) -> Option<Decision> {
+        self.explicit_decision(path)
             .or_else(|| self.default_decision(path))
     }
 
@@ -307,7 +349,7 @@ impl Plan {
     pub fn unresolved(&self) -> Vec<String> {
         self.conflicts
             .iter()
-            .filter(|conflict| self.decisions.get(&conflict.path).is_none())
+            .filter(|conflict| self.explicit_entry(&conflict.path).is_none())
             .map(|conflict| conflict.path.clone())
             .collect()
     }
@@ -422,6 +464,10 @@ impl Plan {
             }
             let changed = row.blob != row.synced_blob;
             let pending_delete = pending.contains(&row.path);
+            if pending_delete && row.synced_blob.is_empty() {
+                // Черновик, удалённый до первой синхронизации, не изменение.
+                continue;
+            }
             let in_plan = self
                 .local
                 .iter()
@@ -440,6 +486,19 @@ impl Plan {
 /// протоколе). Функция ничего не пишет и не проверяет подписи: это делает
 /// `Replica::apply` на фазе commit, а план лишь показывает намерения.
 pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[Op]) -> Result<Plan> {
+    build_with_peer_have(replica, peer_dev, peer_name, remote_ops, None)
+}
+
+/// То же, но с watermarks пира: по ним видно, применил ли он уже наше
+/// подтверждённое удаление. Без этого после commit удаление навсегда
+/// оставалось бы в плане одной стороны («план разошёлся»).
+pub fn build_with_peer_have(
+    replica: &Replica,
+    peer_dev: &str,
+    peer_name: &str,
+    remote_ops: &[Op],
+    peer_have: Option<&HashMap<String, (i64, i64)>>,
+) -> Result<Plan> {
     let created_at = Hlc::wall_ms();
     let mut version = Hlc::new(created_at, 0);
     for op in remote_ops {
@@ -468,6 +527,12 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
             continue;
         }
         if let Some((blob, _)) = pending.get(&row.path) {
+            // Путь ни разу не входил в общую базу: пир о нём не знает, и
+            // «удаление» здесь — не изменение, а просто исчезнувший черновик.
+            // Сканер такие записи забывает, это лишь страховка для старых БД.
+            if row.synced_blob.is_empty() {
+                continue;
+            }
             local.push(Change {
                 path: row.path.clone(),
                 from: None,
@@ -479,12 +544,24 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
                 mtime_ns: row.mtime_ns,
                 present: false,
                 ignored: false,
+                aligned: false,
             });
             continue;
         }
         if row.deleted {
-            // Подтверждённое удаление: несём его пиру, если база была.
-            if !row.synced_blob.is_empty() {
+            // Подтверждённое удаление несём тому пиру, у которого файл ещё
+            // лежит (или который ещё не применил нашу операцию удаления).
+            // Иначе после общего удаления путь всплывал бы в плане вечно,
+            // хотя обе стороны уже согласны.
+            let peer_deleted = remote
+                .get(&row.path)
+                .is_some_and(|state| !state.present);
+            let peer_has_it = remote
+                .get(&row.path)
+                .is_some_and(|state| state.present)
+                || (!peer_deleted
+                    && !peer_applied_delete(replica, peer_have, &row.path)?);
+            if peer_has_it && !row.synced_blob.is_empty() {
                 local.push(Change {
                     path: row.path.clone(),
                     from: None,
@@ -496,11 +573,18 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
                     mtime_ns: row.mtime_ns,
                     present: false,
                     ignored: false,
+                    aligned: false,
                 });
             }
             continue;
         }
         if row.blob != row.synced_blob {
+            // Файл уже идентичен версии пира. Базы может не быть, но данные
+            // передавать незачем: коммит лишь зафиксирует совпадение.
+            let aligned = row.present
+                && remote
+                    .get(&row.path)
+                    .is_some_and(|state| state.present && state.blob == row.blob);
             local.push(Change {
                 path: row.path.clone(),
                 from: None,
@@ -516,6 +600,7 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
                 mtime_ns: row.mtime_ns,
                 present: row.present,
                 ignored: row.ignored,
+                aligned,
             });
         }
     }
@@ -559,6 +644,13 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
                     .get(from.as_str())
                     .is_some_and(|row| !row.deleted && !row.synced_blob.is_empty())
             });
+            // Пир мог прислать старую операцию, которая уже является общей
+            // базой. Это не его изменение: конфликт только если обе стороны
+            // действительно ушли от базы.
+            let remote_changed = state.moved_from.is_some()
+                || row
+                    .as_ref()
+                    .map_or(true, |row| row.deleted || state.blob != row.synced_blob);
 
             if same_content && !move_changes_old_path {
                 continue;
@@ -568,6 +660,12 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
             {
                 // Мы удалили, а у пира лежит та же база: наше удаление —
                 // единственное изменение, его и отправим.
+                continue;
+            }
+
+            if !remote_changed {
+                // Содержимое пира всё ещё совпадает с базой: изменение только
+                // локальное, его уже добавил локальный проход.
                 continue;
             }
 
@@ -644,6 +742,7 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
                 mtime_ns: state.mtime_ns,
                 present: row.is_some_and(|row| row.present),
                 ignored: false,
+                aligned: false,
             });
             continue;
         }
@@ -689,6 +788,7 @@ pub fn build(replica: &Replica, peer_dev: &str, peer_name: &str, remote_ops: &[O
             mtime_ns: row.mtime_ns,
             present: false,
             ignored: false,
+            aligned: false,
         });
     }
 
@@ -725,6 +825,24 @@ struct RemoteState {
 
 /// Последнее состояние каждого пути по присланным операциям. Порядок —
 /// HLC и затем `dev`, чтобы результат не зависел от порядка доставки.
+fn peer_applied_delete(
+    replica: &Replica,
+    peer_have: Option<&HashMap<String, (i64, i64)>>,
+    path: &str,
+) -> Result<bool> {
+    let Some(have) = peer_have else {
+        return Ok(false);
+    };
+    let Some(hlc) = replica.last_delete_hlc(replica.device_id(), path)? else {
+        // Своего удаления мы не отправляли: запись закрылась операцией пира,
+        // а он про неё уже знает.
+        return Ok(true);
+    };
+    Ok(have
+        .get(replica.device_id())
+        .is_some_and(|&(ms, counter)| Hlc::new(ms as u64, counter as u32) >= hlc))
+}
+
 fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
     let mut ordered: Vec<&Op> = ops.iter().collect();
     ordered.sort_by(|a, b| (a.hlc, a.dev.as_str()).cmp(&(b.hlc, b.dev.as_str())));
@@ -838,6 +956,24 @@ mod tests {
     }
 
     #[test]
+    fn ignored_remote_addition_disappears_from_next_plan() {
+        let a = Replica::in_memory("dev-a").unwrap();
+        let addition = remote(put("skip.flac", "b3:skip"), 10);
+
+        let plan = build(&a, "dev-b", "Phone", std::slice::from_ref(&addition)).unwrap();
+        assert_eq!(plan.remote.len(), 1);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Added);
+
+        // «Оставить только на телефоне»: запоминаем исключение, не создавая
+        // локального файла и не забирая блоб.
+        a.ignore_missing("skip.flac", "b3:skip", 3, 1).unwrap();
+
+        let next = build(&a, "dev-b", "Phone", std::slice::from_ref(&addition)).unwrap();
+        assert!(next.remote.is_empty());
+        assert_eq!(next.path_count(), 0);
+    }
+
+    #[test]
     fn local_addition_is_accepted_by_default() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         let op = a.make_op(put("new.flac", "b3:new")).unwrap();
@@ -848,6 +984,49 @@ mod tests {
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].kind, ChangeKind::Added);
         assert_eq!(plan.effective_decision("new.flac"), Some(Decision::Accept));
+    }
+
+    #[test]
+    fn identical_file_without_base_is_aligned_not_a_change() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("same.flac", "b3:aa")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_present("same.flac").unwrap();
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("same.flac", "b3:aa"), 10)],
+        )
+        .unwrap();
+        assert_eq!(plan.local.len(), 1);
+        assert!(plan.local[0].aligned);
+        assert_eq!(plan.path_count(), 0);
+        assert_eq!(plan.aligned_count(), 1);
+        assert!(plan.unresolved().is_empty());
+    }
+
+    #[test]
+    fn stale_peer_op_equal_to_base_is_not_a_conflict() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:one");
+        let update = a.make_op(put("track.flac", "b3:two")).unwrap();
+        a.apply(&update).unwrap();
+        a.mark_present("track.flac").unwrap();
+
+        // Пир присылает операцию со старой базой: он ещё не менял файл.
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("track.flac", "b3:one"), 10)],
+        )
+        .unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Updated);
+        assert!(plan.remote.is_empty());
     }
 
     #[test]
@@ -870,7 +1049,8 @@ mod tests {
     fn local_deletion_is_kept_by_default() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         synced(&mut a, "gone.flac", "b3:aa");
-        a.record_pending_delete("gone.flac", "b3:aa", 10).unwrap();
+        a.record_pending_delete("gone.flac", "b3:aa", Hlc::new(10, 0))
+            .unwrap();
 
         let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
         assert_eq!(plan.local.len(), 1);
@@ -1105,7 +1285,8 @@ mod tests {
     fn building_a_plan_does_not_write_to_the_database() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         synced(&mut a, "base.flac", "b3:base");
-        a.record_pending_delete("base.flac", "b3:base", 10).unwrap();
+        a.record_pending_delete("base.flac", "b3:base", Hlc::new(10, 0))
+            .unwrap();
         let hash_before = a.state_hash().unwrap();
         let ops_before = a.op_count().unwrap();
 
@@ -1234,5 +1415,106 @@ mod tests {
         // Повторное слияние ничего не меняет.
         let (_, changed) = a.merge_decisions("dev-b", &newer).unwrap();
         assert_eq!(changed, 0);
+    }
+
+    fn decision(path: &str, action: Decision, blob: &str, ms: u64, dev: &str) -> PathDecision {
+        PathDecision {
+            path: path.into(),
+            action,
+            blob: blob.into(),
+            hlc: Hlc::new(ms, 0),
+            dev: dev.into(),
+        }
+    }
+
+    #[test]
+    fn unset_beats_a_stale_peer_decision_and_stays_forgotten() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("new.flac", "b3:one")).unwrap();
+        a.apply(&op).unwrap();
+        let mut plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        let mut peer = DecisionSet::default();
+        peer.entries.insert(
+            "new.flac".into(),
+            decision("new.flac", Decision::KeepInLibrary, "b3:one", 10, "dev-b"),
+        );
+        plan.decisions.merge(&peer);
+        assert_eq!(
+            plan.explicit_decision("new.flac"),
+            Some(Decision::KeepInLibrary)
+        );
+
+        let mut mine = DecisionSet::default();
+        mine.entries.insert(
+            "new.flac".into(),
+            decision("new.flac", Decision::Unset, "b3:one", 20, "dev-a"),
+        );
+        plan.decisions.merge(&mine);
+        assert_eq!(plan.explicit_decision("new.flac"), None);
+        // Для добавления возвращается действие по умолчанию, а не решение.
+        assert_eq!(
+            plan.effective_decision("new.flac"),
+            Some(Decision::Accept)
+        );
+
+        // Отмена — надгробие: не выбрасывается, даже если путь исчез из плана.
+        let mut stored = plan.decisions.clone();
+        stored.retain_valid(&plan);
+        assert_eq!(
+            stored.get("new.flac").map(|d| d.action),
+            Some(Decision::Unset)
+        );
+
+        // Устаревшее решение пира не воскресает при повторном слиянии.
+        plan.decisions.merge(&peer);
+        assert_eq!(plan.explicit_decision("new.flac"), None);
+
+        // Новое осознанное решение с более свежим HLC снова работает.
+        let mut again = DecisionSet::default();
+        again.entries.insert(
+            "new.flac".into(),
+            decision("new.flac", Decision::OnlyHere, "b3:one", 30, "dev-a"),
+        );
+        plan.decisions.merge(&again);
+        assert_eq!(plan.explicit_decision("new.flac"), Some(Decision::OnlyHere));
+    }
+
+    #[test]
+    fn pending_delete_keeps_full_hlc_and_is_not_rewritten() {
+        let a = Replica::in_memory("dev-a").unwrap();
+        a.record_pending_delete("gone.flac", "b3:aa", Hlc::new(42, 7))
+            .unwrap();
+        a.record_pending_delete("gone.flac", "b3:aa", Hlc::new(99, 1))
+            .unwrap();
+
+        let pending = a.pending_deletes().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].hlc(), Hlc::new(42, 7));
+        assert_eq!(pending[0].detected_at, 42);
+        assert_eq!(pending[0].counter, 7);
+    }
+
+    #[test]
+    fn deleted_never_shared_file_is_not_a_change() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("draft.flac", "b3:draft")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_present("draft.flac").unwrap();
+
+        // Черновик ни разу не подтверждали как общую базу.
+        a.record_pending_delete("draft.flac", "b3:draft", Hlc::new(10, 0))
+            .unwrap();
+        a.mark_absent("draft.flac").unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+        assert!(plan.local.is_empty(), "призрак не должен быть изменением");
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.unresolved().is_empty());
+
+        // Скан чистит такой призрак целиком, а не оставляет вечное удаление.
+        assert_eq!(a.prune_ghost_deletes().unwrap(), 1);
+        assert!(a.pending_deletes().unwrap().is_empty());
+        assert!(a.plan_rows().unwrap().iter().all(|row| row.path != "draft.flac"));
     }
 }
