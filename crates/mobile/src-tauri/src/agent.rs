@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PORT, AGENT_PROTO};
@@ -51,6 +51,25 @@ pub struct AgentRuntime {
     pair_tx: Mutex<Option<mpsc::Sender<bool>>>,
     root_change: AtomicBool,
     root_tx: Mutex<Option<mpsc::Sender<String>>>,
+    /// Сколько командных сессий с ПК сейчас открыто. Во время сопряжения
+    /// счётчик ещё не растёт: телефон в этот момент показывает свой запрос.
+    connected: AtomicUsize,
+}
+
+/// Учитывает активную сессию и уменьшает счётчик при любом выходе.
+struct SessionGuard<'a>(&'a AtomicUsize);
+
+impl<'a> SessionGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl AgentRuntime {
@@ -305,6 +324,9 @@ fn command_loop(
     runtime: &AgentRuntime,
     transport: &mut dyn Transport,
 ) -> anyhow::Result<()> {
+    // Сессия считается активной, пока ПК держит соединение и шлёт команды.
+    // Во время сопряжения счётчик ещё не растёт: телефон показывает запрос.
+    let _session = SessionGuard::new(&runtime.connected);
     loop {
         match agent::recv(transport)? {
             AgentMsg::GetRoot => {
@@ -394,6 +416,7 @@ pub fn agent_info(app: tauri::AppHandle) -> serde_json::Value {
         "addr": status.addr,
         "error": status.error,
         "root": runtime.root(),
+        "connected": runtime.connected.load(Ordering::SeqCst) > 0,
         "root_change": runtime.root_change.load(Ordering::SeqCst),
         "pending": pending.map(|pair| serde_json::json!({
             "dev": pair.dev,

@@ -51,7 +51,11 @@ pub fn sanitize_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut last_dash = false;
     for ch in raw.trim().chars() {
-        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') || !ch.is_ascii();
+        // Пробелы и скобки нужны для человекочитаемого имени
+        // вида `POCO X8 Pro (2511FPC34G)`. Имя не попадает в файловые пути.
+        let keep = ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | ' ' | '(' | ')')
+            || !ch.is_ascii();
         let ch = if keep { ch } else { '-' };
         if ch == '-' {
             if last_dash {
@@ -68,5 +72,23 @@ pub fn sanitize_name(raw: &str) -> String {
         "device".into()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::sanitize_name;
+
+    #[test]
+    fn keeps_human_readable_phone_name() {
+        assert_eq!(
+            sanitize_name("POCO X8 Pro (2511FPC34G)"),
+            "POCO X8 Pro (2511FPC34G)"
+        );
+    }
+
+    #[test]
+    fn replaces_line_breaks() {
+        assert_eq!(sanitize_name("a\nb"), "a-b");
     }
 }

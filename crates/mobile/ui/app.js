@@ -312,13 +312,38 @@ async function refresh() {
   if (!invoke) return;
   try {
     const info = await invoke('agent_info');
-    state.info = info;
-    state.root = info.root || null;
-    if (state.view !== 'loading' && state.view !== 'error') {
-      state.view = info.root ? 'ready' : 'waiting';
+
+    // Проверяем, изменились ли данные, чтобы не дергать render зря
+    const infoStr = JSON.stringify(info);
+    if (state.info && JSON.stringify(state.info) === infoStr && !info.root_change) {
+      return; // Данные те же, ничего не делаем
     }
 
-    if (info.root_change && !state.rootChangeSeen && !state.pickerOpen && !state.busy) {
+    state.info = info;
+    state.root = info.root || null;
+
+    // Логика переключения экранов
+    if (state.view !== 'loading' && state.view !== 'error') {
+      if (!info.connected) {
+        // Если ПК не подключен, всегда показываем ожидание
+        if (state.view !== 'waiting') {
+          state.view = 'waiting';
+          // Закрываем пикер, если он был открыт
+          if (state.pickerOpen) closePicker();
+        }
+      } else if (!info.root) {
+        // ПК подключен, но папка не выбрана — открываем выбор.
+        // Пока висит запрос сопряжения, пикер не мешаем показывать поверх.
+        state.view = 'waiting';
+        if (!state.pickerOpen && !info.pending) openPicker();
+      } else {
+        // Папка уже выбрана, переходим в готовый режим
+        state.view = 'ready';
+      }
+    }
+
+    // Обработка принудительной смены папки с ПК
+    if (info.root_change && !state.rootChangeSeen && !state.pickerOpen && !state.busy && info.connected) {
       state.rootChangeSeen = true;
       openPicker();
     }
@@ -326,9 +351,11 @@ async function refresh() {
 
     render();
   } catch (error) {
-    state.view = 'error';
-    state.note = message(error);
-    render();
+    if (state.view !== 'error') {
+      state.view = 'error';
+      state.note = message(error);
+      render();
+    }
   }
 }
 
@@ -345,7 +372,14 @@ async function boot() {
   try {
     state.info = await invoke('agent_info');
     state.root = state.info?.root || null;
-    state.view = state.root ? 'ready' : 'waiting';
+
+    // При старте показываем ожидание, пока ПК не откроет сессию.
+    if (state.info?.connected) {
+      state.view = state.root ? 'ready' : 'waiting';
+      if (!state.root && !state.info?.pending) openPicker();
+    } else {
+      state.view = 'waiting';
+    }
   } catch (error) {
     state.view = 'error';
     state.note = message(error);
@@ -353,7 +387,6 @@ async function boot() {
   render();
   setInterval(refresh, 1000);
 }
-
 document.addEventListener('click', (event) => {
   if (event.target.closest('#change-root')) {
     openPicker();

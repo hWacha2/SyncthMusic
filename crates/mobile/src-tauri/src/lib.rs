@@ -68,24 +68,47 @@ fn open(app: &tauri::AppHandle) -> Result<Replica, String> {
     Ok(replica)
 }
 
-/// Модель телефона для интерфейса и для второго устройства. В отличие от
+/// Читает системное свойство Android. На других платформах возвращает пустую строку.
+fn android_prop(name: &str) -> String {
+    if !cfg!(target_os = "android") {
+        return String::new();
+    }
+    std::process::Command::new("getprop")
+        .arg(name)
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Имя телефона для интерфейса и для второго устройства. В отличие от
 /// `device_id`, имя ничего не идентифицирует и может быть любым.
+///
+/// Берём маркетинговое название, а модель добавляем в скобках: на телефоне
+/// оно обычно понятнее, чем артикул вроде `2511FPC34G`.
 fn phone_name() -> String {
     use std::sync::OnceLock;
     static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
-        if cfg!(target_os = "android") {
-            if let Ok(out) = std::process::Command::new("getprop")
-                .arg("ro.product.model")
-                .output()
-            {
-                let model = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !model.is_empty() {
-                    return model;
-                }
-            }
+        let model = android_prop("ro.product.model");
+        let market = ["ro.product.marketname", "ro.product.odm.marketname", "ro.product.vendor.marketname"]
+            .iter()
+            .map(|prop| android_prop(prop))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
+
+        let same = market.eq_ignore_ascii_case(&model)
+            || (!model.is_empty() && market.to_lowercase().contains(&model.to_lowercase()));
+
+        if !market.is_empty() && !model.is_empty() && !same {
+            format!("{market} ({model})")
+        } else if !market.is_empty() {
+            market
+        } else if !model.is_empty() {
+            model
+        } else {
+            syncth_core::device_name()
         }
-        syncth_core::device_name()
     })
     .clone()
 }
