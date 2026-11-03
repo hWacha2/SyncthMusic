@@ -147,6 +147,7 @@ button:focus-visible {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
   background: transparent;
 }
 
@@ -657,7 +658,6 @@ button:focus-visible {
   background: var(--surface);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
   text-align: center;
-  animation: view-in 0.28s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .library-icon {
@@ -698,7 +698,6 @@ button:focus-visible {
   border-radius: 22px;
   background: var(--surface);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
-  animation: view-in 0.28s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .phone-head {

@@ -20,7 +20,7 @@ const state = {
 
 // Что уже нарисовано. Как и на телефоне, не трогаем DOM, если HTML тот же:
 // иначе опрос статуса будет вызывать мерцание и сбрасывать фокус.
-const painted = { screen: null };
+const painted = { screen: null, view: null };
 
 function t(key, vars) {
   return window.I18N.t(key, vars);
@@ -142,7 +142,7 @@ function devicesView() {
     ? `<p class="group-error">${esc(state.adbError)}</p>`
     : '';
 
-  return `<section class="setup view-enter">
+  return `<section class="setup">
     <div class="setup-head">
       <h1 class="setup-title">${esc(t('setup.title'))}</h1>
       <div class="setup-actions">
@@ -170,7 +170,7 @@ function devicesView() {
 }
 
 function libraryView() {
-  return `<section class="setup setup--center view-enter">
+  return `<section class="setup setup--center">
     <div class="library-card">
       <span class="library-icon">${iconFolder()}</span>
       <h1 class="setup-title">${esc(t('library.title'))}</h1>
@@ -228,7 +228,7 @@ function phonePanel() {
 }
 
 function workspaceView() {
-  return `<section class="workspace view-enter">
+  return `<section class="workspace">
     <div class="workspace-head">
       <span class="workspace-label">${esc(t('workspace.label'))}</span>
       <span class="workspace-path" title="${esc(state.root)}">${esc(state.root)}</span>
@@ -240,18 +240,31 @@ function workspaceView() {
   </section>`;
 }
 
+function markEnter(host) {
+  host.classList.remove('view-enter');
+  void host.offsetWidth;
+  host.classList.add('view-enter');
+}
+
 function render() {
   const screen = document.getElementById('screen');
   if (!screen) return;
+  const viewChanged = state.view !== painted.view;
   let html = '';
   if (state.view === 'devices') html = devicesView();
   else if (state.view === 'library') html = libraryView();
   else if (state.view === 'workspace') html = workspaceView();
   else if (state.view === 'error') html = `<div class="fatal">${esc(state.note)}</div>`;
   if (html !== painted.screen) {
+    const scrollTop = screen.scrollTop;
     screen.innerHTML = html;
     painted.screen = html;
+    screen.scrollTop = viewChanged ? 0 : scrollTop;
+  } else if (viewChanged) {
+    screen.scrollTop = 0;
   }
+  if (viewChanged) markEnter(screen);
+  painted.view = state.view;
 
   document.querySelectorAll('[data-window]').forEach((button) => {
     const title = t(`window.${button.dataset.window}`);

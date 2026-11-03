@@ -23,7 +23,7 @@ const state = {
 
 /// Что уже нарисовано. Нужно, чтобы секундный опрос не пересоздавал DOM
 /// и не вызывал мерцание, если данные не изменились.
-const painted = { screen: null, picker: null, pair: null };
+const painted = { screen: null, view: null, picker: null, pickerOpen: false, pair: null, pairOpen: false };
 
 let browseSeq = 0;
 
@@ -137,7 +137,7 @@ function pickerView() {
   </button>`).join('');
 
   let body = '';
-  if (browser.loading) {
+  if (browser.loading && !browser.entries.length) {
     body = `<div class="picker-state">${esc(t('picker.loading'))}</div>`;
   } else if (browser.error) {
     body = `<div class="picker-state is-error">
@@ -170,7 +170,7 @@ function pickerView() {
     </header>
     ${banner}
     <div class="picker-path">${esc(browser.path || '')}</div>
-    <div class="picker-list">
+    <div class="picker-list${browser.loading ? ' is-loading' : ''}"${browser.loading ? ' aria-busy="true"' : ''}>
       ${up}
       ${body}
     </div>
@@ -197,35 +197,56 @@ function pairView() {
   </div>`;
 }
 
+function markEnter(host) {
+  host.classList.remove('view-enter');
+  void host.offsetWidth;
+  host.classList.add('view-enter');
+}
+
 function render() {
   const screen = document.getElementById('screen');
   const picker = document.getElementById('picker');
   const pair = document.getElementById('pair');
   if (!screen || !picker || !pair) return;
 
+  const viewChanged = state.view !== painted.view;
   let main = '';
   if (state.view === 'ready') main = readyView();
   else if (state.view === 'waiting') main = waitingView();
   else if (state.view === 'error') main = `<div class="fatal">${esc(state.note)}</div>`;
   if (main !== painted.screen) {
+    const scrollTop = screen.scrollTop;
     screen.innerHTML = main;
     painted.screen = main;
+    screen.scrollTop = viewChanged ? 0 : scrollTop;
+  } else if (viewChanged) {
+    screen.scrollTop = 0;
   }
+  if (viewChanged) markEnter(screen);
+  painted.view = state.view;
 
-  const pickerHtml = state.pickerOpen ? pickerView() : '';
-  if (picker.hidden !== !state.pickerOpen) picker.hidden = !state.pickerOpen;
+  const pickerOpen = state.pickerOpen;
+  const pickerChanged = pickerOpen !== painted.pickerOpen;
+  const pickerHtml = pickerOpen ? pickerView() : '';
+  if (picker.hidden !== !pickerOpen) picker.hidden = !pickerOpen;
   if (pickerHtml !== painted.picker) {
     picker.innerHTML = pickerHtml;
     painted.picker = pickerHtml;
   }
+  if (pickerChanged && pickerOpen) markEnter(picker);
+  painted.pickerOpen = pickerOpen;
 
   const pending = state.info?.pending;
-  const pairHtml = pending ? pairView() : '';
-  if (pair.hidden !== !pending) pair.hidden = !pending;
+  const pairOpen = Boolean(pending);
+  const pairChanged = pairOpen !== painted.pairOpen;
+  const pairHtml = pairOpen ? pairView() : '';
+  if (pair.hidden !== !pairOpen) pair.hidden = !pairOpen;
   if (pairHtml !== painted.pair) {
     pair.innerHTML = pairHtml;
     painted.pair = pairHtml;
   }
+  if (pairChanged && pairOpen) markEnter(pair);
+  painted.pairOpen = pairOpen;
 }
 
 async function browse(path) {

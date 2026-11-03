@@ -57,6 +57,10 @@ button:focus-visible {
   background: transparent;
 }
 
+.screen.view-enter {
+  animation: settle 0.26s cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
 /* ------------------------------------------------------------------ бренд */
 
 .topbar {
@@ -325,7 +329,6 @@ button:focus-visible {
   align-items: center;
   gap: 30px;
   text-align: center;
-  animation: settle 0.3s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .wait-orb {
@@ -408,7 +411,6 @@ button:focus-visible {
   display: flex;
   flex-direction: column;
   padding: 0 20px calc(22px + var(--safe-bottom));
-  animation: settle 0.26s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .ready-head {
@@ -575,20 +577,27 @@ button:focus-visible {
 
 /* ------------------------------------------------------------------ сопряжение */
 
+.pair-host {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
 .pair-host[hidden] {
   display: none;
 }
 
+.pair-host.view-enter {
+  animation: settle 0.2s cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
 .pair {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
+  height: 100%;
   display: grid;
   place-items: end stretch;
   padding: 18px 18px calc(18px + var(--safe-bottom));
   background: rgba(10, 10, 11, 0.66);
   backdrop-filter: blur(6px);
-  animation: settle 0.2s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .pair-card {
@@ -640,19 +649,26 @@ button:focus-visible {
 
 /* ------------------------------------------------------------------ браузер папок */
 
+.picker-host {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
 .picker-host[hidden] {
   display: none;
 }
 
+.picker-host.view-enter {
+  animation: sheet-in 0.2s cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
 .picker {
-  position: fixed;
-  inset: 0;
-  z-index: 30;
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   padding-top: var(--safe-top);
-  animation: sheet-in 0.2s cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
 .picker-head {
@@ -725,6 +741,11 @@ button:focus-visible {
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+.picker-list.is-loading {
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
 }
 
 .picker-row {
