@@ -440,13 +440,6 @@ button:focus-visible {
   border-radius: 12px;
 }
 
-.ready-field .pair-row {
-  justify-content: flex-start;
-  align-items: center;
-  border-bottom: 0;
-  padding: 2px 0;
-}
-
 /* ------------------------------------------------------------------ агент */
 
 .agent {
@@ -571,44 +564,6 @@ button:focus-visible {
 .ghost:disabled {
   color: var(--dim);
   cursor: default;
-}
-
-.pairs {
-  display: flex;
-  flex-direction: column;
-}
-
-.pair-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 9px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.pair-row:last-child {
-  border-bottom: 0;
-}
-
-.pair-name {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 13.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pair-dev {
-  flex: none;
-  color: var(--dim);
-  font-family: var(--mono);
-  font-size: 10.5px;
-}
-
-.pair-empty {
-  color: var(--dim);
-  font-size: 13px;
 }
 
 .agent-foot {

@@ -107,13 +107,6 @@ function waitingView() {
 
 function readyView() {
   const info = state.info || {};
-  const pairs = Array.isArray(info.pairs) ? info.pairs : [];
-  const pairRows = pairs.length
-    ? pairs.map((pair) => `<div class="pair-row">
-        <span class="status-dot is-on" aria-hidden="true"></span>
-        <span class="pair-name">${esc(pair.name || pair.dev)}</span>
-      </div>`).join('')
-    : '';
 
   const statusError = info.error
     ? `<p class="agent-error" role="alert">${esc(t('agent.error', { error: info.error }))}</p>`
@@ -132,10 +125,6 @@ function readyView() {
       <button class="ghost" id="change-root" ${state.busy ? 'disabled' : ''}>
         ${esc(t('agent.change'))}
       </button>
-    </div>
-    <div class="ready-field">
-      <div class="field-label">${esc(t('agent.paired'))}</div>
-      ${pairRows || `<div class="pair-empty">${esc(t('agent.no_pairs'))}</div>`}
     </div>
   </section>`;
 }
