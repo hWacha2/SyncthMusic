@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS ops (
 );
 
 -- Для дельта-синка: «что у пира уже есть» по каждому устройству-автору.
+-- Индекс по пути создаётся в migrate(): в старых БД колонки ops.path ещё нет,
+-- и CREATE INDEX здесь падал бы раньше, чем успевала пройти миграция.
 CREATE INDEX IF NOT EXISTS ops_by_dev_hlc ON ops(dev, hlc_ms, hlc_counter);
-CREATE INDEX IF NOT EXISTS ops_by_path ON ops(dev, path);
 
 -- TOFU: первый подписанный ключ устройства запоминается. Смена ключа у того же
 -- `dev` отклоняется — иначе подпись не защищает от подмены автора.
@@ -266,6 +267,11 @@ impl Replica {
             )?;
             self.backfill_op_paths()?;
         }
+        // Только после появления колонки: на старых БД её ещё нет.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ops_by_path ON ops(dev, path)",
+            [],
+        )?;
         self.set_meta("schema_version", "6")?;
         match self.get_meta("device_id")? {
             Some(stored) => {
@@ -1477,4 +1483,72 @@ fn random_key() -> Result<SigningKey> {
 
 pub fn now_ms() -> u64 {
     Hlc::wall_ms()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия: в старых БД на `ops` ещё нет колонки `path`. Схема пыталась
+    /// создать индекс по этой колонке до миграции и падала с
+    /// `no such column: path`, после чего приложение не открывало библиотеку.
+    #[test]
+    fn migrates_old_ops_without_path_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("library.db");
+
+        let op = Op::new(
+            "old-dev",
+            Hlc::new(1, 0),
+            OpKind::EntryPut {
+                path: "music/a.mp3".into(),
+                blob: "b3:old".into(),
+                size: 7,
+                mtime_ns: 1,
+                added_at: 1,
+            },
+        );
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ops (
+                     id          TEXT PRIMARY KEY,
+                     op_json     TEXT NOT NULL,
+                     hlc_ms      INTEGER NOT NULL,
+                     hlc_counter INTEGER NOT NULL,
+                     dev         TEXT NOT NULL,
+                     kind        TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ops(id, op_json, hlc_ms, hlc_counter, dev, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![op.id, op.to_json(), 1_i64, 0_i64, "old-dev", "entry_put"],
+            )
+            .unwrap();
+        }
+
+        let replica = Replica::open(tmp.path(), "dev-a").unwrap();
+
+        let path: String = replica
+            .conn
+            .query_row("SELECT path FROM ops WHERE id = ?1", params![op.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(path, "music/a.mp3");
+
+        let index: i64 = replica
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'ops_by_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
 }
