@@ -12,7 +12,17 @@ use walkdir::WalkDir;
 use crate::transport::{self, Transport};
 
 /// Версия протокола агента. Меняется при несовместимых правках сообщений.
-pub const AGENT_PROTO: u32 = 1;
+///
+/// Версия 2: ПК держит постоянную сессию и шлёт `GetRoot` как heartbeat,
+/// иначе агент закрывает сессию после 30 секунд тишины.
+pub const AGENT_PROTO: u32 = 2;
+
+/// Сколько агент ждёт подтверждения сопряжения на телефоне.
+pub const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Сколько агент ждёт хоть одного сообщения от ПК, прежде чем считать,
+/// что связь потеряна. ПК шлёт heartbeat каждые несколько секунд.
+pub const AGENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Порт, который слушает Android-агент.
 pub const AGENT_PORT: u16 = 47_890;

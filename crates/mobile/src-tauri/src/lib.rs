@@ -806,6 +806,7 @@ pub fn run() {
             browse_dirs,
             agent::agent_info,
             agent::agent_set_root,
+            agent::agent_cancel_root,
             agent::agent_pair_decision,
             agent::agent_forget,
             status,

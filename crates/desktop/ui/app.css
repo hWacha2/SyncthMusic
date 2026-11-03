@@ -445,6 +445,14 @@ button:focus-visible {
   padding-bottom: 22px;
 }
 
+.setup-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .setup-title {
   margin: 0;
   font-family: var(--display);
@@ -674,6 +682,12 @@ button:focus-visible {
 
 .library-card .setup-hint {
   margin: 10px 0 24px;
+}
+
+.library-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 /* ------------------------------------------------------------------ телефон */

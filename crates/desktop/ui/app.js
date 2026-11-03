@@ -18,6 +18,10 @@ const state = {
   manifest: null,
 };
 
+// Что уже нарисовано. Как и на телефоне, не трогаем DOM, если HTML тот же:
+// иначе опрос статуса будет вызывать мерцание и сбрасывать фокус.
+const painted = { screen: null };
+
 function t(key, vars) {
   return window.I18N.t(key, vars);
 }
@@ -65,10 +69,19 @@ function iconPhone() {
 }
 
 function iconUsb() {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M12 3v12M12 3l-2.5 2.5M12 3l2.5 2.5"/>
-    <path d="M12 9l3.5 2v2M12 12l-3.5 2v2"/>
-  </svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+\t<path d="M0 0h24v24H0z" fill="none" />
+\t<g fill="none">
+\t\t<rect width="2.96" height="2.96" x="15.72" y="6.28" fill="currentColor" opacity=".2" rx="1" />
+\t\t<rect width="2.86" height="2.86" x="10.53" y="19.37" fill="currentColor" opacity=".2" rx="1" />
+\t\t<rect width="3.09" height="3.09" x="5.85" y="7.99" fill="currentColor" opacity=".2" rx="1" />
+\t\t<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13.5 20.8a1.54 1.54 0 1 1-3.08 0a1.54 1.54 0 0 1 3.08 0M8.84 9.53a1.48 1.48 0 1 1-2.96 0a1.48 1.48 0 0 1 2.96 0" />
+\t\t<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11.96 17.19L9.4 15.75c-1-.56-1.49-.84-1.76-1.3c-.28-.47-.28-1.05-.28-2.19v-1.24m4.6 3.4l3.14-1.38c.87-.39 1.3-.58 1.6-.91a2 2 0 0 0 .3-.47c.2-.4.2-.88.2-1.84m-5.24 9.44V1.99" />
+\t\t<rect width="2.8" height="2.8" x="15.72" y="6.28" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" rx=".5" />
+\t\t<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9.38 3.93l1.16-1.16c.67-.67 1-1 1.42-1s.75.33 1.41 1l1.17 1.16" />
+\t</g>
+</svg>
+`;
 }
 
 function spinner() {
@@ -90,10 +103,10 @@ function lanRow(device) {
       <div class="device-name">${esc(device.name || device.dev)}</div>
       <div class="device-addr">${esc(device.addr)}</div>
     </div>
-    <button class="btn" data-connect-lan data-dev="${esc(device.dev)}" data-addr="${esc(device.addr)}"
-      ${state.busy ? 'disabled' : ''}>
-      ${busy ? spinner() : ''}${esc(busy ? t('setup.connecting') : t('setup.connect'))}
-    </button>
+    ${busy
+      ? `<button class="btn btn--quiet" data-cancel>${esc(t('setup.cancel'))}</button>`
+      : `<button class="btn" data-connect-lan data-dev="${esc(device.dev)}" data-addr="${esc(device.addr)}"
+          ${state.busy ? 'disabled' : ''}>${esc(t('setup.connect'))}</button>`}
   </div>`;
 }
 
@@ -110,10 +123,10 @@ function adbRow(device) {
       <div class="device-name">${esc(device.model || device.serial)}</div>
       <div class="device-addr">${esc(device.serial)}</div>
     </div>
-    <button class="btn" data-connect-adb data-serial="${esc(device.serial)}"
-      ${!ready || state.busy ? 'disabled' : ''}>
-      ${busy ? spinner() : ''}${esc(label)}
-    </button>
+    ${busy
+      ? `<button class="btn btn--quiet" data-cancel>${esc(t('setup.cancel'))}</button>`
+      : `<button class="btn" data-connect-adb data-serial="${esc(device.serial)}"
+          ${!ready || state.busy ? 'disabled' : ''}>${esc(label)}</button>`}
   </div>`;
 }
 
@@ -132,9 +145,14 @@ function devicesView() {
   return `<section class="setup view-enter">
     <div class="setup-head">
       <h1 class="setup-title">${esc(t('setup.title'))}</h1>
-      <button class="btn btn--quiet" id="refresh" ${state.discovering ? 'disabled' : ''}>
-        ${state.discovering ? spinner() : ''}${esc(t('setup.refresh'))}
-      </button>
+      <div class="setup-actions">
+        ${state.root
+          ? `<button class="btn btn--quiet" id="open-library">${esc(t('setup.change_folder'))}</button>`
+          : ''}
+        <button class="btn btn--quiet" id="refresh" ${state.discovering ? 'disabled' : ''}>
+          ${state.discovering ? spinner() : ''}${esc(t('setup.refresh'))}
+        </button>
+      </div>
     </div>
     <div class="setup-body">
       <section class="group">
@@ -157,9 +175,14 @@ function libraryView() {
       <span class="library-icon">${iconFolder()}</span>
       <h1 class="setup-title">${esc(t('library.title'))}</h1>
       <p class="setup-hint">${esc(t('library.hint'))}</p>
-      <button class="btn btn--large" id="choose" ${state.busy === 'folder' ? 'disabled' : ''}>
-        ${state.busy === 'folder' ? spinner() : ''}${esc(state.busy === 'folder' ? t('library.choosing') : t('library.action'))}
-      </button>
+      <div class="library-actions">
+        <button class="btn btn--large" id="choose" ${state.busy === 'folder' ? 'disabled' : ''}>
+          ${state.busy === 'folder' ? spinner() : ''}${esc(state.busy === 'folder' ? t('library.choosing') : t('library.action'))}
+        </button>
+        ${state.root
+          ? `<button class="btn btn--quiet" id="open-devices">${esc(t('library.back'))}</button>`
+          : ''}
+      </div>
       ${noteView()}
     </div>
   </section>`;
@@ -220,11 +243,15 @@ function workspaceView() {
 function render() {
   const screen = document.getElementById('screen');
   if (!screen) return;
-  if (state.view === 'devices') screen.innerHTML = devicesView();
-  else if (state.view === 'library') screen.innerHTML = libraryView();
-  else if (state.view === 'workspace') screen.innerHTML = workspaceView();
-  else if (state.view === 'error') screen.innerHTML = `<div class="fatal">${esc(state.note)}</div>`;
-  else screen.innerHTML = '';
+  let html = '';
+  if (state.view === 'devices') html = devicesView();
+  else if (state.view === 'library') html = libraryView();
+  else if (state.view === 'workspace') html = workspaceView();
+  else if (state.view === 'error') html = `<div class="fatal">${esc(state.note)}</div>`;
+  if (html !== painted.screen) {
+    screen.innerHTML = html;
+    painted.screen = html;
+  }
 
   document.querySelectorAll('[data-window]').forEach((button) => {
     const title = t(`window.${button.dataset.window}`);
@@ -288,11 +315,13 @@ async function connectAdb(serial) {
   }
 }
 
-async function discoverAll() {
+async function discoverAll(keepNote = false) {
   if (state.discovering || !invoke) return;
   state.discovering = true;
-  state.error = false;
-  state.note = '';
+  if (!keepNote) {
+    state.error = false;
+    state.note = '';
+  }
   render();
   const [lan, adb] = await Promise.allSettled([
     invoke('discover_agents'),
@@ -324,14 +353,15 @@ async function chooseFolder() {
 
   state.busy = 'folder';
   render();
+  let opened = false;
   try {
     const result = await invoke('initialize_library', {
       root: folder,
       dataDir: state.info?.config?.data_dir || null,
     });
     state.root = result?.root || folder;
-    state.view = 'workspace';
     state.note = '';
+    opened = true;
   } catch (error) {
     state.error = true;
     state.note = t('error.init', { error: message(error) });
@@ -339,6 +369,36 @@ async function chooseFolder() {
     state.busy = '';
     render();
   }
+  if (!opened) return;
+
+  // Сначала локальная папка, потом телефон: после выбора папки показываем
+  // устройства. Если телефон уже был сопряжён, пробуем вернуться к нему.
+  if (state.phone.linked) {
+    state.view = 'workspace';
+    render();
+    await reconnect();
+  } else {
+    state.view = 'devices';
+    render();
+    await discoverAll();
+  }
+}
+
+function openLibrary() {
+  if (state.busy) return;
+  state.view = 'library';
+  state.error = false;
+  state.note = '';
+  render();
+}
+
+async function openDevices() {
+  if (state.busy) return;
+  state.view = 'devices';
+  state.error = false;
+  state.note = '';
+  render();
+  await discoverAll();
 }
 
 async function requestRootChange(quiet = false) {
@@ -403,6 +463,72 @@ async function forgetPhone() {
   }
 }
 
+async function reconnect() {
+  if (!invoke || state.busy || !state.phone.linked) return;
+  state.busy = 'reconnect';
+  state.error = false;
+  state.note = t('setup.connecting');
+  render();
+  try {
+    const result = await invoke('agent_reconnect');
+    state.busy = '';
+    applyLink(result);
+  } catch (error) {
+    state.busy = '';
+    state.error = true;
+    state.note = t('phone.error', { error: message(error) });
+    state.phone = { linked: false };
+    state.view = 'devices';
+    render();
+    await discoverAll(true);
+  }
+}
+
+async function pollStatus() {
+  if (!invoke || !state.phone.linked) return;
+  if (state.busy || state.phoneBusy) return;
+  if (state.view !== 'workspace' && state.view !== 'library') return;
+
+  let status;
+  try {
+    status = await invoke('agent_status');
+  } catch {
+    return;
+  }
+  if (!status || status.busy) return;
+
+  if (!status.connected) {
+    state.phone = { linked: false };
+    state.manifest = null;
+    state.error = true;
+    state.note = t('phone.lost');
+    state.view = 'devices';
+    render();
+    await discoverAll(true);
+    return;
+  }
+
+  let changed = false;
+  if (status.root !== undefined && status.root !== state.phone.root) {
+    state.phone.root = status.root;
+    changed = true;
+  }
+  if (status.name && status.name !== state.phone.name) {
+    state.phone.name = status.name;
+    changed = true;
+  }
+  if (changed) render();
+}
+
+async function cancelConnect() {
+  if (!invoke) return;
+  try {
+    await invoke('agent_cancel');
+  } catch {
+    // Соединение могло уже закрыться само.
+  }
+}
+
 async function windowAction(action) {
   if (!invoke) return;
   const command = {
@@ -434,8 +560,8 @@ async function boot() {
     const link = await invoke('agent_link');
     state.phone = link?.linked ? link : { linked: false };
 
-    if (!state.phone.linked) state.view = 'devices';
-    else if (!state.root) state.view = 'library';
+    if (!state.root) state.view = 'library';
+    else if (!state.phone.linked) state.view = 'devices';
     else state.view = 'workspace';
   } catch (error) {
     state.view = 'error';
@@ -443,11 +569,18 @@ async function boot() {
   }
   render();
   if (state.view === 'devices') await discoverAll();
+  else if (state.phone.linked) await reconnect();
+  setInterval(pollStatus, 2500);
 }
 
 document.addEventListener('click', (event) => {
   if (event.target.closest('#refresh')) {
     discoverAll();
+    return;
+  }
+
+  if (event.target.closest('[data-cancel]')) {
+    cancelConnect();
     return;
   }
 
@@ -483,10 +616,13 @@ document.addEventListener('click', (event) => {
     return;
   }
 
+  if (event.target.closest('#open-library')) {
+    openLibrary();
+    return;
+  }
+
   if (event.target.closest('#open-devices')) {
-    state.view = 'devices';
-    render();
-    discoverAll();
+    openDevices();
     return;
   }
 
@@ -501,7 +637,12 @@ window.__syncth = {
   discoverAll,
   connectLan,
   connectAdb,
+  reconnect,
+  pollStatus,
+  cancelConnect,
   chooseFolder,
+  openLibrary,
+  openDevices,
   requestRootChange,
   scanPhone,
   forgetPhone,

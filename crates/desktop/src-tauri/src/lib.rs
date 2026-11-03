@@ -10,22 +10,53 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PROTO};
 use syncth_core::transport::Transport;
 use syncth_core::Replica;
+use tauri::Manager;
 
 const UI_ADDR: &str = "127.0.0.1:47889";
 const SYNC_BIND: &str = "0.0.0.0:47887";
+
+/// Как часто ПК проверяет живой сеанс и заодно забирает актуальную папку.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
+/// Сколько ждём ответ на heartbeat, прежде чем считать связь потерянной.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Прощание не должно задерживать закрытие окна, если сокет уже завис.
+const BYE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Сокет текущего подключения, который можно аварийно закрыть кнопкой
+/// «Отмена». Хранится отдельно, чтобы команда отмены не ждала мьютекс сессии.
+static CANCEL_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct Desktop {
     /// Демон, запущенный именно этим окном. Нужен, чтобы не плодить процессы.
     child: Mutex<Option<std::process::Child>>,
+    agent: Mutex<AgentState>,
+}
+
+#[derive(Default)]
+struct AgentState {
+    session: Option<LiveSession>,
+    last_error: Option<String>,
+}
+
+/// Постоянное соединение с телефоном. Живёт, пока открыт ПК-клиент.
+struct LiveSession {
+    transport: Box<dyn Transport>,
+    link: AgentLink,
+    root: Option<String>,
+    last_beat: Instant,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -252,7 +283,29 @@ fn agent_open(
     timeout: Duration,
 ) -> Result<(Box<dyn Transport>, HelloInfo), String> {
     let identity = pc_identity()?;
+    CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     let stream = agent_stream(addr, timeout)?;
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("сопряжение отменено".to_string());
+    }
+
+    // Пока идёт рукопожатие, кнопка «Отмена» может закрыть сокет снаружи.
+    *CANCEL_STREAM.lock().unwrap() = stream.try_clone().ok();
+
+    let result = agent_handshake(stream, link, identity);
+    *CANCEL_STREAM.lock().unwrap() = None;
+
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("сопряжение отменено".to_string());
+    }
+    result
+}
+
+fn agent_handshake(
+    stream: TcpStream,
+    link: Option<&AgentLink>,
+    identity: AgentIdentity,
+) -> Result<(Box<dyn Transport>, HelloInfo), String> {
     let mut transport: Box<dyn Transport> = Box::new(stream);
 
     agent::send(
@@ -378,12 +431,156 @@ fn adb_forward(serial: &str) -> Result<String, String> {
 
 fn link_addr(link: &AgentLink) -> Result<String, String> {
     if let Some(serial) = link.serial.as_deref().filter(|value| !value.is_empty()) {
+        // Убираем прошлое правило forward, иначе они копятся при каждом запуске.
+        if let Some(port) = link
+            .addr
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+        {
+            let _ = run_adb(&["-s", serial, "forward", "--remove", &format!("tcp:{port}")]);
+        }
         return adb_forward(serial);
     }
     if link.addr.is_empty() {
         return Err("адрес устройства не сохранён".to_string());
     }
     Ok(link.addr.clone())
+}
+
+#[tauri::command]
+fn agent_cancel() {
+    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    if let Some(stream) = CANCEL_STREAM.lock().unwrap().take() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// Ставит постоянный сеанс и закрывает предыдущий, если он был.
+fn install_session(app: &tauri::AppHandle, transport: Box<dyn Transport>, link: AgentLink) {
+    let state = app.state::<Desktop>();
+    let mut guard = state.agent.lock().unwrap();
+    if let Some(mut old) = guard.session.take() {
+        let _ = old.transport.set_write_timeout(Some(BYE_TIMEOUT));
+        let _ = agent::send(old.transport.as_mut(), &AgentMsg::Bye);
+        old.transport.shutdown();
+    }
+    guard.last_error = None;
+    guard.session = Some(LiveSession {
+        transport,
+        root: link.root.clone(),
+        link,
+        last_beat: Instant::now(),
+    });
+}
+
+fn close_session(app: &tauri::AppHandle) {
+    let state = app.state::<Desktop>();
+    let mut guard = state.agent.lock().unwrap();
+    if let Some(mut session) = guard.session.take() {
+        let _ = session.transport.set_write_timeout(Some(BYE_TIMEOUT));
+        let _ = agent::send(session.transport.as_mut(), &AgentMsg::Bye);
+        session.transport.shutdown();
+    }
+}
+
+/// Прощание при закрытии окна. Если сеанс занят длинной командой, не ждём:
+/// процесс всё равно закроет сокет, и телефон увидит разрыв.
+fn close_session_now(app: &tauri::AppHandle) {
+    let state = app.state::<Desktop>();
+    let Ok(mut guard) = state.agent.try_lock() else {
+        return;
+    };
+    if let Some(mut session) = guard.session.take() {
+        let _ = session.transport.set_write_timeout(Some(BYE_TIMEOUT));
+        let _ = agent::send(session.transport.as_mut(), &AgentMsg::Bye);
+        session.transport.shutdown();
+    }
+}
+
+/// Выполняет команду на уже открытом сеансе.
+///
+/// Внешняя ошибка означает разрыв или рассинхронизацию протокола — сеанс
+/// сбрасывается, и следующий статус покажет «нет связи». Внутренняя ошибка —
+/// это обычный отказ телефона (например, отмена выбора папки): сеанс остаётся
+/// живым, и heartbeat продолжает идти.
+fn with_session<T>(
+    app: &tauri::AppHandle,
+    action: impl FnOnce(&mut LiveSession) -> Result<Result<T, String>, String>,
+) -> Result<T, String> {
+    let state = app.state::<Desktop>();
+    let mut guard = state
+        .agent
+        .lock()
+        .map_err(|_| "состояние связи недоступно".to_string())?;
+    let Some(session) = guard.session.as_mut() else {
+        return Err(guard
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "телефон не подключён".to_string()));
+    };
+
+    match action(session) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(message)) => Err(message),
+        Err(error) => {
+            if let Some(mut dead) = guard.session.take() {
+                dead.transport.shutdown();
+            }
+            guard.last_error = Some(error.clone());
+            Err(error)
+        }
+    }
+}
+
+/// Heartbeat: заодно забирает актуальную папку, если её изменили на телефоне.
+fn query_root(session: &mut LiveSession) -> Result<Option<String>, String> {
+    session
+        .transport
+        .set_read_timeout(Some(HEARTBEAT_TIMEOUT))
+        .map_err(|error| format!("{error:#}"))?;
+    agent::send(session.transport.as_mut(), &AgentMsg::GetRoot)
+        .map_err(|error| format!("{error:#}"))?;
+    loop {
+        match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
+            AgentMsg::RootInfo { path } => return Ok(path),
+            AgentMsg::Error { message } => return Err(message),
+            _ => continue,
+        }
+    }
+}
+
+fn start_heartbeat(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(HEARTBEAT_EVERY);
+
+        // Если сеанс занят длинной командой (выбор папки, скан), пропускаем
+        // удар: телефон в это время тоже не читает сокет.
+        let state = app.state::<Desktop>();
+        let Ok(mut guard) = state.agent.try_lock() else {
+            continue;
+        };
+        let Some(session) = guard.session.as_mut() else {
+            continue;
+        };
+
+        match query_root(session) {
+            Ok(root) => {
+                session.last_beat = Instant::now();
+                if session.root != root {
+                    session.root = root.clone();
+                    session.link.root = root;
+                    let _ = save_agent_link(session.link.clone());
+                }
+            }
+            Err(error) => {
+                if let Some(mut dead) = guard.session.take() {
+                    dead.transport.shutdown();
+                }
+                guard.last_error = Some(error);
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -433,7 +630,11 @@ async fn discover_agents() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn agent_connect(addr: String, dev: Option<String>) -> Result<Value, String> {
+async fn agent_connect(
+    app: tauri::AppHandle,
+    addr: String,
+    dev: Option<String>,
+) -> Result<Value, String> {
     blocking(move || {
         let config = load_config();
         let link = config.agent.as_ref();
@@ -443,27 +644,25 @@ async fn agent_connect(addr: String, dev: Option<String>) -> Result<Value, Strin
             _ => None,
         };
 
-        let (mut transport, info) = agent_open(
-            addr.trim(),
-            link.as_ref(),
-            Duration::from_secs(125),
-        )?;
+        let (transport, info) =
+            agent_open(addr.trim(), link.as_ref(), agent::PAIR_TIMEOUT + Duration::from_secs(5))?;
 
-        save_agent_link(AgentLink {
+        let full = AgentLink {
             dev: info.dev.clone(),
             name: info.name.clone(),
             addr: addr.trim().to_string(),
             token: info.token.clone(),
             root: info.root.clone(),
             serial: None,
-        })?;
-
-        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+        };
+        save_agent_link(full.clone())?;
+        install_session(&app, transport, full);
 
         Ok(json!({
             "dev": info.dev,
             "name": info.name,
             "addr": addr.trim(),
+            "serial": null,
             "root": info.root,
             "remembered": info.remembered,
             "needs_root": info.root.is_none(),
@@ -473,7 +672,7 @@ async fn agent_connect(addr: String, dev: Option<String>) -> Result<Value, Strin
 }
 
 #[tauri::command]
-async fn agent_connect_adb(serial: String) -> Result<Value, String> {
+async fn agent_connect_adb(app: tauri::AppHandle, serial: String) -> Result<Value, String> {
     blocking(move || {
         let config = load_config();
         let link = config
@@ -483,19 +682,19 @@ async fn agent_connect_adb(serial: String) -> Result<Value, String> {
             .cloned();
 
         let addr = adb_forward(&serial)?;
-        let (mut transport, info) =
-            agent_open(&addr, link.as_ref(), Duration::from_secs(125))?;
+        let (transport, info) =
+            agent_open(&addr, link.as_ref(), agent::PAIR_TIMEOUT + Duration::from_secs(5))?;
 
-        save_agent_link(AgentLink {
+        let full = AgentLink {
             dev: info.dev.clone(),
             name: info.name.clone(),
             addr: addr.clone(),
             token: info.token.clone(),
             root: info.root.clone(),
             serial: Some(serial.clone()),
-        })?;
-
-        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+        };
+        save_agent_link(full.clone())?;
+        install_session(&app, transport, full);
 
         Ok(json!({
             "dev": info.dev,
@@ -510,25 +709,66 @@ async fn agent_connect_adb(serial: String) -> Result<Value, String> {
     .await
 }
 
+/// Переподключается к сохранённому телефону при запуске ПК-клиента.
 #[tauri::command]
-async fn agent_request_root_change() -> Result<Value, String> {
+async fn agent_reconnect(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
         let link = load_config()
             .agent
             .ok_or_else(|| "телефон ещё не подключён".to_string())?;
         let addr = link_addr(&link)?;
-        let (mut transport, _) = agent_open(&addr, Some(&link), Duration::from_secs(310))?;
-        agent::send(transport.as_mut(), &AgentMsg::RequestRootChange)
-            .map_err(|e| format!("{e:#}"))?;
+        let (transport, info) =
+            agent_open(&addr, Some(&link), agent::PAIR_TIMEOUT + Duration::from_secs(5))?;
 
-        let root = match agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))? {
-            AgentMsg::RootChanged { path } => path,
-            AgentMsg::Error { message } => return Err(message),
-            other => return Err(format!("телефон ответил неожиданно: {other:?}")),
+        let full = AgentLink {
+            dev: info.dev.clone(),
+            name: info.name.clone(),
+            addr: addr.clone(),
+            token: info.token.clone(),
+            root: info.root.clone(),
+            serial: link.serial.clone(),
         };
-        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+        save_agent_link(full.clone())?;
+        install_session(&app, transport, full);
 
-        let mut updated = link;
+        Ok(json!({
+            "dev": info.dev,
+            "name": info.name,
+            "addr": addr,
+            "serial": link.serial,
+            "root": info.root,
+            "remembered": info.remembered,
+            "needs_root": info.root.is_none(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn agent_request_root_change(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let root = with_session(&app, |session| {
+            session
+                .transport
+                .set_read_timeout(Some(Duration::from_secs(310)))
+                .map_err(|error| format!("{error:#}"))?;
+            agent::send(session.transport.as_mut(), &AgentMsg::RequestRootChange)
+                .map_err(|e| format!("{e:#}"))?;
+
+            match agent::recv(session.transport.as_mut()).map_err(|e| format!("{e:#}"))? {
+                AgentMsg::RootChanged { path } => {
+                    session.root = Some(path.clone());
+                    session.link.root = Some(path.clone());
+                    Ok(Ok(path))
+                }
+                AgentMsg::Error { message } => Ok(Err(message)),
+                other => Err(format!("телефон ответил неожиданно: {other:?}")),
+            }
+        })?;
+
+        let mut updated = load_config()
+            .agent
+            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
         updated.root = Some(root.clone());
         save_agent_link(updated)?;
         Ok(json!({ "root": root }))
@@ -537,21 +777,26 @@ async fn agent_request_root_change() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn agent_scan() -> Result<Value, String> {
+async fn agent_scan(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
-        let link = load_config()
-            .agent
-            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
-        let addr = link_addr(&link)?;
-        let (mut transport, _) = agent_open(&addr, Some(&link), Duration::from_secs(610))?;
-        agent::send(transport.as_mut(), &AgentMsg::Scan).map_err(|e| format!("{e:#}"))?;
+        let (root, entries) = with_session(&app, |session| {
+            session
+                .transport
+                .set_read_timeout(Some(Duration::from_secs(610)))
+                .map_err(|error| format!("{error:#}"))?;
+            agent::send(session.transport.as_mut(), &AgentMsg::Scan)
+                .map_err(|e| format!("{e:#}"))?;
 
-        let (root, entries) = match agent::recv(transport.as_mut()).map_err(|e| format!("{e:#}"))? {
-            AgentMsg::Manifest { root, entries } => (root, entries),
-            AgentMsg::Error { message } => return Err(message),
-            other => return Err(format!("телефон ответил неожиданно: {other:?}")),
-        };
-        let _ = agent::send(transport.as_mut(), &AgentMsg::Bye);
+            match agent::recv(session.transport.as_mut()).map_err(|e| format!("{e:#}"))? {
+                AgentMsg::Manifest { root, entries } => {
+                    session.root = Some(root.clone());
+                    session.link.root = Some(root.clone());
+                    Ok(Ok((root, entries)))
+                }
+                AgentMsg::Error { message } => Ok(Err(message)),
+                other => Err(format!("телефон ответил неожиданно: {other:?}")),
+            }
+        })?;
 
         let total: u64 = entries.iter().map(|entry| entry.size).sum();
         let preview = entries
@@ -560,7 +805,9 @@ async fn agent_scan() -> Result<Value, String> {
             .map(|entry| json!({ "path": entry.path, "size": entry.size }))
             .collect::<Vec<_>>();
 
-        let mut updated = link;
+        let mut updated = load_config()
+            .agent
+            .ok_or_else(|| "телефон ещё не подключён".to_string())?;
         updated.root = Some(root.clone());
         save_agent_link(updated)?;
 
@@ -572,6 +819,36 @@ async fn agent_scan() -> Result<Value, String> {
         }))
     })
     .await
+}
+
+#[tauri::command]
+fn agent_status(app: tauri::AppHandle) -> Value {
+    let state = app.state::<Desktop>();
+    let guard = match state.agent.try_lock() {
+        Ok(guard) => guard,
+        // Сеанс занят длинной командой; пусть UI сохранит прошлое состояние.
+        Err(_) => return json!({ "busy": true }),
+    };
+
+    if let Some(session) = &guard.session {
+        return json!({
+            "busy": false,
+            "connected": true,
+            "dev": session.link.dev,
+            "name": session.link.name,
+            "addr": session.link.addr,
+            "serial": session.link.serial,
+            "root": session.root,
+            "idle_secs": session.last_beat.elapsed().as_secs(),
+        });
+    }
+
+    json!({
+        "busy": false,
+        "connected": false,
+        "error": guard.last_error,
+        "root": load_config().agent.and_then(|link| link.root),
+    })
 }
 
 #[tauri::command]
@@ -590,9 +867,21 @@ fn agent_link() -> Value {
 }
 
 #[tauri::command]
-fn agent_forget() -> Result<Value, String> {
+fn agent_forget(app: tauri::AppHandle) -> Result<Value, String> {
+    close_session(&app);
     let mut config = load_config();
-    config.agent = None;
+    if let Some(link) = config.agent.take() {
+        if let Some(serial) = link.serial.as_deref().filter(|value| !value.is_empty()) {
+            if let Some(port) = link
+                .addr
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse::<u16>().ok())
+            {
+                let _ = run_adb(&["-s", serial, "forward", "--remove", &format!("tcp:{port}")]);
+            }
+        }
+    }
     save_config(&config)?;
     Ok(json!({ "linked": false }))
 }
@@ -984,9 +1273,18 @@ fn window_close(window: tauri::WebviewWindow) {
 pub fn run() {
     tauri::Builder::default()
         .manage(Desktop::default())
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                close_session_now(window.app_handle());
+            }
+        })
         // Отладочный канал: позволяет прогнать сценарий интерфейса без кликов.
         // В релизе отсутствует.
         .setup(|app| {
+            start_heartbeat(app.handle().clone());
             #[cfg(debug_assertions)]
             if let Ok(script) = std::env::var("SYNCTH_UI_EVAL") {
                 use tauri::Manager;
@@ -1007,6 +1305,9 @@ pub fn run() {
             discover_adb,
             agent_connect,
             agent_connect_adb,
+            agent_reconnect,
+            agent_status,
+            agent_cancel,
             agent_request_root_change,
             agent_scan,
             agent_link,

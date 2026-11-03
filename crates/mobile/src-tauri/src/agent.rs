@@ -30,6 +30,8 @@ struct Config {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingPair {
+    /// Номер запроса. Нужен, чтобы старый таймаут не сбросил новый запрос.
+    pub seq: usize,
     pub dev: String,
     pub name: String,
     pub pk: String,
@@ -49,6 +51,7 @@ pub struct AgentRuntime {
     status: Mutex<Status>,
     pending: Mutex<Option<PendingPair>>,
     pair_tx: Mutex<Option<mpsc::Sender<bool>>>,
+    pair_seq: AtomicUsize,
     root_change: AtomicBool,
     root_tx: Mutex<Option<mpsc::Sender<String>>>,
     /// Сколько командных сессий с ПК сейчас открыто. Во время сопряжения
@@ -279,8 +282,10 @@ fn pair(
     pk: String,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<bool>();
+    let seq = runtime.pair_seq.fetch_add(1, Ordering::SeqCst) + 1;
     {
         *runtime.pending.lock().unwrap() = Some(PendingPair {
+            seq,
             dev: dev.clone(),
             name: name.clone(),
             pk: pk.clone(),
@@ -288,9 +293,25 @@ fn pair(
         *runtime.pair_tx.lock().unwrap() = Some(tx);
     }
 
-    let accepted = rx.recv_timeout(Duration::from_secs(120)).unwrap_or(false);
-    *runtime.pending.lock().unwrap() = None;
-    *runtime.pair_tx.lock().unwrap() = None;
+    let accepted = rx.recv_timeout(agent::PAIR_TIMEOUT).unwrap_or(false);
+
+    // Запрос мог быть заменён новым подключением, пока мы ждали. В этом случае
+    // не трогаем чужое состояние и не шлём ответ в уже закрытый сокет.
+    let still_mine = {
+        let mut pending = runtime.pending.lock().unwrap();
+        let mine = pending
+            .as_ref()
+            .map(|pair| pair.seq == seq)
+            .unwrap_or(false);
+        if mine {
+            *pending = None;
+            *runtime.pair_tx.lock().unwrap() = None;
+        }
+        mine
+    };
+    if !still_mine {
+        anyhow::bail!("сопряжение прервано новым запросом");
+    }
 
     if !accepted {
         agent::send(
@@ -319,6 +340,21 @@ fn pair(
     Ok(())
 }
 
+/// Проверяет, что ошибка чтения — это истёкший таймаут, а не разрыв связи.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn command_loop(
     _app: &tauri::AppHandle,
     runtime: &AgentRuntime,
@@ -327,8 +363,22 @@ fn command_loop(
     // Сессия считается активной, пока ПК держит соединение и шлёт команды.
     // Во время сопряжения счётчик ещё не растёт: телефон показывает запрос.
     let _session = SessionGuard::new(&runtime.connected);
+
+    // ПК шлёт heartbeat (GetRoot) каждые несколько секунд. Если сообщений нет
+    // дольше AGENT_IDLE_TIMEOUT, считаем, что связь потеряна, и возвращаемся
+    // в ожидание. Таймаут ставится на весь кадр: сообщения маленькие и
+    // приходят целиком, поэтому частичный кадр не останется в буфере.
+    transport
+        .set_read_timeout(Some(agent::AGENT_IDLE_TIMEOUT))
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+
     loop {
-        match agent::recv(transport)? {
+        let message = match agent::recv(transport) {
+            Ok(message) => message,
+            Err(error) if is_timeout(&error) => break,
+            Err(error) => return Err(error),
+        };
+        match message {
             AgentMsg::GetRoot => {
                 agent::send(
                     transport,
@@ -345,8 +395,16 @@ fn command_loop(
                 runtime.root_change.store(false, Ordering::SeqCst);
                 *runtime.root_tx.lock().unwrap() = None;
                 match result {
-                    Ok(path) => {
+                    Ok(path) if !path.is_empty() => {
                         agent::send(transport, &AgentMsg::RootChanged { path })?;
+                    }
+                    Ok(_) => {
+                        agent::send(
+                            transport,
+                            &AgentMsg::Error {
+                                message: "выбор папки отменён".into(),
+                            },
+                        )?;
                     }
                     Err(_) => {
                         agent::send(
@@ -446,6 +504,17 @@ pub fn agent_set_root(app: tauri::AppHandle, path: String) -> Result<serde_json:
         let _ = tx.send(root);
     }
     Ok(agent_info(app))
+}
+
+/// Закрывает выбор папки, если ПК его запросил. Пустой путь — это сигнал
+/// «пользователь передумал», чтобы ПК не ждал пять минут.
+#[tauri::command]
+pub fn agent_cancel_root(app: tauri::AppHandle) {
+    if let Some(runtime) = app.try_state::<AgentRuntime>() {
+        if let Some(tx) = runtime.root_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(String::new());
+        }
+    }
 }
 
 #[tauri::command]

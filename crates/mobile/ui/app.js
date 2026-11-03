@@ -9,7 +9,7 @@ const state = {
   note: '',
   error: false,
   pickerOpen: false,
-  pickerReason: 'request',
+  pickerRequested: false,
   rootChangeSeen: false,
   pairBusy: false,
   browser: {
@@ -92,6 +92,12 @@ function waitingView() {
       <div class="wait-copy">
         <h1 class="wait-title">${esc(t('wait.title'))}</h1>
         <p class="wait-hint">${esc(t('wait.hint'))}</p>
+        ${state.root
+          ? `<button class="ghost" id="change-root" ${state.busy ? 'disabled' : ''}>
+              ${esc(t('agent.change'))}
+            </button>
+            <p class="wait-path">${esc(state.root)}</p>`
+          : ''}
       </div>
       ${statusError}
     </div>
@@ -162,11 +168,14 @@ function pickerView() {
       </button>`
     : '';
 
-  const banner = `<div class="picker-banner">${esc(t('picker.request'))}</div>`;
+  const banner = `<div class="picker-banner">${esc(t(state.pickerRequested ? 'picker.request' : 'picker.hint'))}</div>`;
+  const canClose = Boolean(state.root) || state.pickerRequested;
 
   return `<section class="picker">
     <header class="picker-head">
-      <button class="picker-close" data-picker-close aria-label="${esc(t('picker.cancel'))}">${iconClose()}</button>
+      ${canClose
+        ? `<button class="picker-close" data-picker-close aria-label="${esc(t('picker.cancel'))}">${iconClose()}</button>`
+        : '<span></span>'}
       <span class="picker-title">${esc(t('picker.change'))}</span>
       <span></span>
     </header>
@@ -254,16 +263,29 @@ async function browse(path) {
   render();
 }
 
-function openPicker() {
+/// Сообщает ПК, что выбор папки отменён, чтобы он не ждал ответа.
+function cancelRootRequest() {
+  if (!state.pickerRequested) return;
+  state.pickerRequested = false;
+  if (invoke) invoke('agent_cancel_root').catch(() => {});
+}
+
+function openPicker(fromPc = false) {
   if (state.busy || !invoke || state.pickerOpen) return;
   state.pickerOpen = true;
+  state.pickerRequested = fromPc;
   state.browser = { path: null, parent: null, entries: [], loading: true, error: '' };
   if (!window.history.state?.syncthPicker) window.history.pushState({ syncthPicker: true }, '');
   render();
   browse(null);
 }
 
-function closePicker() {
+function closePicker(cancelRequest = true) {
+  // Первый выбор папки — обязательный шаг: закрыть его нельзя. Отменить
+  // можно только запрос ПК (тогда ПК получит понятный отказ).
+  if (cancelRequest && !state.root && !state.pickerRequested) return;
+  if (cancelRequest) cancelRootRequest();
+  state.pickerRequested = false;
   state.pickerOpen = false;
   if (window.history.state?.syncthPicker) window.history.back();
   render();
@@ -273,7 +295,7 @@ async function useFolder() {
   const path = state.browser.path;
   if (!path || state.busy) return;
 
-  closePicker();
+  closePicker(false);
   state.busy = true;
   state.error = false;
   render();
@@ -281,7 +303,7 @@ async function useFolder() {
   try {
     state.info = await invoke('agent_set_root', { path });
     state.root = state.info?.root || path;
-    state.view = 'ready';
+    state.view = state.info?.connected ? 'ready' : 'waiting';
     state.note = '';
   } catch (error) {
     state.error = true;
@@ -322,30 +344,28 @@ async function refresh() {
     state.info = info;
     state.root = info.root || null;
 
-    // Логика переключения экранов
+    // Логика переключения экранов: сначала папка на телефоне, потом связь.
     if (state.view !== 'loading' && state.view !== 'error') {
-      if (!info.connected) {
-        // Если ПК не подключен, всегда показываем ожидание
+      if (!info.root) {
+        state.view = 'waiting';
+        if (!state.pickerOpen && !info.pending) openPicker(info.connected);
+      } else if (!info.connected) {
         if (state.view !== 'waiting') {
           state.view = 'waiting';
-          // Закрываем пикер, если он был открыт
           if (state.pickerOpen) closePicker();
         }
-      } else if (!info.root) {
-        // ПК подключен, но папка не выбрана — открываем выбор.
-        // Пока висит запрос сопряжения, пикер не мешаем показывать поверх.
-        state.view = 'waiting';
-        if (!state.pickerOpen && !info.pending) openPicker();
       } else {
-        // Папка уже выбрана, переходим в готовый режим
         state.view = 'ready';
       }
     }
 
-    // Обработка принудительной смены папки с ПК
-    if (info.root_change && !state.rootChangeSeen && !state.pickerOpen && !state.busy && info.connected) {
+    // Обработка принудительной смены папки с ПК. Если пикер уже открыт
+    // (например, это первый выбор папки), помечаем запрос, чтобы отмена
+    // корректно дошла до ПК.
+    if (info.root_change && !state.rootChangeSeen && !state.busy && info.connected) {
       state.rootChangeSeen = true;
-      openPicker();
+      if (state.pickerOpen) state.pickerRequested = true;
+      else openPicker(true);
     }
     if (!info.root_change) state.rootChangeSeen = false;
 
@@ -373,13 +393,9 @@ async function boot() {
     state.info = await invoke('agent_info');
     state.root = state.info?.root || null;
 
-    // При старте показываем ожидание, пока ПК не откроет сессию.
-    if (state.info?.connected) {
-      state.view = state.root ? 'ready' : 'waiting';
-      if (!state.root && !state.info?.pending) openPicker();
-    } else {
-      state.view = 'waiting';
-    }
+    // Сначала папка на телефоне, потом ожидание подключения.
+    state.view = state.info?.connected && state.root ? 'ready' : 'waiting';
+    if (!state.root && !state.info?.pending) openPicker(Boolean(state.info?.connected));
   } catch (error) {
     state.view = 'error';
     state.note = message(error);
@@ -429,10 +445,15 @@ window.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('popstate', () => {
-  if (state.pickerOpen) {
-    state.pickerOpen = false;
-    render();
+  if (!state.pickerOpen) return;
+  // Первый выбор папки нельзя отменить: возвращаем запись истории назад.
+  if (!state.root && !state.pickerRequested) {
+    if (!window.history.state?.syncthPicker) window.history.pushState({ syncthPicker: true }, '');
+    return;
   }
+  state.pickerOpen = false;
+  cancelRootRequest();
+  render();
 });
 
 window.__syncth = { state, boot, render, openPicker, closePicker, browse, useFolder, pairDecision, refresh };
