@@ -4,13 +4,15 @@ import ModalLayer from './components/ModalLayer.vue';
 import TitleBar from './components/TitleBar.vue';
 import ErrorView from './views/ErrorView.vue';
 import LanguageView from './views/LanguageView.vue';
+import LibraryView from './views/LibraryView.vue';
+import DevicesView from './views/DevicesView.vue';
 import PlaceholderView from './views/PlaceholderView.vue';
 import { boot, state } from './store.js';
 
 const views = {
   language: LanguageView,
-  library: PlaceholderView,
-  devices: PlaceholderView,
+  library: LibraryView,
+  devices: DevicesView,
   workspace: PlaceholderView,
   error: ErrorView,
 };
