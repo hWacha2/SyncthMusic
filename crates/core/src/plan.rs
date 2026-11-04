@@ -354,14 +354,29 @@ impl Plan {
             .collect()
     }
 
-    /// Хэш набора решений: по нему commit проверяет, что обе стороны видят
-    /// одно и то же. Неразрешённый конфликт тоже входит в хэш.
+    /// Хэш явных решений и нерешённых конфликтов: по нему commit проверяет,
+    /// что обе стороны видят одно и то же.
+    ///
+    /// Сравнивать полный `effective_map` нельзя. `local_ignored` — локальное
+    /// состояние и пиру не передаётся, поэтому один и тот же файл может быть
+    /// строкой плана у одной стороны и отсутствовать у другой. Решение по
+    /// такой строке никто не принимает, и расхождение планов здесь ложное:
+    /// commit всё равно не тронет путь, который вторая сторона игнорирует.
     pub fn decisions_hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
-        for (path, action) in self.effective_map() {
+        for (path, decision) in &self.decisions.entries {
             hasher.update(path.as_bytes());
             hasher.update(b"\0");
-            hasher.update(action.as_bytes());
+            hasher.update(decision.action.as_str().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(decision.blob.as_bytes());
+            hasher.update(b"\n");
+        }
+        // Конфликт без решения — такая же часть общего состояния, как и
+        // выбранное действие: обе стороны обязаны видеть его одинаково.
+        for path in self.unresolved() {
+            hasher.update(b"unresolved\0");
+            hasher.update(path.as_bytes());
             hasher.update(b"\n");
         }
         format!("b3:{}", hasher.finalize().to_hex())
@@ -1261,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn decisions_hash_reflects_effective_actions() {
+    fn decisions_hash_reflects_explicit_decisions() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         let op = a.make_op(put("new.flac", "b3:one")).unwrap();
         a.apply(&op).unwrap();
@@ -1279,6 +1294,37 @@ mod tests {
             },
         );
         assert_ne!(before, plan.decisions_hash());
+    }
+
+    #[test]
+    fn decisions_hash_ignores_paths_without_explicit_decisions() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("new.flac", "b3:one")).unwrap();
+        a.apply(&op).unwrap();
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+        let before = plan.decisions_hash();
+
+        // У второй стороны может быть лишняя строка плана: например, файл,
+        // который здесь помечен `local_ignored` и потому в план не попал.
+        // Решения по нему нет, поэтому набор решений остаётся тем же.
+        let mut with_extra = plan.clone();
+        let mut extra = with_extra.local[0].clone();
+        extra.path = "ignored.flac".into();
+        with_extra.local.push(extra);
+        assert_eq!(before, with_extra.decisions_hash());
+
+        // Явное решение по этому пути уже обязано изменить хэш.
+        with_extra.decisions.entries.insert(
+            "ignored.flac".into(),
+            PathDecision {
+                path: "ignored.flac".into(),
+                action: Decision::Keep,
+                blob: "b3:one".into(),
+                hlc: Hlc::new(11, 0),
+                dev: "dev-a".into(),
+            },
+        );
+        assert_ne!(before, with_extra.decisions_hash());
     }
 
     #[test]
