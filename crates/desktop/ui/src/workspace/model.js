@@ -1,5 +1,5 @@
-import { t } from '../i18n/index.js';
-import { ago, basename, formatSize, number, sizeParts } from '../format.js';
+import { lang, t } from '../i18n/index.js';
+import { ago, basename, dirname, formatSize, number, sizeParts } from '../format.js';
 import { state } from '../store.js';
 
 // Производные значения рабочей области. Здесь нет побочных эффектов: те же
@@ -58,6 +58,104 @@ export function pendingDecisions(data = workspaceData()) {
 
 export function pendingCount(data = workspaceData()) {
   return pendingDecisions(data).length;
+}
+
+// Единый список изменений для вкладки «Изменения». Конфликты идут первыми и
+// вытесняют одноимённую строку из обычных изменений, чтобы путь не задвоился.
+export function changeEntries(data = workspaceData()) {
+  const plan = planData(data);
+  if (!plan) return [];
+  const manual = Boolean(data && data.manual_additions);
+  const entries = [];
+  const seen = new Set();
+
+  for (const conflict of plan.conflicts || []) {
+    seen.add(conflict.path);
+    entries.push({
+      type: 'conflict',
+      path: conflict.path,
+      conflict,
+      change: null,
+      side: null,
+      folder: dirname(conflict.path),
+      decided: !conflict.unresolved,
+      pending: Boolean(conflict.unresolved),
+      size: Math.max(Number(conflict.local_size) || 0, Number(conflict.remote_size) || 0),
+    });
+  }
+
+  for (const change of plan.changes || []) {
+    if (change.aligned || seen.has(change.path)) continue;
+    seen.add(change.path);
+    const addition = manual && change.kind === 'added';
+    const deletion = change.kind === 'deleted';
+    entries.push({
+      type: addition ? 'addition' : deletion ? 'deletion' : 'change',
+      path: change.path,
+      conflict: null,
+      change,
+      side: change.side,
+      folder: dirname(change.path),
+      decided: Boolean(change.decided),
+      pending: Boolean(!change.decided && (addition || deletion)),
+      size: change.size,
+    });
+  }
+
+  return entries;
+}
+
+function locale() {
+  return lang.value === 'ru' ? 'ru' : 'en';
+}
+
+function comparePaths(a, b) {
+  return String(a.path).localeCompare(String(b.path), locale(), {
+    numeric: true,
+    sensitivity: 'base',
+  });
+}
+
+export function sortEntries(entries) {
+  return [...entries].sort(comparePaths);
+}
+
+export function groupByFolder(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const folder = entry.folder || '';
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push(entry);
+  }
+
+  return [...groups.entries()]
+    .map(([folder, items]) => {
+      const pendingItems = items.filter((item) => item.pending);
+      return {
+        folder,
+        items: sortEntries(items),
+        pendingItems,
+        pending: pendingItems.length,
+        kinds: [...new Set(items.map((item) => item.change?.kind || 'conflict'))],
+      };
+    })
+    .sort((a, b) => {
+      // Файлы из корня библиотеки — в конце, остальные папки по алфавиту.
+      if (!a.folder) return b.folder ? 1 : 0;
+      if (!b.folder) return -1;
+      return a.folder.localeCompare(b.folder, locale(), { numeric: true, sensitivity: 'base' });
+    });
+}
+
+const TYPE_ORDER = ['deletion', 'addition', 'change'];
+
+export function groupByType(entries) {
+  return TYPE_ORDER
+    .map((type) => ({
+      type,
+      items: sortEntries(entries.filter((entry) => entry.type === type)),
+    }))
+    .filter((group) => group.items.length);
 }
 
 export function workspaceConnected(data) {

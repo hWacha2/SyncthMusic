@@ -1102,25 +1102,41 @@ impl PreviewSession {
         path: &str,
         action: Decision,
     ) -> Result<()> {
+        self.record_decisions(replica, &[path.to_string()], action)
+    }
+
+    /// Записать одно решение для набора путей: одно чтение и одна запись в БД,
+    /// чтобы массовое действие не делало N отдельных транзакций.
+    pub fn record_decisions(
+        &mut self,
+        replica: &mut Replica,
+        paths: &[String],
+        action: Decision,
+    ) -> Result<()> {
         anyhow::ensure!(
             !self.read_only,
             "передача уже началась — решения заморожены"
         );
         anyhow::ensure!(!self.finished, "сессия уже завершена");
-        let blob = self
-            .plan
-            .blob_for(path)
-            .with_context(|| format!("путь отсутствует в плане: {path}"))?;
-        let hlc = replica.next_hlc()?;
-        let decision = PathDecision {
-            path: path.to_string(),
-            action,
-            blob,
-            hlc,
-            dev: replica.device_id().to_string(),
-        };
+        if paths.is_empty() {
+            return Ok(());
+        }
+
         let mut set = replica.load_decisions(&self.peer_dev)?;
-        set.entries.insert(path.to_string(), decision);
+        for path in paths {
+            let blob = self
+                .plan
+                .blob_for(path)
+                .with_context(|| format!("путь отсутствует в плане: {path}"))?;
+            let decision = PathDecision {
+                path: path.clone(),
+                action,
+                blob,
+                hlc: replica.next_hlc()?,
+                dev: replica.device_id().to_string(),
+            };
+            set.entries.insert(path.clone(), decision);
+        }
         set.retain_valid(&self.plan);
         replica.save_decisions(&self.peer_dev, &set)?;
         self.plan.decisions = set;

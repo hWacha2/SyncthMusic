@@ -56,6 +56,28 @@ export async function undecide(path) {
   }
 }
 
+export async function decideMany(paths, action) {
+  if (!hasBridge || !paths.length || state.workspace.action || state.workspace.refreshing) {
+    return false;
+  }
+  const gen = nextWorkspaceGeneration();
+  state.workspace.action = `decide-many:${action}`;
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  try {
+    const data = await invoke('workspace_decide_many', { paths, action });
+    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    return true;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.decision', { error: errorMessage(error) });
+    state.workspace.noteError = true;
+    return false;
+  } finally {
+    state.workspace.action = '';
+  }
+}
+
 export function askDelete(path, type = 'deletion') {
   const kicker = type === 'addition'
     ? t('workspace.attention.addition')
@@ -80,6 +102,16 @@ export function askForget() {
     label: t('workspace.forget'),
     danger: true,
     onConfirm: () => forgetPhone(),
+  });
+}
+
+export function askBulkDelete(paths) {
+  openModal({
+    title: t('workspace.selection.delete_title'),
+    text: t('workspace.selection.delete_text', { count: paths.length }),
+    label: t('workspace.attention.delete_everywhere'),
+    danger: true,
+    onConfirm: () => decideMany(paths, 'delete_everywhere'),
   });
 }
 

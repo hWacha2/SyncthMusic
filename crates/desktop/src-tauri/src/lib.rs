@@ -1525,6 +1525,34 @@ async fn workspace_decide(
 }
 
 #[tauri::command]
+async fn workspace_decide_many(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    action: String,
+) -> Result<Value, String> {
+    blocking(move || {
+        let decision = parse_decision(&action)?;
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        let Some(session) = ws.session.as_mut() else {
+            return Err("Сначала проверьте папки: сеанс ещё не открыт".to_string());
+        };
+        session
+            .record_decisions(&mut replica, &paths, decision)
+            .map_err(|error| format!("{error:#}"))?;
+        session
+            .poll(&mut replica)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn workspace_undecide(app: tauri::AppHandle, path: String) -> Result<Value, String> {
     blocking(move || {
         let mut replica = workspace_replica()?;
@@ -2105,6 +2133,7 @@ pub fn run() {
             workspace_refresh,
             workspace_status,
             workspace_decide,
+            workspace_decide_many,
             workspace_undecide,
             workspace_set_manual,
             workspace_commit,

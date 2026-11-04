@@ -27,6 +27,8 @@ export const state = reactive({
     statusError: '',
     action: '',
     tab: 'overview',
+    changesSide: 'remote',
+    changesSort: 'folders',
     note: '',
     noteError: false,
   },

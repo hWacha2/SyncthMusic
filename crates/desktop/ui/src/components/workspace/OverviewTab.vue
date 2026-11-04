@@ -1,6 +1,5 @@
 <script setup>
 import DecisionButtons from './DecisionButtons.vue';
-import UndoButton from './UndoButton.vue';
 import IconCheck from '../icons/IconCheck.vue';
 import IconPc from '../icons/IconPc.vue';
 import IconPhone from '../icons/IconPhone.vue';
@@ -19,7 +18,7 @@ import {
   pendingCount,
   planData,
 } from '../../workspace/model.js';
-import { askForget } from '../../workspace/actions.js';
+import { askForget, selectTab } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
@@ -35,6 +34,14 @@ const items = computed(() => decisionItems(props.data));
 const conn = computed(() => connectionState(props.data));
 const connected = computed(() => conn.value.tone === 'on');
 const phone = computed(() => props.data?.phone || {});
+
+// Карточка «Требует решения» не должна расти вместе со списком: показываем
+// первые несколько нерешённых пунктов. Решённые здесь не нужны — они остаются
+// во вкладке «Изменения», где решение можно отменить.
+const ATTENTION_LIMIT = 3;
+const pendingItems = computed(() => items.value.filter((item) => !item.decided));
+const shownItems = computed(() => pendingItems.value.slice(0, ATTENTION_LIMIT));
+const hiddenCount = computed(() => Math.max(0, pendingItems.value.length - ATTENTION_LIMIT));
 
 const planNote = computed(() => {
   if (pending.value) return t('workspace.stats.plan_pending', { count: number(pending.value) });
@@ -168,9 +175,9 @@ function attentionMeta(item) {
             : items.length ? t('workspace.attention.done') : t('workspace.attention.none') }}
         </span>
       </div>
-      <div v-if="items.length" class="ws-decisions">
+      <div v-if="shownItems.length" class="ws-decisions">
         <div
-          v-for="item in items"
+          v-for="item in shownItems"
           :key="item.path"
           class="ws-decision"
           :class="{ 'is-decided': item.decided }"
@@ -181,10 +188,13 @@ function attentionMeta(item) {
             <span class="ws-decision-meta">{{ attentionMeta(item) }}</span>
           </div>
           <div class="ws-decision-actions">
-            <UndoButton v-if="item.decided" :path="item.path" />
-            <DecisionButtons v-else :item="item" />
+            <DecisionButtons :item="item" />
           </div>
         </div>
+        <button v-if="hiddenCount" class="ws-more" @click="selectTab('changes')">
+          <span>{{ t('workspace.attention.more', { count: hiddenCount }) }}</span>
+          <span class="ws-more-arrow" aria-hidden="true">→</span>
+        </button>
       </div>
       <div v-else class="ws-calm">
         <span class="ws-calm-icon"><IconCheck /></span>

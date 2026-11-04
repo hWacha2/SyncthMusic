@@ -44,3 +44,10 @@ export function basename(path) {
   const parts = text.split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : text;
 }
+
+// Папка, в которой лежит путь. Для файла в корне библиотеки — пустая строка.
+export function dirname(path) {
+  const text = String(path || '');
+  const index = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
+  return index > 0 ? text.slice(0, index) : '';
+}
