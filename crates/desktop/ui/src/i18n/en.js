@@ -6,6 +6,7 @@ export default {
   "setup.change_folder": "Change PC folder",
   "setup.searching": "Searching…",
   "setup.empty_lan": "No devices found.",
+  "setup.lan_hint": "Phone missing? Make sure it is on the same Wi-Fi network. A VPN can block the local network, so turn it off or exclude SyncthMusic from the tunnel. You can also connect over USB.",
   "setup.empty_adb": "No devices.",
   "setup.connect": "Connect",
   "setup.connecting": "Connecting…",

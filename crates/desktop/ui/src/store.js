@@ -14,6 +14,7 @@ export const state = reactive({
   adb: [],
   adbError: '',
   discovering: false,
+  discovered: false,
   busy: '',
   note: '',
   error: false,
@@ -106,6 +107,7 @@ export async function discoverAll(keepNote = false) {
   state.adbError = adb.status === 'rejected'
     ? t('setup.adb_error', { error: errorMessage(adb.reason) })
     : '';
+  state.discovered = true;
   state.discovering = false;
 }
 

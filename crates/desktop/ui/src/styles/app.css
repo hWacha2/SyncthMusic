@@ -1382,6 +1382,14 @@ button:focus-visible {
   color: var(--danger);
 }
 
+.group-hint {
+  display: block;
+  margin-top: 8px;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .device-list {
   display: flex;
   flex-direction: column;

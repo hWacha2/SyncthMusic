@@ -6,6 +6,7 @@ export default {
   "setup.change_folder": "Сменить папку",
   "setup.searching": "Поиск…",
   "setup.empty_lan": "Устройства не найдены.",
+  "setup.lan_hint": "Не видно телефон? Проверьте, что он в той же сети Wi-Fi. VPN может блокировать локальную сеть — отключите его или добавьте SyncthMusic в исключения туннеля. Можно подключиться и по USB.",
   "setup.empty_adb": "Нет устройств.",
   "setup.connect": "Подключить",
   "setup.connecting": "Подключение…",

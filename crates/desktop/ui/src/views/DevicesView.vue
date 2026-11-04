@@ -76,6 +76,9 @@ function adbLabel(device) {
           </template>
           <p v-else class="group-empty">
             {{ state.discovering ? t('setup.searching') : t('setup.empty_lan') }}
+            <span v-if="!state.discovering && state.discovered" class="group-hint">
+              {{ t('setup.lan_hint') }}
+            </span>
           </p>
         </div>
       </section>
@@ -88,7 +91,7 @@ function adbLabel(device) {
               v-for="device in state.adb"
               :key="device.serial"
               kind="usb"
-              :name="device.model || device.serial"
+              :name="device.name || device.serial"
               :sub="device.serial"
               :busy="state.busy === adbKey(device)"
             >
