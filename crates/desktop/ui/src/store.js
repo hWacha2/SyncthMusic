@@ -333,6 +333,29 @@ export async function refreshWorkspace(options = {}) {
 
 // ---------------------------------------------------------------- status
 
+/// Закрывает текущий сеанс, не трогая сохранённую пару. Телефон снова
+/// появится в списке устройств, а подключение к нему пройдёт без
+/// подтверждения на телефоне.
+export async function disconnectPhone() {
+  if (state.phoneBusy || !hasBridge) return;
+  state.phoneBusy = 'disconnect';
+  state.note = '';
+  state.error = false;
+  try {
+    await invoke('agent_disconnect');
+    await closeWorkspace();
+    state.phone = { linked: false };
+    state.view = 'devices';
+    await discoverAll(true);
+    state.note = t('phone.disconnected');
+  } catch (error) {
+    state.error = true;
+    state.note = t('phone.error', { error: errorMessage(error) });
+  } finally {
+    state.phoneBusy = '';
+  }
+}
+
 export async function reconnect() {
   if (!hasBridge || state.busy || !state.phone.linked) return;
   state.busy = 'reconnect';
@@ -366,7 +389,7 @@ async function pollStatus() {
     state.workspace.statusError = errorMessage(error);
     return;
   }
-  if (!status || status.busy) return;
+  if (!status || status.busy || state.phoneBusy) return;
 
   if (!status.connected) {
     state.phone = { linked: false };

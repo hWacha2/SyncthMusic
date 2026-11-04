@@ -35,6 +35,10 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Прощание не должно задерживать закрытие окна, если сокет уже завис.
 const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Токен сохранённой пары принадлежит другому телефону. По этой ошибке USB-
+/// подключение повторяется без токена, чтобы новый телефон спросил согласие.
+const OTHER_DEVICE_ERROR: &str = "подключилось другое устройство";
+
 /// Сокет текущего подключения, который можно аварийно закрыть кнопкой
 /// «Отмена». Хранится отдельно, чтобы команда отмены не ждала мьютекс сессии.
 static CANCEL_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
@@ -397,7 +401,7 @@ fn agent_handshake(
 
     if let Some(link) = link {
         if link.dev != remote_dev {
-            return Err("подключилось другое устройство".to_string());
+            return Err(OTHER_DEVICE_ERROR.to_string());
         }
     }
 
@@ -875,39 +879,52 @@ async fn agent_connect(
 #[tauri::command]
 async fn agent_connect_adb(app: tauri::AppHandle, serial: String) -> Result<Value, String> {
     blocking(move || {
-        let config = load_config();
-        let link = config
-            .agent
-            .as_ref()
-            .filter(|link| link.serial.as_deref() == Some(serial.as_str()))
-            .cloned();
-
+        // Токен пары не привязан к ADB-серийнику: тот же телефон может
+        // подключиться по USB после LAN или получить новый серийник. Поэтому
+        // сохранённую пару пробуем всегда, а не только при совпадении serial.
+        let saved = load_config().agent;
         let addr = adb_forward(&serial)?;
-        let (transport, info) =
-            agent_open(&addr, link.as_ref(), agent::PAIR_TIMEOUT + Duration::from_secs(5))?;
-
-        let full = AgentLink {
-            dev: info.dev.clone(),
-            name: info.name.clone(),
-            addr: addr.clone(),
-            token: info.token.clone(),
-            root: info.root.clone(),
-            serial: Some(serial.clone()),
-        };
-        save_agent_link(full.clone())?;
-        install_session(&app, transport, full);
-
-        Ok(json!({
-            "dev": info.dev,
-            "name": info.name,
-            "addr": addr,
-            "serial": serial,
-            "root": info.root,
-            "remembered": info.remembered,
-            "needs_root": info.root.is_none(),
-        }))
+        match adb_connect_once(&app, &serial, &addr, saved.as_ref()) {
+            // Ответил другой телефон: повторяем без токена, иначе вместо
+            // запроса на сопряжение человек увидел бы ошибку.
+            Err(error) if saved.is_some() && error == OTHER_DEVICE_ERROR => {
+                adb_connect_once(&app, &serial, &addr, None)
+            }
+            result => result,
+        }
     })
     .await
+}
+
+fn adb_connect_once(
+    app: &tauri::AppHandle,
+    serial: &str,
+    addr: &str,
+    link: Option<&AgentLink>,
+) -> Result<Value, String> {
+    let (transport, info) =
+        agent_open(addr, link, agent::PAIR_TIMEOUT + Duration::from_secs(5))?;
+
+    let full = AgentLink {
+        dev: info.dev.clone(),
+        name: info.name.clone(),
+        addr: addr.to_string(),
+        token: info.token.clone(),
+        root: info.root.clone(),
+        serial: Some(serial.to_string()),
+    };
+    save_agent_link(full.clone())?;
+    install_session(app, transport, full);
+
+    Ok(json!({
+        "dev": info.dev,
+        "name": info.name,
+        "addr": addr,
+        "serial": serial,
+        "root": info.root,
+        "remembered": info.remembered,
+        "needs_root": info.root.is_none(),
+    }))
 }
 
 /// Переподключается к сохранённому телефону при запуске ПК-клиента.
@@ -1045,6 +1062,21 @@ fn agent_forget(app: tauri::AppHandle) -> Result<Value, String> {
     }
     save_config(&config)?;
     Ok(json!({ "linked": false }))
+}
+
+/// Разрывает текущий сеанс, но оставляет сохранённую пару: следующее
+/// подключение к тому же телефону пройдёт без подтверждения.
+#[tauri::command]
+fn agent_disconnect(app: tauri::AppHandle) -> Value {
+    close_session(&app);
+    {
+        let desktop = app.state::<Desktop>();
+        if let Ok(mut ws) = desktop.workspace.lock() {
+            ws.close();
+            ws.session_error = None;
+        };
+    }
+    agent_link()
 }
 
 // ------------------------------------------------------------------ workspace
@@ -2068,6 +2100,7 @@ pub fn run() {
             agent_request_root_change,
             agent_scan,
             agent_link,
+            agent_disconnect,
             agent_forget,
             workspace_refresh,
             workspace_status,

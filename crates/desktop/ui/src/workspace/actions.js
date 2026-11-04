@@ -77,7 +77,7 @@ export function askForget() {
   openModal({
     title: t('workspace.modal.forget_title'),
     text: t('workspace.modal.forget_text'),
-    label: t('workspace.disconnect'),
+    label: t('workspace.forget'),
     danger: true,
     onConfirm: () => forgetPhone(),
   });

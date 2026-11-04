@@ -8,7 +8,7 @@ import Spinner from '../Spinner.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
 import { basename, formatSize, number } from '../../format.js';
-import { openDevices, requestRootChange, state } from '../../store.js';
+import { disconnectPhone, openDevices, requestRootChange, state } from '../../store.js';
 import {
   attentionKind,
   checkedText,
@@ -143,8 +143,18 @@ function attentionMeta(item) {
           v-if="phone.linked"
           class="btn btn--quiet btn--small"
           :disabled="Boolean(state.phoneBusy)"
+          @click="disconnectPhone"
+        >
+          <Spinner v-if="state.phoneBusy === 'disconnect'" />{{ t('workspace.disconnect') }}
+        </button>
+        <button
+          v-if="phone.linked"
+          class="btn btn--quiet btn--small btn--danger"
+          :disabled="Boolean(state.phoneBusy)"
           @click="askForget"
-        >{{ t('workspace.disconnect') }}</button>
+        >
+          <Spinner v-if="state.phoneBusy === 'forget'" />{{ t('workspace.forget') }}
+        </button>
         <button v-else class="btn btn--small" @click="openDevices">{{ t('workspace.connect') }}</button>
       </div>
     </section>
