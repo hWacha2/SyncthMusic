@@ -91,7 +91,7 @@ function adbLabel(device) {
               v-for="device in state.adb"
               :key="device.serial"
               kind="usb"
-              :name="device.name || device.serial"
+              :name="device.name || device.model || device.serial"
               :sub="device.serial"
               :busy="state.busy === adbKey(device)"
             >

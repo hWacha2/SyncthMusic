@@ -644,6 +644,39 @@ fn start_heartbeat(app: tauri::AppHandle) {
     });
 }
 
+/// Человеческое имя телефона, подключённого по USB.
+///
+/// `adb devices -l` отдаёт только кодовое обозначение модели, например
+/// `2511FPC34G`. Маркетинговое название лежит в системных свойствах, поэтому
+/// для авторизованного устройства читаем их одним вызовом. Если прочитать не
+/// удалось, остаётся модель из списка или серийный номер.
+fn adb_device_name(serial: &str, model: &str) -> String {
+    let props = run_adb(&[
+        "-s",
+        serial,
+        "shell",
+        "getprop ro.product.marketname; getprop ro.product.model",
+    ])
+    .unwrap_or_default();
+    let mut lines = props.lines().map(str::trim);
+    let market = lines.next().unwrap_or_default();
+    let system_model = lines.next().unwrap_or_default();
+    let model = if system_model.is_empty() { model } else { system_model };
+
+    // Как и на телефоне: не дублируем модель, если она уже входит в название.
+    let duplicate = market.eq_ignore_ascii_case(model)
+        || (!model.is_empty() && market.to_lowercase().contains(&model.to_lowercase()));
+    if !market.is_empty() && !model.is_empty() && !duplicate {
+        format!("{market} ({model})")
+    } else if !market.is_empty() {
+        market.to_string()
+    } else if !model.is_empty() {
+        model.to_string()
+    } else {
+        serial.to_string()
+    }
+}
+
 #[tauri::command]
 async fn discover_adb() -> Result<Value, String> {
     blocking(|| {
@@ -668,9 +701,20 @@ async fn discover_adb() -> Result<Value, String> {
                     model = value.replace('_', " ");
                 }
             }
+            let model = if model.is_empty() {
+                serial.to_string()
+            } else {
+                model
+            };
+            let name = if state == "device" {
+                adb_device_name(serial, &model)
+            } else {
+                model.clone()
+            };
             devices.push(json!({
                 "serial": serial,
-                "model": if model.is_empty() { serial.to_string() } else { model },
+                "model": model,
+                "name": name,
                 "state": state,
             }));
         }
