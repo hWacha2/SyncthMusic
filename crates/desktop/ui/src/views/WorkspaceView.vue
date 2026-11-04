@@ -1,6 +1,7 @@
 <script setup>
 import ChangesTab from '../components/workspace/ChangesTab.vue';
 import OverviewTab from '../components/workspace/OverviewTab.vue';
+import SettingsTab from '../components/workspace/SettingsTab.vue';
 import VaultTab from '../components/workspace/VaultTab.vue';
 import WorkspaceEmpty from '../components/workspace/WorkspaceEmpty.vue';
 import WorkspaceHead from '../components/workspace/WorkspaceHead.vue';
@@ -31,6 +32,7 @@ onMounted(() => {
         <OverviewTab v-else-if="tab === 'overview'" :data="data" />
         <ChangesTab v-else-if="tab === 'changes'" :data="data" />
         <VaultTab v-else-if="tab === 'vault'" :data="data" />
+        <SettingsTab v-else-if="tab === 'settings'" :data="data" />
       </div>
     </div>
   </section>

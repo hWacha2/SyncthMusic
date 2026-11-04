@@ -798,7 +798,7 @@ impl Replica {
     /// Операции для preview. Собственные «призраки» — добавления, удалённые
     /// до первой синхронизации, — пиру не показываем: файла больше нет, а в
     /// общей базе его никогда не было. Иначе у пира появится строка плана,
-    /// которой у нас нет, и `decisions_hash` разойдётся.
+    /// которой у нас нет, и стороны зря разойдутся.
     pub fn preview_ops(&self, known: &HashMap<String, (i64, i64)>) -> Result<Vec<Op>> {
         let mut ops = self.ops_since(known)?;
         let mut stmt = self
@@ -1138,6 +1138,35 @@ impl Replica {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Забыть журнал и материализованное состояние, но оставить идентичность
+    /// устройства, выбранную папку, токен и корзину. Нужно для проверки
+    /// синхронизации с чистого листа: следующий скан заново построит индекс.
+    pub fn reset_history(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for table in [
+            "ops",
+            "entries",
+            "blobs",
+            "pending_deletes",
+            "sync_plans",
+            "plan_decisions",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tx.commit()?;
+        // Недокачанные блобы больше не нужны: решение по ним потеряно вместе
+        // с планом.
+        if let Some(dir) = self.data_dir() {
+            let incoming = dir.join("incoming");
+            if let Ok(entries) = std::fs::read_dir(incoming) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_pending_delete(&self, path: &str) -> Result<()> {
@@ -1550,5 +1579,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn reset_history_keeps_identity_root_and_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("music");
+        fs::create_dir_all(&root).unwrap();
+        let mut replica = Replica::open(tmp.path(), "dev-a").unwrap();
+        replica.set_root(&root).unwrap();
+        let token = replica.ensure_token().unwrap();
+
+        let op = replica
+            .make_op(OpKind::EntryPut {
+                path: "a.mp3".into(),
+                blob: "b3:a".into(),
+                size: 1,
+                mtime_ns: 1,
+                added_at: 1,
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+        assert_eq!(replica.op_count().unwrap(), 1);
+        assert!(!replica.entries().unwrap().is_empty());
+
+        replica.reset_history().unwrap();
+
+        assert_eq!(replica.op_count().unwrap(), 0);
+        assert!(replica.entries().unwrap().is_empty());
+        assert_eq!(replica.device_id(), "dev-a");
+        assert_eq!(replica.root().unwrap().as_deref(), Some(root.as_path()));
+        assert_eq!(replica.ensure_token().unwrap(), token);
     }
 }

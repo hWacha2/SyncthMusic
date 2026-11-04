@@ -126,6 +126,46 @@ export function askGc() {
   });
 }
 
+export function askClearHistory() {
+  openModal({
+    kicker: t('workspace.tab.settings'),
+    title: t('workspace.modal.clear_history_title'),
+    text: t('workspace.modal.clear_history_text'),
+    label: t('workspace.settings.clear_history'),
+    danger: true,
+    onConfirm: () => clearHistory(),
+  });
+}
+
+/// Сбрасывает журнал и планы на ПК и телефоне. Файлы и «Хранилище» остаются.
+export async function clearHistory() {
+  if (!hasBridge || state.workspace.action) return;
+  const gen = nextWorkspaceGeneration();
+  state.workspace.action = 'clear-history';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  try {
+    const data = await invoke('workspace_clear_history');
+    if (!isWorkspaceGeneration(gen)) return;
+    state.workspace.data = data;
+    const cleared = data?.history_cleared;
+    if (cleared && cleared.phone === false) {
+      state.workspace.note = t('workspace.error.clear_history_phone', {
+        error: cleared.phone_error || t('error.unknown'),
+      });
+      state.workspace.noteError = true;
+    } else {
+      state.workspace.note = t('workspace.history_cleared');
+      state.workspace.noteError = false;
+    }
+  } catch (error) {
+    state.workspace.note = t('workspace.error.clear_history', { error: errorMessage(error) });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+}
+
 export async function commitWorkspace() {
   if (!hasBridge || !canCommit()) return;
   nextWorkspaceGeneration();

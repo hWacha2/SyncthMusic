@@ -1,11 +1,12 @@
 <script setup>
 import IconList from '../icons/IconList.vue';
 import IconOverview from '../icons/IconOverview.vue';
+import IconSettings from '../icons/IconSettings.vue';
 import IconVault from '../icons/IconVault.vue';
 import { t } from '../../i18n/index.js';
 import { openDevices, state } from '../../store.js';
 import { basename, connectionState, pendingCount } from '../../workspace/model.js';
-import { selectTab, toggleManual } from '../../workspace/actions.js';
+import { selectTab } from '../../workspace/actions.js';
 
 defineProps({
   data: { type: Object, default: null },
@@ -15,6 +16,7 @@ const tabs = [
   { id: 'overview', icon: IconOverview, label: 'workspace.tab.overview' },
   { id: 'changes', icon: IconList, label: 'workspace.tab.changes', hot: true },
   { id: 'vault', icon: IconVault, label: 'workspace.tab.vault' },
+  { id: 'settings', icon: IconSettings, label: 'workspace.tab.settings' },
 ];
 
 function countFor(id, data) {
@@ -55,19 +57,6 @@ function countFor(id, data) {
     </nav>
 
     <div class="ws-rail-foot">
-      <button
-        class="ws-manual"
-        role="switch"
-        :aria-checked="data?.manual_additions ? 'true' : 'false'"
-        :title="t('workspace.manual.hint')"
-        :disabled="Boolean(state.workspace.action || state.workspace.refreshing)"
-        @click="toggleManual"
-      >
-        <span class="ws-manual-text">{{ t('workspace.manual.label') }}</span>
-        <span class="ws-switch" :class="{ 'is-on': data?.manual_additions }" aria-hidden="true">
-          <span class="ws-switch-dot"></span>
-        </span>
-      </button>
       <div class="ws-rail-state">
         <span
           class="status-dot"

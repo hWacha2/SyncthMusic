@@ -189,7 +189,15 @@ function bulkLabel(action) {
     }
     return t('workspace.attention.only_one_side');
   }
-  if (action === 'keep_in_library') return t('workspace.attention.keep');
+  if (action === 'keep_in_library') {
+    const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
+    if (sides.size === 1) {
+      return sides.has('local')
+        ? t('workspace.attention.restore_from_phone')
+        : t('workspace.attention.keep_pc');
+    }
+    return t('decision.keep_in_library');
+  }
   if (action === 'keep') return t('workspace.attention.keep_pc');
   if (action === 'keep_both') return t('workspace.attention.keep_both');
   if (action === 'delete_everywhere') return t('workspace.attention.delete_everywhere');
@@ -453,32 +461,31 @@ function typeTitle(type) {
       </template>
     </div>
     <Teleport to="body">
-      <div v-if="selectedEntries.length" class="ws-bulk"> ... </div>
+      <div v-if="selectedEntries.length" class="ws-bulk">
+        <div class="ws-bulk-info">
+          <span class="ws-bulk-count">{{ t('workspace.selection.count', { count: selectedEntries.length }) }}</span>
+          <button type="button" class="ws-bulk-clear" @click="clearSelection">
+            {{ t('workspace.selection.clear') }}
+          </button>
+        </div>
+        <div class="ws-bulk-actions">
+          <span v-if="!bulkActions.length" class="ws-bulk-hint">
+            {{ t('workspace.selection.mixed') }}
+          </span>
+          <button
+            v-for="action in bulkActions"
+            :key="action"
+            type="button"
+            class="btn btn--small"
+            :class="{ 'btn--danger': action === 'delete_everywhere' }"
+            :disabled="Boolean(state.workspace.action || state.workspace.refreshing)"
+            @click="applyBulk(action)"
+          >
+            <Spinner v-if="state.workspace.action === `decide-many:${action}`" />
+            {{ bulkLabel(action) }}
+          </button>
+        </div>
+      </div>
     </Teleport>
-    <div v-if="selectedEntries.length" class="ws-bulk">
-      <div class="ws-bulk-info">
-        <span class="ws-bulk-count">{{ t('workspace.selection.count', { count: selectedEntries.length }) }}</span>
-        <button type="button" class="ws-bulk-clear" @click="clearSelection">
-          {{ t('workspace.selection.clear') }}
-        </button>
-      </div>
-      <div class="ws-bulk-actions">
-        <span v-if="!bulkActions.length" class="ws-bulk-hint">
-          {{ t('workspace.selection.mixed') }}
-        </span>
-        <button
-          v-for="action in bulkActions"
-          :key="action"
-          type="button"
-          class="btn btn--small"
-          :class="{ 'btn--danger': action === 'delete_everywhere' }"
-          :disabled="Boolean(state.workspace.action || state.workspace.refreshing)"
-          @click="applyBulk(action)"
-        >
-          <Spinner v-if="state.workspace.action === `decide-many:${action}`" />
-          {{ bulkLabel(action) }}
-        </button>
-      </div>
-    </div>
   </div>
 </template>

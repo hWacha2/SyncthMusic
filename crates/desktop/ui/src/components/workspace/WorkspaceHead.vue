@@ -29,6 +29,12 @@ const head = computed(() => {
           : t('workspace.changes.sub', { count }),
     };
   }
+  if (props.tab === 'settings') {
+    return {
+      title: t('workspace.tab.settings'),
+      text: t('workspace.settings.sub'),
+    };
+  }
   if (props.tab === 'vault') {
     return {
       title: t('workspace.tab.vault'),
@@ -63,7 +69,7 @@ const commitLabel = computed(() => {
       <h1 class="ws-title">{{ head.title }}</h1>
       <p class="ws-sub">{{ head.text }}</p>
     </div>
-    <div class="ws-head-actions">
+    <div v-if="tab !== 'settings'" class="ws-head-actions">
       <button class="btn btn--quiet" :disabled="busy" @click="refreshWorkspace()">
         <Spinner v-if="refreshing" />
         {{ refreshing ? t('workspace.checking') : t('workspace.check') }}

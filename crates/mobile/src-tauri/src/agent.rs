@@ -514,6 +514,26 @@ fn command_loop(
                     }
                 }
             }
+            AgentMsg::ResetHistory => match crate::reset_phone_history(app) {
+                Ok((root, _)) => {
+                    let entries = agent::manifest(&root)?;
+                    agent::send(
+                        transport,
+                        &AgentMsg::Manifest {
+                            root: root.to_string_lossy().to_string(),
+                            entries,
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    agent::send(
+                        transport,
+                        &AgentMsg::Error {
+                            message: error,
+                        },
+                    )?;
+                }
+            },
             AgentMsg::GetSyncInfo => {
                 crate::server::ensure_started(app.clone());
                 let info = crate::server::info_json();

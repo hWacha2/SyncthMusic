@@ -1415,6 +1415,41 @@ fn scan_phone_now(app: &tauri::AppHandle) -> Result<Value, String> {
     }))
 }
 
+/// Сбрасывает историю на телефоне: агент забывает журнал, заново сканирует
+/// папку и возвращает свежий список файлов.
+fn clear_phone_history(app: &tauri::AppHandle) -> Result<Value, String> {
+    let (root, entries) = with_session(app, |session| {
+        session
+            .transport
+            .set_read_timeout(Some(Duration::from_secs(610)))
+            .map_err(|error| format!("{error:#}"))?;
+        agent::send(session.transport.as_mut(), &AgentMsg::ResetHistory)
+            .map_err(|error| format!("{error:#}"))?;
+
+        match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
+            AgentMsg::Manifest { root, entries } => {
+                session.root = Some(root.clone());
+                session.link.root = Some(root.clone());
+                Ok(Ok((root, entries)))
+            }
+            AgentMsg::Error { message } => Ok(Err(message)),
+            other => Err(format!("телефон ответил неожиданно: {other:?}")),
+        }
+    })?;
+
+    let total = entries.iter().map(|entry| entry.size).sum::<u64>();
+    let mut config = load_config();
+    if let Some(link) = config.agent.as_mut() {
+        link.root = Some(root.clone());
+        save_config(&config)?;
+    }
+    Ok(json!({
+        "root": root,
+        "count": entries.len(),
+        "total": total,
+    }))
+}
+
 fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
     let mut replica = workspace_replica()?;
     let root = replica
@@ -1701,6 +1736,55 @@ async fn workspace_gc(ttl_days: Option<u64>) -> Result<Value, String> {
             "blobs": report.blobs_removed,
             "orphans": report.orphans_removed,
         }))
+    })
+    .await
+}
+
+/// Полный сброс истории синхронизации. Файлы остаются на месте; на телефоне
+/// стирается его журнал, чтобы обе стороны начали с чистого листа.
+#[tauri::command]
+async fn workspace_clear_history(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        // Сеанс держит старый план, поэтому закрываем его до сброса.
+        {
+            let desktop = app.state::<Desktop>();
+            let mut ws = desktop
+                .workspace
+                .lock()
+                .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+            ws.close();
+        }
+
+        // Проверяем корень до телефона: иначе телефон остался бы без истории,
+        // хотя на ПК сбрасывать нечего.
+        let mut replica = workspace_replica()?;
+        let root = replica
+            .root()
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or_else(|| "Корень библиотеки не задан".to_string())?;
+
+        // Телефон сбрасываем первым: если он недоступен, ПК всё равно очистим,
+        // а интерфейс покажет предупреждение.
+        let phone = clear_phone_history(&app);
+
+        replica
+            .reset_history()
+            .map_err(|error| format!("{error:#}"))?;
+        scan::scan(&root, &mut replica).map_err(|error| format!("{error:#}"))?;
+        drop(replica);
+
+        let mut payload = refresh_workspace(&app)?;
+        let (phone_ok, phone_error) = match phone {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(error)),
+        };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "history_cleared".into(),
+                json!({ "pc": true, "phone": phone_ok, "phone_error": phone_error }),
+            );
+        }
+        Ok(payload)
     })
     .await
 }
@@ -2136,6 +2220,7 @@ pub fn run() {
             workspace_decide_many,
             workspace_undecide,
             workspace_set_manual,
+            workspace_clear_history,
             workspace_commit,
             workspace_restore,
             workspace_gc,

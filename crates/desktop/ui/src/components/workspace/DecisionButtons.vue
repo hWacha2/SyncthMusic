@@ -52,7 +52,9 @@ function conflictReason() {
       :disabled="busy()"
       @click="decide(item.path, 'keep_in_library')"
     >
-      <Spinner v-if="decisionBusy('keep_in_library')" />{{ t('workspace.attention.keep') }}
+      <Spinner v-if="decisionBusy('keep_in_library')" />{{ item.change?.side === 'local'
+        ? t('workspace.attention.restore_from_phone')
+        : t('workspace.attention.keep_pc') }}
     </button>
     <button
       class="btn btn--danger btn--small"

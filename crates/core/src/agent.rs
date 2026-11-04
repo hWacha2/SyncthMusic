@@ -15,7 +15,8 @@ use crate::transport::{self, Transport};
 ///
 /// Версия 2: ПК держит постоянную сессию и шлёт `GetRoot` как heartbeat,
 /// иначе агент закрывает сессию после 30 секунд тишины.
-pub const AGENT_PROTO: u32 = 2;
+/// Версия 3: команда `ResetHistory` — сброс журнала телефона из настроек ПК.
+pub const AGENT_PROTO: u32 = 3;
 
 /// Сколько агент ждёт подтверждения сопряжения на телефоне.
 pub const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -110,6 +111,9 @@ pub enum AgentMsg {
         root: String,
         entries: Vec<ManifestEntry>,
     },
+    /// Забыть журнал и индекс на телефоне и заново просканировать папку.
+    /// Сопряжение, токен и выбранная папка остаются. Ответ — свежий `Manifest`.
+    ResetHistory,
     /// Готовность приёмника полной синхронизации на телефоне.
     SyncInfo {
         port: u16,

@@ -96,6 +96,22 @@ pub(crate) fn scan_phone(app: &tauri::AppHandle) -> Result<(PathBuf, scan::ScanR
     Ok((root, report))
 }
 
+/// Забывает историю на телефоне и сразу пересобирает индекс из файлов.
+/// Сопряжение, токен и выбранная папка не трогаются.
+pub(crate) fn reset_phone_history(
+    app: &tauri::AppHandle,
+) -> Result<(PathBuf, scan::ScanReport), String> {
+    let mut replica = open(app)?;
+    let root = replica
+        .root()
+        .map_err(err)?
+        .ok_or("Папка на телефоне не выбрана")?;
+    replica.reset_history().map_err(err)?;
+    let report = scan::scan(&root, &mut replica).map_err(err)?;
+    let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
+    Ok((root, report))
+}
+
 /// Привязывает токен полной синхронизации к токену агентской пары.
 /// Без этого `PreviewSession` с ПК не пройдёт проверку токена.
 pub(crate) fn set_sync_token(app: &tauri::AppHandle, token: &str) -> Result<(), String> {
