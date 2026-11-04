@@ -7,6 +7,7 @@ import { isWorkspaceGeneration, nextWorkspaceGeneration } from './workspace/gene
 // меняют через функции ниже — так проще переносить старую логику по кускам.
 export const state = reactive({
   view: 'loading',
+  langReturn: null,
   info: null,
   root: null,
   phone: { linked: false },
@@ -84,9 +85,29 @@ export async function boot() {
   }
 }
 
+/// Открывает выбор языка поверх текущего экрана. После выбора возвращаемся
+/// туда же: перезапускать загрузку и рвать соединение с телефоном не нужно.
+export function openLanguage() {
+  if (state.view === 'language') return;
+  state.langReturn = state.view;
+  state.view = 'language';
+}
+
 export function chooseLanguage(next) {
   setLang(next);
+  const back = state.langReturn;
+  state.langReturn = null;
+  if (back) {
+    state.view = back;
+    return;
+  }
   boot();
+}
+
+export function closeLanguage() {
+  if (!state.langReturn) return;
+  state.view = state.langReturn;
+  state.langReturn = null;
 }
 
 // ---------------------------------------------------------------- setup

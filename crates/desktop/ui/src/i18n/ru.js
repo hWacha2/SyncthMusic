@@ -1,4 +1,5 @@
 export default {
+  "language.switch": "Язык",
   "setup.title": "Устройства",
   "setup.lan": "Локальная сеть",
   "setup.adb": "USB (ADB)",
