@@ -354,14 +354,9 @@ impl Plan {
             .collect()
     }
 
-    /// Хэш явных решений и нерешённых конфликтов: по нему commit проверяет,
-    /// что обе стороны видят одно и то же.
-    ///
-    /// Сравнивать полный `effective_map` нельзя. `local_ignored` — локальное
-    /// состояние и пиру не передаётся, поэтому один и тот же файл может быть
-    /// строкой плана у одной стороны и отсутствовать у другой. Решение по
-    /// такой строке никто не принимает, и расхождение планов здесь ложное:
-    /// commit всё равно не тронет путь, который вторая сторона игнорирует.
+    /// Отпечаток набора решений для статуса сеанса. Для сверки сторон он не
+    /// годится: планы строятся независимо, и локально игнорируемый путь есть
+    /// только у одной стороны. Сверка идёт по [`states_disagree`].
     pub fn decisions_hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         for (path, decision) in &self.decisions.entries {
@@ -401,6 +396,15 @@ impl Plan {
             map.insert(conflict.path.clone(), action);
         }
         map
+    }
+
+    /// То же, что [`Plan::effective_map`], но в виде, который можно передать
+    /// пиру: обе стороны сверяют только общие пути.
+    pub fn effective_state(&self) -> BTreeMap<String, String> {
+        self.effective_map()
+            .into_iter()
+            .map(|(path, action)| (path, action.to_string()))
+            .collect()
     }
 
     /// Отпечаток самого плана (не решений). Нужен, чтобы отличить старый
@@ -493,6 +497,23 @@ impl Plan {
         }
         Ok(true)
     }
+}
+
+/// Расходятся ли стороны: есть ли общий путь с разными итоговыми действиями.
+///
+/// Сравнивать карты целиком нельзя: план каждой стороны строится независимо,
+/// и локально игнорируемый путь (`local_ignored`) есть только у одной. Такой
+/// путь не общий, и commit всё равно его не тронет. Расхождением считается
+/// только разное действие по одному и тому же пути.
+pub fn states_disagree(
+    mine: &BTreeMap<String, String>,
+    theirs: &BTreeMap<String, String>,
+) -> bool {
+    mine.iter().any(|(path, action)| {
+        theirs
+            .get(path)
+            .is_some_and(|other| other.as_str() != action.as_str())
+    })
 }
 
 /// Построить план по локальному состоянию и операциям, которых у нас ещё нет.
@@ -1325,6 +1346,24 @@ mod tests {
             },
         );
         assert_ne!(before, with_extra.decisions_hash());
+    }
+
+    #[test]
+    fn states_disagree_only_on_shared_paths() {
+        let mut mine = std::collections::BTreeMap::new();
+        mine.insert("shared.flac".to_string(), "delete_everywhere".to_string());
+        mine.insert("only-mine.flac".to_string(), "keep".to_string());
+
+        let mut theirs = std::collections::BTreeMap::new();
+        theirs.insert("shared.flac".to_string(), "delete_everywhere".to_string());
+        theirs.insert("only-theirs.flac".to_string(), "accept".to_string());
+
+        // Лишние пути у любой стороны — не расхождение: у другой стороны
+        // такого файла просто нет.
+        assert!(!states_disagree(&mine, &theirs));
+
+        theirs.insert("shared.flac".to_string(), "accept".to_string());
+        assert!(states_disagree(&mine, &theirs));
     }
 
     #[test]

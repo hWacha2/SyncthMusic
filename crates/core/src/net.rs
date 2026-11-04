@@ -20,7 +20,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -42,8 +42,9 @@ pub const SYNC_PORT: u16 = 47_887;
 /// Версия протокола.
 ///
 /// `2` отклоняется: там не было предварительного плана. `4` добавила отмену
-/// решений и передачу «мягких» удалений в предпросмотре.
-pub const PROTO: u32 = 5;
+/// решений и передачу «мягких» удалений в предпросмотре. `6` сверяет стороны
+/// по общим путям, а не по хэшу всего плана.
+pub const PROTO: u32 = 6;
 /// Как часто живая сессия шлёт heartbeat и проверяет локальные решения.
 const SESSION_TICK: Duration = Duration::from_millis(100);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
@@ -97,14 +98,15 @@ enum Msg {
     },
     /// Push-решение по одному пути. Обе стороны могут слать в любой момент.
     Decision(PathDecision),
-    /// Сводка набора решений: хэш и версия плана.
+    /// Сводка итоговых действий по путям. Сверяются только общие пути:
+    /// локальные исключения есть лишь у одной стороны.
     DecisionState {
-        hash: String,
+        state: BTreeMap<String, String>,
         version: Hlc,
     },
     Heartbeat,
     Commit {
-        decisions_hash: String,
+        state: BTreeMap<String, String>,
     },
     /// Пир принял хэш и готов к обмену операциями commit.
     CommitGo,
@@ -1095,6 +1097,11 @@ impl PreviewSession {
         self.plan.decisions_hash()
     }
 
+    /// Итоговые действия по путям — то, что стороны сверяют между собой.
+    pub fn state(&self) -> BTreeMap<String, String> {
+        self.plan.effective_state()
+    }
+
     /// Записать решение в БД. Отправка пиру произойдёт на ближайшем `poll`.
     pub fn record_decision(
         &mut self,
@@ -1177,9 +1184,8 @@ impl PreviewSession {
         // Отмену шлём сразу, не дожидаясь poll: иначе набранная следом новая
         // кнопка могла бы уйти раньше, чем пир забудет старое решение.
         self.send(&Msg::Decision(decision))?;
-        let hash = self.plan.decisions_hash();
         self.send(&Msg::DecisionState {
-            hash,
+            state: self.plan.effective_state(),
             version: self.plan.version,
         })?;
         Ok(())
@@ -1209,18 +1215,17 @@ impl PreviewSession {
                     self.plan.decisions = merged;
                     self.announced.insert(decision.path.clone(), decision);
                     replica.save_plan(&self.plan)?;
-                    let hash = self.plan.decisions_hash();
                     self.send(&Msg::DecisionState {
-                        hash,
+                        state: self.plan.effective_state(),
                         version: self.plan.version,
                     })?;
                 }
-                Msg::DecisionState { hash, .. } => {
-                    self.diverged = hash != self.plan.decisions_hash();
+                Msg::DecisionState { state, .. } => {
+                    self.diverged = plan::states_disagree(&self.plan.effective_state(), &state);
                 }
                 Msg::Heartbeat => {}
-                Msg::Commit { decisions_hash } => {
-                    self.accept_commit(replica, decisions_hash)?;
+                Msg::Commit { state } => {
+                    self.accept_commit(replica, state)?;
                     return Ok(());
                 }
                 Msg::BlobNeed { .. } => {
@@ -1272,9 +1277,8 @@ impl PreviewSession {
         for decision in outgoing {
             self.send(&Msg::Decision(decision))?;
         }
-        let hash = self.plan.decisions_hash();
         self.send(&Msg::DecisionState {
-            hash,
+            state: self.plan.effective_state(),
             version: self.plan.version,
         })?;
         Ok(())
@@ -1325,12 +1329,10 @@ impl PreviewSession {
         commit::validate(replica, &self.plan)?;
         self.read_only = true;
 
-        let hash = self.plan.decisions_hash();
+        let state = self.plan.effective_state();
         self.commit_timeout()?;
         let result = (|| -> Result<commit::Outcome> {
-            self.send(&Msg::Commit {
-                decisions_hash: hash,
-            })?;
+            self.send(&Msg::Commit { state })?;
             match self.recv_commit_msg()? {
                 Msg::CommitGo => {}
                 Msg::Error { message } => bail!("пир отказал в commit: {message}"),
@@ -1388,7 +1390,11 @@ impl PreviewSession {
 
     /// Серверная сторона: пир прислал `Commit`. Проверяем хэш и план, затем
     /// проходим тот же обмен, что и клиент, в зеркальном порядке.
-    fn accept_commit(&mut self, replica: &mut Replica, decisions_hash: String) -> Result<()> {
+    fn accept_commit(
+        &mut self,
+        replica: &mut Replica,
+        peer_state: BTreeMap<String, String>,
+    ) -> Result<()> {
         if self.read_only || self.finished {
             let message = "commit уже начат или завершён".to_string();
             let _ = self.send(&Msg::Error {
@@ -1396,7 +1402,7 @@ impl PreviewSession {
             });
             bail!("{message}");
         }
-        if decisions_hash != self.plan.decisions_hash() {
+        if plan::states_disagree(&self.plan.effective_state(), &peer_state) {
             let message = "план разошёлся — обновите его".to_string();
             let _ = self.send(&Msg::Error {
                 message: message.clone(),

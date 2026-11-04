@@ -373,7 +373,7 @@ fn commit_applies_accepted_additions_and_clears_the_plan() {
 }
 
 #[test]
-fn commit_with_a_different_decisions_hash_is_rejected() {
+fn commit_with_a_different_decision_is_rejected() {
     use syncth_core::plan::Decision;
 
     let ctx = setup();
