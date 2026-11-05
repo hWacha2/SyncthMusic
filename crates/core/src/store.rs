@@ -238,6 +238,9 @@ pub struct Replica {
     dev: String,
     name: String,
     data_dir: Option<PathBuf>,
+    /// Общая с другими соединениями к этой же библиотеке блокировка.
+    /// См. `crate::lock`.
+    lock: crate::lock::LibraryLock,
     key: SigningKey,
     /// Часы в памяти. Читать и писать `meta` на каждый файл слишком дорого:
     /// при долгом сканировании это тысячи лишних транзакций.
@@ -298,6 +301,7 @@ impl Replica {
             dev: dev.to_string(),
             name: crate::device_name(),
             data_dir: None,
+            lock: crate::lock::ephemeral(),
             key: load_or_create_key(None)?,
             hlc: Cell::new(None),
             hlc_dirty: Cell::new(false),
@@ -320,12 +324,19 @@ impl Replica {
             dev: dev.to_string(),
             name: crate::device_name(),
             data_dir: Some(data_dir.to_path_buf()),
+            lock: crate::lock::for_data_dir(data_dir),
             key: load_or_create_key(Some(data_dir))?,
             hlc: Cell::new(None),
             hlc_dirty: Cell::new(false),
             exclusions: false,
         };
-        replica.migrate()?;
+        // Открытие и миграция схемы тоже не должны пересекаться с другой
+        // репликой того же каталога (агент, входящий сеанс, UI).
+        let lock = replica.lock.clone();
+        {
+            let _guard = lock.lock();
+            replica.migrate()?;
+        }
         Ok(replica)
     }
 
@@ -393,6 +404,12 @@ impl Replica {
 
     pub fn device_id(&self) -> &str {
         &self.dev
+    }
+
+    /// Блокировка библиотеки, общая для всех соединений к тому же каталогу.
+    /// Клонируется, чтобы держать guard, пока `Replica` используется mutably.
+    pub fn library_lock(&self) -> crate::lock::LibraryLock {
+        self.lock.clone()
     }
 
     /// Понятное имя этого устройства. Отличается от `device_id`.
@@ -553,6 +570,31 @@ impl Replica {
     }
 
     // ---------------------------------------------------------------- plan
+
+    /// Прочитать несколько таблиц как одно состояние.
+    ///
+    /// SQLite в режиме autocommit даёт каждому `SELECT` свой снимок. Плану
+    /// нужны `entries`, `pending_deletes`, `exclusions`, `ops` и `removal_hlcs`
+    /// из одного момента: иначе перенос может попасть в `entries`, но ещё не
+    /// попасть в `ops`, и новый путь станет «добавлением». `BEGIN DEFERRED`
+    /// фиксирует снимок на первом чтении; запись внутри замыкания запрещена.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+
+        /// Закрывает читающую транзакцию на любом выходе, включая ошибку.
+        struct Guard<'a>(&'a rusqlite::Connection);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                // Транзакция только читающая: commit не меняет данные.
+                let _ = self.0.execute_batch("COMMIT");
+            }
+        }
+
+        let guard = Guard(&self.conn);
+        let result = read();
+        drop(guard);
+        result
+    }
 
     /// Все пути с локальными флагами — вход для построения плана.
     pub fn plan_rows(&self) -> Result<Vec<PlanRow>> {

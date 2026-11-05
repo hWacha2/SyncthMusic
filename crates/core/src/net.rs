@@ -797,6 +797,10 @@ fn serve_wants_resumable<R: Read, W: Write>(
 
 /// Клиентская сторона: подключиться и синхронизироваться.
 pub fn sync_with_peer(replica: &mut Replica, addr: &str, token: &str) -> Result<SyncStats> {
+    // Полный обмен применяет операции и раскладывает файлы: скан на это
+    // время должен ждать, иначе он прочитает библиотеку в середине записи.
+    let lock = replica.library_lock();
+    let _guard = lock.lock();
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let stream = TcpStream::connect(addr).with_context(|| format!("подключение к {addr}"))?;
     stream.set_nodelay(true)?;
@@ -976,6 +980,10 @@ fn serve_one(
         // Старый полный обмен оставлен до этапа commit: он ещё используется
         // кнопкой «Синхронизировать» и тестами.
         Msg::Ops { ops } => {
+            // Старый полный обмен тоже меняет журнал и файлы — не даём скану
+            // работать параллельно.
+            let lock = replica.library_lock();
+            let _guard = lock.lock();
             // 1. Принимаем операции клиента.
             absorb_ops(replica, &root, &ops, &mut stats)?;
             // 2. Отдаём свои — только то, чего у клиента ещё нет.
@@ -1070,13 +1078,19 @@ impl PreviewSession {
 
         let mut merged = local_decisions;
         merged.merge(&peer_decisions);
-        let mut plan = plan::build_with_peer_have(
-            replica,
-            &peer_dev,
-            &peer_name,
-            &remote_ops,
-            Some(&peer_have),
-        )?;
+        // План строится только когда скан полностью закончил свои транзакции.
+        // Иначе перенос мог попасть в `entries`, но ещё не в `ops`.
+        let mut plan = {
+            let lock = replica.library_lock();
+            let _guard = lock.lock();
+            plan::build_with_peer_have(
+                replica,
+                &peer_dev,
+                &peer_name,
+                &remote_ops,
+                Some(&peer_have),
+            )?
+        };
         if version > plan.version {
             plan.version = version;
         }
@@ -1104,13 +1118,18 @@ impl PreviewSession {
     ) -> Result<Self> {
         let mut merged = replica.load_decisions(peer_dev)?;
         merged.merge(&peer_decisions);
-        let mut plan = plan::build_with_peer_have(
-            replica,
-            peer_dev,
-            peer_name,
-            remote_ops,
-            Some(peer_have),
-        )?;
+        // См. комментарий в `open`: никакого плана между транзакциями скана.
+        let mut plan = {
+            let lock = replica.library_lock();
+            let _guard = lock.lock();
+            plan::build_with_peer_have(
+                replica,
+                peer_dev,
+                peer_name,
+                remote_ops,
+                Some(peer_have),
+            )?
+        };
         merged.retain_valid(&plan);
         plan.decisions = merged.clone();
 
@@ -1416,6 +1435,10 @@ impl PreviewSession {
     pub fn commit(&mut self, replica: &mut Replica) -> Result<commit::Outcome> {
         anyhow::ensure!(!self.finished, "сессия уже завершена");
         anyhow::ensure!(!self.read_only, "передача уже началась");
+        // Commit пишет файлы и журнал: скан не может идти параллельно —
+        // он увидел бы недописанные файлы и построил бы операции по ним.
+        let lock = replica.library_lock();
+        let _guard = lock.lock();
         commit::validate(replica, &self.plan)?;
         self.read_only = true;
 
@@ -1492,6 +1515,10 @@ impl PreviewSession {
             });
             bail!("{message}");
         }
+        // Зеркальная сторона: скан и построение нового плана ждут, пока
+        // commit полностью не разложит файлы и операции.
+        let lock = replica.library_lock();
+        let _guard = lock.lock();
         if plan::states_disagree(&self.plan.effective_state(), &peer_state) {
             let message = "план разошёлся — обновите его".to_string();
             let _ = self.send(&Msg::Error {

@@ -66,6 +66,12 @@ pub fn scan_with_progress(
     replica: &mut Replica,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<ScanReport> {
+    // Скан пишет журнал несколькими транзакциями и не должен пересекаться с
+    // другим сканом, построением плана или commit: план, прочитанный между
+    // транзакциями, примет перенос за добавление (см. `core::lock`).
+    let lock = replica.library_lock();
+    let _guard = lock.lock();
+
     anyhow::ensure!(
         root.is_dir(),
         "корень библиотеки не найден: {}",

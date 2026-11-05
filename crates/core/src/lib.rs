@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod commit;
 pub mod hlc;
+pub mod lock;
 pub mod net;
 pub mod op;
 pub mod path;

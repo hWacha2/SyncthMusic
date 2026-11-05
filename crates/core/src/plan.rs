@@ -74,6 +74,28 @@ fn same_folder(from: &str, to: &str) -> bool {
     path::key(parent(from)) == path::key(parent(to))
 }
 
+/// Старый путь переноса, если он всё ещё описывает текущее содержимое строки.
+///
+/// Одна и та же проверка нужна при построении плана и при проверке его
+/// актуальности перед commit. Иначе план мог сказать «добавление», а к моменту
+/// commit в журнале уже лежал `entry_move` — и путь уехал бы пиру как `put`.
+fn local_move_from(
+    by_path: &HashMap<&str, &PlanRow>,
+    move_to: &HashMap<&str, &LocalMove>,
+    row: &PlanRow,
+) -> Option<String> {
+    move_to.get(row.path.as_str()).and_then(|mv| {
+        let source_is_gone = by_path
+            .get(mv.from.as_str())
+            .map_or(true, |source| source.deleted);
+        (mv.from != row.path
+            && mv.blob == row.blob
+            && source_is_gone
+            && (mv.hlc == row.hlc || row.synced_blob.is_empty()))
+        .then(|| mv.from.clone())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub path: String,
@@ -463,20 +485,29 @@ impl Plan {
     /// Локальная часть плана ещё соответствует БД? Скан или правка файла
     /// после построения плана делают его непригодным.
     pub fn local_is_current(&self, replica: &Replica) -> Result<bool> {
-        let rows = replica.plan_rows()?;
+        // То же состояние БД, что увидит commit: строки, ожидания удаления,
+        // исключения и переносы читаются одним снимком.
+        let me = replica.device_id().to_string();
+        let (rows, pending_rows, excluded, local_moves) = replica.read_snapshot(|| {
+            Ok((
+                replica.plan_rows()?,
+                replica.pending_deletes()?,
+                replica.exclusion_paths()?,
+                replica.local_moves(&me)?,
+            ))
+        })?;
         let by_path: HashMap<&str, &PlanRow> =
             rows.iter().map(|row| (row.path.as_str(), row)).collect();
-        let pending: HashSet<String> = replica
-            .pending_deletes()?
-            .into_iter()
-            .map(|row| row.path)
+        let pending: HashSet<String> = pending_rows.into_iter().map(|row| row.path).collect();
+        let move_to: HashMap<&str, &LocalMove> = local_moves
+            .iter()
+            .map(|mv| (mv.to.as_str(), mv))
             .collect();
         let conflicts: HashSet<&str> = self
             .conflicts
             .iter()
             .map(|conflict| conflict.path.as_str())
             .collect();
-        let excluded = replica.exclusion_paths()?;
 
         for change in &self.local {
             let Some(row) = by_path.get(change.path.as_str()) else {
@@ -495,7 +526,56 @@ impl Plan {
                 if base != change.blob {
                     return Ok(false);
                 }
-            } else if row.deleted || row.blob != change.blob || row.ignored != change.ignored {
+            } else {
+                if row.deleted || row.blob != change.blob || row.ignored != change.ignored {
+                    return Ok(false);
+                }
+                // За время между планом и commit скан мог распознать перенос
+                // (или наоборот — путь переписали после переноса). План с
+                // неверным `from`/видом отправлять нельзя: иначе перенос уйдёт
+                // как `put`, а старый путь останется на пире навсегда.
+                let current_from = local_move_from(&by_path, &move_to, row);
+                if current_from != change.from {
+                    return Ok(false);
+                }
+                let kind = if let Some(from) = &current_from {
+                    ChangeKind::for_move(from, &row.path)
+                } else if row.synced_blob.is_empty() {
+                    ChangeKind::Added
+                } else {
+                    ChangeKind::Updated
+                };
+                if kind != change.kind {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Каждый действующий перенос обязан быть строкой плана. Проверка выше
+        // ловит неверный вид уже существующей строки; эта — полностью
+        // потерянный перенос, когда цель по содержимому совпала с базой.
+        for (to, mv) in &move_to {
+            let Some(target) = by_path.get(to) else {
+                continue;
+            };
+            if target.deleted
+                || target.ignored
+                || excluded.contains(&target.path)
+                // Перенос уже вошёл в общую базу: отдельной строки плана нет
+                // и не должно быть.
+                || target.blob == target.synced_blob
+            {
+                continue;
+            }
+            if local_move_from(&by_path, &move_to, target).as_deref() != Some(mv.from.as_str()) {
+                continue;
+            }
+            let described = self.local.iter().any(|change| {
+                change.path.as_str() == *to
+                    && change.from.as_deref() == Some(mv.from.as_str())
+                    && change.kind == ChangeKind::for_move(&mv.from, to)
+            });
+            if !described {
                 return Ok(false);
             }
         }
@@ -569,19 +649,27 @@ pub fn build_with_peer_have(
         }
     }
 
-    let rows = replica.plan_rows()?;
+    // Все входы плана должны быть из одного состояния БД. Иначе перенос
+    // может быть уже в `entries`, но ещё не в `ops` (скан пишет несколькими
+    // транзакциями), и новый путь превратится в «добавление».
+    let me = replica.device_id().to_string();
+    let (rows, excluded, pending_deletes, local_moves, removals) =
+        replica.read_snapshot(|| {
+            Ok((
+                replica.plan_rows()?,
+                replica.exclusion_paths()?,
+                replica.pending_deletes()?,
+                replica.local_moves(&me)?,
+                replica.removal_hlcs(&me)?,
+            ))
+        })?;
     let by_path: HashMap<&str, &PlanRow> =
         rows.iter().map(|row| (row.path.as_str(), row)).collect();
-    let excluded = replica.exclusion_paths()?;
-    let pending: HashMap<String, (String, u64)> = replica
-        .pending_deletes()?
+    let pending: HashMap<String, (String, u64)> = pending_deletes
         .into_iter()
         .map(|row| (row.path, (row.blob, row.detected_at)))
         .collect();
     let remote = remote_state(remote_ops);
-    let me = replica.device_id();
-    let local_moves = replica.local_moves(me)?;
-    let removals = replica.removal_hlcs(me)?;
 
     // Последний перенос в каждый путь. В `entries` связи «откуда» нет,
     // поэтому без журнала новый путь неотличим от добавления.
@@ -675,7 +763,7 @@ pub fn build_with_peer_have(
                 || (!peer_deleted
                     && !peer_applied_delete(
                         peer_have,
-                        me,
+                        &me,
                         removals.get(&row.path).copied(),
                     ));
             if peer_has_it && !row.synced_blob.is_empty() {
@@ -706,16 +794,7 @@ pub fn build_with_peer_have(
             // Сканер уже распознал переименование и записал `entry_move`.
             // Проверяем, что перенос всё ещё относится к текущему содержимому:
             // если путь позже переписали другим блобом, это обычная правка.
-            let moved_from = move_to.get(row.path.as_str()).and_then(|mv| {
-                let source_is_gone = by_path
-                    .get(mv.from.as_str())
-                    .map_or(true, |source| source.deleted);
-                (mv.from != row.path
-                    && mv.blob == row.blob
-                    && source_is_gone
-                    && (mv.hlc == row.hlc || row.synced_blob.is_empty()))
-                    .then(|| mv.from.clone())
-            });
+            let moved_from = local_move_from(&by_path, &move_to, row);
 
             local.push(Change {
                 path: row.path.clone(),
