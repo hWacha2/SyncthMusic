@@ -38,8 +38,6 @@ export default {
   "workspace.tab.settings": "Settings",
   "workspace.settings.sub": "Manual mode and library maintenance.",
   "workspace.settings.sync": "Sync",
-  "workspace.settings.manual_on": "On",
-  "workspace.settings.manual_off": "Off",
   "workspace.settings.history_title": "Library history",
   "workspace.settings.history_tag": "Data",
   "workspace.settings.history_text": "The sync journal, decisions and plans on this PC and on the phone. Music folders are not modified.",

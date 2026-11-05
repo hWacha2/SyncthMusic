@@ -38,8 +38,6 @@ export default {
   "workspace.tab.settings": "Настройки",
   "workspace.settings.sub": "Ручной режим и обслуживание библиотеки.",
   "workspace.settings.sync": "Синхронизация",
-  "workspace.settings.manual_on": "Включён",
-  "workspace.settings.manual_off": "Выключен",
   "workspace.settings.history_title": "История библиотеки",
   "workspace.settings.history_tag": "Данные",
   "workspace.settings.history_text": "Журнал, решения и планы синхронизации на этом ПК и на телефоне. Папки с музыкой не изменяются.",

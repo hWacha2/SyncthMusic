@@ -21,9 +21,6 @@ const clearing = computed(() => state.workspace.action === 'clear-history');
     <section class="ws-card ws-setting-card">
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.sync') }}</h2>
-        <span class="ws-tag" :class="{ 'is-on': manual }">
-          {{ manual ? t('workspace.settings.manual_on') : t('workspace.settings.manual_off') }}
-        </span>
       </div>
       <button
         type="button"
