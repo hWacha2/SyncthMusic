@@ -204,6 +204,7 @@ fn handle(app: tauri::AppHandle, stream: TcpStream) {
     if let Some(runtime) = app.try_state::<AgentRuntime>() {
         runtime.status.lock().unwrap().error = None;
     }
+    crate::background_touch(&app, true);
     if let Err(error) = session(&app, transport.as_mut()) {
         if let Some(runtime) = app.try_state::<AgentRuntime>() {
             // Обрыв сокета — штатное завершение сеанса, а не ошибка. Если же
@@ -216,6 +217,7 @@ fn handle(app: tauri::AppHandle, stream: TcpStream) {
         }
     }
     transport.shutdown();
+    crate::background_touch(&app, false);
 }
 
 fn session(app: &tauri::AppHandle, transport: &mut dyn Transport) -> anyhow::Result<()> {

@@ -1,0 +1,16 @@
+[package]
+name = "tauri-plugin-foreground-service"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Keeps the SynctMusic Android receiver alive while the phone is locked"
+links = "tauri-plugin-foreground-service"
+
+[dependencies]
+tauri = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

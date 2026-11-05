@@ -8,7 +8,8 @@
 //! исходящая синхронизация с сопряжённым пиром, входящие сеансы и commit, пока
 //! приложение открыто, очередь удалений, корзина, конфликты, список устройств.
 //! После записи файлов Android просят перечитать библиотеку. Foreground-сервис
-//! для работы в фоне появится позже.
+//! удерживает приёмник в фоне, пока телефон заблокирован или открыто другое
+//! приложение; он останавливается по кнопке в уведомлении или после простоя.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,54 @@ mod server;
 
 /// Порт синхронизации: тот же, что у демона на ПК.
 const SYNC_PORT: u16 = 47887;
+
+/// Сколько минут без подключений ПК сервис работает до самопроверки.
+#[cfg(target_os = "android")]
+const BACKGROUND_IDLE_MINUTES: u32 = 25;
+
+/// Включает удержание процесса в фоне. Вызывается при старте приложения и при
+/// возврате на экран после ручной или автоматической остановки сервиса.
+#[cfg(target_os = "android")]
+fn background_start(app: &tauri::AppHandle) {
+    use tauri_plugin_foreground_service::ForegroundServiceExt;
+    if let Err(error) = app.foreground_service().start(BACKGROUND_IDLE_MINUTES) {
+        eprintln!("foreground service: {error}");
+        return;
+    }
+    let _ = app.foreground_service().set_foreground(true);
+}
+
+/// Сообщает сервису о начале или конце сеанса с ПК: пока сеанс идёт, таймер
+/// простоя не должен останавливать приёмник.
+pub(crate) fn background_touch(app: &tauri::AppHandle, active: bool) {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_foreground_service::ForegroundServiceExt;
+        let _ = app.foreground_service().touch(active);
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, active);
+}
+
+/// Приложение ушло в фон — разрешаем таймеру простоя; вернулось — сбрасываем.
+#[cfg(target_os = "android")]
+fn background_lifecycle(app: &tauri::AppHandle, event: &tauri::RunEvent) {
+    use tauri::{RunEvent, WindowEvent};
+    use tauri_plugin_foreground_service::ForegroundServiceExt;
+    match event {
+        RunEvent::WindowEvent {
+            event: WindowEvent::Suspended,
+            ..
+        } => {
+            let _ = app.foreground_service().set_foreground(false);
+        }
+        RunEvent::WindowEvent {
+            event: WindowEvent::Resumed,
+            ..
+        } => background_start(app),
+        _ => {}
+    }
+}
 
 /// Имя устройства до первого открытия базы. Дальше ядро берёт сохранённое.
 /// Считаем из машины и каталога данных: без аккаунтов и без сети.
@@ -642,7 +691,10 @@ async fn sync_now(app: tauri::AppHandle, state: tauri::State<'_, Mobile>) -> Res
             .ok_or("сохранённое устройство не найдено")?;
 
         let token = replica.ensure_token().map_err(err)?;
-        let stats = net::sync_with_peer(&mut replica, &peer.addr, &token).map_err(err)?;
+        background_touch(&app, true);
+        let stats = net::sync_with_peer(&mut replica, &peer.addr, &token);
+        background_touch(&app, false);
+        let stats = stats.map_err(err)?;
         let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
         let saved = resolve::prune_deleted_files(&mut replica, &root).map_err(err)?;
         // Новые файлы появились через std::fs — Android узнает о них только
@@ -836,9 +888,13 @@ fn probe_root(path: String) -> Value {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(Mobile::default())
-        .manage(agent::AgentRuntime::default())
+        .manage(agent::AgentRuntime::default());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_foreground_service::init());
+
+    builder
         .setup(|app| {
             // Сессия живёт только пока приложение открыто: сокет не переживает
             // перезапуск, поэтому «подключено» из прошлого запуска не сохраняем.
@@ -853,6 +909,9 @@ pub fn run() {
             server::ensure_started(app.handle().clone());
             // Запускаем минимальный агент: он слушает ПК и отдаёт выбранную папку.
             agent::init(app.handle().clone());
+            // Сервис нужен до того, как экран погаснет в первый раз.
+            #[cfg(target_os = "android")]
+            background_start(app.handle());
             let _ = app;
             Ok(())
         })
@@ -884,6 +943,12 @@ pub fn run() {
             vault_gc,
             probe_root,
         ])
-        .run(tauri::generate_context!())
-        .expect("не удалось запустить приложение");
+        .build(tauri::generate_context!())
+        .expect("не удалось собрать приложение")
+        .run(|app, event| {
+            #[cfg(target_os = "android")]
+            background_lifecycle(app, &event);
+            #[cfg(not(target_os = "android"))]
+            let _ = (app, event);
+        });
 }

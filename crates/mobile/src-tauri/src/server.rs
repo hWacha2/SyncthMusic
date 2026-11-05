@@ -5,8 +5,8 @@
 //! затем commit: телефон примет операции и файлы так же, как демон.
 //!
 //! У каждого соединения своя реплика (своё SQLite-соединение): UI продолжает
-//! читать статус, пока сеанс идёт. Слушатель живёт до закрытия приложения —
-//! foreground service появится позже, вместе с работой в фоне.
+//! читать статус, пока сеанс идёт. Слушатель живёт до закрытия приложения, а в
+//! фоне его удерживает foreground-сервис из `tauri-plugin-foreground-service`.
 
 use serde_json::{json, Value};
 use std::net::TcpListener;
@@ -94,6 +94,7 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
             return;
         }
     };
+    crate::background_touch(app, true);
     let addr = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -161,6 +162,7 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
     }
 
     state().lock().unwrap().session = None;
+    crate::background_touch(app, false);
 
     if committed {
         if let Ok(Some(root)) = replica.root() {
