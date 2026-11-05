@@ -3,24 +3,39 @@ import IconList from '../icons/IconList.vue';
 import IconOverview from '../icons/IconOverview.vue';
 import IconSettings from '../icons/IconSettings.vue';
 import IconVault from '../icons/IconVault.vue';
+import IconExclude from '../icons/IconExclude.vue';
+import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
 import { openDevices, state } from '../../store.js';
 import { basename, connectionState, pendingCount } from '../../workspace/model.js';
 import { selectTab } from '../../workspace/actions.js';
 
-defineProps({
+const props = defineProps({
   data: { type: Object, default: null },
+});
+
+const conn = computed(() => {
+  // Пока идёт проверка или сброс истории, «Нет связи» вводит в заблуждение:
+  // сеанс как раз используется для сканирования.
+  if (state.workspace.refreshing || state.workspace.action === 'clear-history') {
+    return { tone: 'warn', label: t('workspace.status.checking') };
+  }
+  return connectionState(props.data);
 });
 
 const tabs = [
   { id: 'overview', icon: IconOverview, label: 'workspace.tab.overview' },
   { id: 'changes', icon: IconList, label: 'workspace.tab.changes', hot: true },
+  { id: 'exclusions', icon: IconExclude, label: 'workspace.tab.exclusions' },
   { id: 'vault', icon: IconVault, label: 'workspace.tab.vault' },
   { id: 'settings', icon: IconSettings, label: 'workspace.tab.settings' },
 ];
 
 function countFor(id, data) {
+  // После сброса истории счётчики ещё старые — не показываем их.
+  if (state.workspace.stale) return 0;
   if (id === 'changes') return pendingCount(data);
+  if (id === 'exclusions') return Number(data?.exclusions?.length) || 0;
   if (id === 'vault') return Number(data?.pc?.vault_files) || 0;
   return 0;
 }
@@ -61,12 +76,12 @@ function countFor(id, data) {
         <span
           class="status-dot"
           :class="{
-            'is-on': connectionState(data).tone === 'on',
-            'is-warn': connectionState(data).tone === 'warn',
+            'is-on': conn.tone === 'on',
+            'is-warn': conn.tone === 'warn',
           }"
           aria-hidden="true"
         ></span>
-        <span>{{ connectionState(data).label }}</span>
+        <span>{{ conn.label }}</span>
       </div>
       <button class="ws-link" @click="openDevices">{{ t('workspace.devices') }}</button>
       <span v-if="state.info?.version" class="ws-version">v{{ state.info.version }} · AGPL-3.0</span>

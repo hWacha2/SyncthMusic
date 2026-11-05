@@ -185,6 +185,34 @@ fn vault_gc_removes_orphan_files() {
 }
 
 #[test]
+fn vault_clear_removes_every_row_and_blob_but_keeps_the_library() {
+    let ctx = setup(&[("Album/01.flac", b"one"), ("Album/02.flac", b"two")]);
+    let mut a = open(&ctx, "data_a", &ctx.root_a);
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+
+    let first = vault::preserve_file(&a, &ctx.root_a, "Album/01.flac")
+        .unwrap()
+        .unwrap();
+    let second = vault::preserve_file(&a, &ctx.root_a, "Album/02.flac")
+        .unwrap()
+        .unwrap();
+    let data_dir = ctx.tmp.path().join("data_a");
+    let first_blob = vault::vault_blob_path(&data_dir, &first.blob);
+    let second_blob = vault::vault_blob_path(&data_dir, &second.blob);
+    assert!(first_blob.is_file() && second_blob.is_file());
+
+    let report = vault::clear(&a).unwrap();
+    assert_eq!(report.rows_removed, 2);
+    assert_eq!(report.blobs_removed, 2);
+    assert!(a.vault_rows().unwrap().is_empty());
+    assert!(!first_blob.exists() && !second_blob.exists());
+
+    // Оригиналы в библиотеке остаются на месте.
+    assert_eq!(fs::read(ctx.root_a.join("Album/01.flac")).unwrap(), b"one");
+    assert_eq!(fs::read(ctx.root_a.join("Album/02.flac")).unwrap(), b"two");
+}
+
+#[test]
 fn restore_fails_when_the_vault_file_was_lost() {
     let (ctx, mut a, _b) = pair();
     fs::remove_file(ctx.root_a.join("Album/01.flac")).unwrap();

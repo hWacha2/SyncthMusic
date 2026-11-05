@@ -16,7 +16,9 @@ use crate::transport::{self, Transport};
 /// Версия 2: ПК держит постоянную сессию и шлёт `GetRoot` как heartbeat,
 /// иначе агент закрывает сессию после 30 секунд тишины.
 /// Версия 3: команда `ResetHistory` — сброс журнала телефона из настроек ПК.
-pub const AGENT_PROTO: u32 = 3;
+/// Версия 4: `ScanProgress` — телефон сообщает, сколько файлов уже проверено.
+/// Версия 5: `ScanProgress` также сообщает байты, чтобы показывать скорость и ETA.
+pub const AGENT_PROTO: u32 = 5;
 
 /// Сколько агент ждёт подтверждения сопряжения на телефоне.
 pub const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -114,6 +116,16 @@ pub enum AgentMsg {
     /// Забыть журнал и индекс на телефоне и заново просканировать папку.
     /// Сопряжение, токен и выбранная папка остаются. Ответ — свежий `Manifest`.
     ResetHistory,
+    /// Ход сканирования на телефоне. `total == 0` — ещё считаем файлы.
+    /// Байты добавлены в версии 5: по ним интерфейс считает скорость и ETA.
+    ScanProgress {
+        done: usize,
+        total: usize,
+        #[serde(default)]
+        done_bytes: u64,
+        #[serde(default)]
+        total_bytes: u64,
+    },
     /// Готовность приёмника полной синхронизации на телефоне.
     SyncInfo {
         port: u16,

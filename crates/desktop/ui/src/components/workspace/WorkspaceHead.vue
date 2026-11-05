@@ -5,7 +5,7 @@ import { t } from '../../i18n/index.js';
 import { formatSize, number } from '../../format.js';
 import { refreshWorkspace, state } from '../../store.js';
 import { canCommit, headline, pendingCount, planData } from '../../workspace/model.js';
-import { askGc, commitWorkspace } from '../../workspace/actions.js';
+import { commitWorkspace } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
@@ -44,10 +44,16 @@ const head = computed(() => {
       }),
     };
   }
+  if (props.tab === 'exclusions') {
+    return {
+      title: t('workspace.tab.exclusions'),
+      text: t('workspace.exclusions.sub', {
+        count: number(props.data?.exclusions?.length || 0),
+      }),
+    };
+  }
   return headline(props.data);
 });
-
-const hasVault = computed(() => Number(props.data?.pc?.vault_files) > 0);
 
 const fixing = computed(() => {
   const plan = planData(props.data);
@@ -69,23 +75,15 @@ const commitLabel = computed(() => {
       <h1 class="ws-title">{{ head.title }}</h1>
       <p class="ws-sub">{{ head.text }}</p>
     </div>
-    <div v-if="tab !== 'settings'" class="ws-head-actions">
+    <div v-if="tab !== 'settings' && tab !== 'vault' && tab !== 'exclusions'" class="ws-head-actions">
       <button class="btn btn--quiet" :disabled="busy" @click="refreshWorkspace()">
         <Spinner v-if="refreshing" />
         {{ refreshing ? t('workspace.checking') : t('workspace.check') }}
       </button>
-      <template v-if="tab === 'vault'">
-        <button class="btn" :disabled="!hasVault || busy" @click="askGc">
-          <Spinner v-if="state.workspace.action === 'gc'" />
-          {{ t('workspace.vault.gc') }}
-        </button>
-      </template>
-      <template v-else>
-        <button class="btn" :disabled="!canCommit(data)" @click="commitWorkspace">
-          <Spinner v-if="state.workspace.action === 'commit'" />
-          {{ commitLabel }}
-        </button>
-      </template>
+      <button class="btn" :disabled="!canCommit(data)" @click="commitWorkspace">
+        <Spinner v-if="state.workspace.action === 'commit'" />
+        {{ commitLabel }}
+      </button>
     </div>
   </header>
 </template>

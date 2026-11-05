@@ -451,6 +451,7 @@ impl Plan {
             .iter()
             .map(|conflict| conflict.path.as_str())
             .collect();
+        let excluded = replica.exclusion_paths()?;
 
         for change in &self.local {
             let Some(row) = by_path.get(change.path.as_str()) else {
@@ -475,7 +476,7 @@ impl Plan {
         }
         // Появившийся новый локальный путь тоже делает план неполным.
         for row in &rows {
-            if row.ignored || row.deleted {
+            if row.ignored || row.deleted || excluded.contains(&row.path) {
                 continue;
             }
             if conflicts.contains(row.path.as_str()) {
@@ -546,6 +547,7 @@ pub fn build_with_peer_have(
     let rows = replica.plan_rows()?;
     let by_path: HashMap<&str, &PlanRow> =
         rows.iter().map(|row| (row.path.as_str(), row)).collect();
+    let excluded = replica.exclusion_paths()?;
     let pending: HashMap<String, (String, u64)> = replica
         .pending_deletes()?
         .into_iter()
@@ -559,7 +561,9 @@ pub fn build_with_peer_have(
 
     // ---------------------------------------------------------- локальные
     for row in &rows {
-        if row.ignored {
+        if row.ignored || excluded.contains(&row.path) {
+            // «Только здесь» или явное исключение: путь не участвует в плане
+            // ни с одной стороны, пока человек не вернёт его в синхронизацию.
             continue;
         }
         if let Some((blob, _)) = pending.get(&row.path) {
@@ -654,11 +658,39 @@ pub fn build_with_peer_have(
 
     for state in remote.values() {
         let path = &state.path;
+        if excluded.contains(path) {
+            // Явное исключение: пир может продолжать слать свой журнал, но
+            // этот путь не участвует в синхронизации.
+            continue;
+        }
         if by_path.get(path.as_str()).is_some_and(|row| row.ignored) {
             // «Только здесь»: не тянем и не трогаем.
             continue;
         }
         let row = by_path.get(path.as_str()).cloned();
+
+        // Журнал пира может содержать давнюю операцию, которая до нас не
+        // доехала: watermark двигается только по применённым операциям, а не
+        // по всей истории. Если наше состояние пути уже новее (LWW: HLC, затем
+        // автор) и пир по своему watermark уже видел эту нашу операцию, значит
+        // присланная запись — хвост истории, а не текущее состояние пира.
+        // Тянуть для неё блоб нельзя: у пира его может давно не быть.
+        //
+        // Без watermark пира судить нельзя: при одновременной правке обеих
+        // сторон более старый HLC — всё ещё настоящее изменение, и его нужно
+        // показать как конфликт.
+        if let Some(row) = row {
+            let mine = (row.hlc.ms, row.hlc.counter, row.dev.as_str());
+            let theirs = (state.hlc.ms, state.hlc.counter, state.dev.as_str());
+            let peer_has_ours = peer_have
+                .and_then(|have| have.get(&row.dev))
+                .is_some_and(|&(ms, counter)| {
+                    (ms, counter) >= (row.hlc.ms as i64, row.hlc.counter as i64)
+                });
+            if mine > theirs && peer_has_ours {
+                continue;
+            }
+        }
 
         if state.present {
             let local_changed = match row {
@@ -857,6 +889,12 @@ struct RemoteState {
     size: u64,
     mtime_ns: i64,
     moved_from: Option<String>,
+    /// HLC и автор операции, сформировавшей состояние. Нужны, чтобы отличить
+    /// свежее изменение пира от старой записи журнала: пир присылает всё, что
+    /// выше нашего watermark, а туда могут попадать операции, которые уже
+    /// перекрыты более новой версией с нашей стороны.
+    hlc: Hlc,
+    dev: String,
 }
 
 /// Последнее состояние каждого пути по присланным операциям. Порядок —
@@ -902,6 +940,8 @@ fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
                         size: *size,
                         mtime_ns: *mtime_ns,
                         moved_from: None,
+                        hlc: op.hlc,
+                        dev: op.dev.clone(),
                     },
                 );
             }
@@ -911,6 +951,8 @@ fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
                     RemoteState {
                         path: path.clone(),
                         present: false,
+                        hlc: op.hlc,
+                        dev: op.dev.clone(),
                         ..Default::default()
                     },
                 );
@@ -928,6 +970,8 @@ fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
                     RemoteState {
                         path: from.clone(),
                         present: false,
+                        hlc: op.hlc,
+                        dev: op.dev.clone(),
                         ..Default::default()
                     },
                 );
@@ -940,6 +984,8 @@ fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
                         size: *size,
                         mtime_ns: *mtime_ns,
                         moved_from: Some(from.clone()),
+                        hlc: op.hlc,
+                        dev: op.dev.clone(),
                     },
                 );
             }
@@ -968,8 +1014,14 @@ mod tests {
         OpKind::EntryDel { path: path.into() }
     }
 
+    /// Свежая операция пира: HLC заметно выше локальных (они идут по часам).
     fn remote(kind: OpKind, ms: u64) -> Op {
-        Op::new("dev-peer", Hlc::new(ms, 0), kind)
+        Op::new("dev-peer", Hlc::new(Hlc::wall_ms() + 1000 + ms, 0), kind)
+    }
+
+    /// Давняя операция, которая до нас так и не доехала.
+    fn stale_remote(kind: OpKind) -> Op {
+        Op::new("dev-peer", Hlc::new(10, 0), kind)
     }
 
     /// Локальная запись, которую уже подтвердили как общую базу.
@@ -1063,6 +1115,88 @@ mod tests {
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].kind, ChangeKind::Updated);
         assert!(plan.remote.is_empty());
+    }
+
+    #[test]
+    fn excluded_local_path_stays_out_of_the_plan() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+
+        // Локальная правка, которую человек решил не синхронизировать.
+        let op = a.make_op(put("track.flac", "b3:bb")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_present("track.flac").unwrap();
+        a.add_exclusion("track.flac", "local", "b3:bb", 2, 1)
+            .unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+        assert!(plan.local.is_empty(), "исключённый путь не должен попасть в план");
+        assert!(plan.remote.is_empty());
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.local_is_current(&a).unwrap());
+    }
+
+    #[test]
+    fn excluded_remote_path_does_not_request_a_blob() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.add_exclusion("track.flac", "remote", "b3:bb", 2, 1)
+            .unwrap();
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("track.flac", "b3:bb"), 10)],
+        )
+        .unwrap();
+
+        assert!(plan.local.is_empty());
+        assert!(plan.remote.is_empty(), "исключённый путь не должен проситься с пира");
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn stale_peer_op_older_than_local_state_is_ignored() {
+        // ПК уже принял версию с обложкой, а на телефоне в журнале осталась
+        // старая операция без обложки, которую ПК так и не получил.
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:with-cover");
+
+        // Пир уже применил всё, что мы ему отправили.
+        let peer_have = HashMap::from([("dev-a".to_string(), (i64::MAX, i64::MAX))]);
+        let plan = build_with_peer_have(
+            &a,
+            "dev-b",
+            "Phone",
+            &[stale_remote(put("track.flac", "b3:no-cover"))],
+            Some(&peer_have),
+        )
+        .unwrap();
+
+        assert!(plan.remote.is_empty(), "устаревшая запись не должна тянуться");
+        assert!(plan.local.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn stale_peer_delete_older_than_local_state_is_ignored() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:with-cover");
+
+        let peer_have = HashMap::from([("dev-a".to_string(), (i64::MAX, i64::MAX))]);
+        let plan = build_with_peer_have(
+            &a,
+            "dev-b",
+            "Phone",
+            &[stale_remote(del("track.flac"))],
+            Some(&peer_have),
+        )
+        .unwrap();
+
+        assert!(plan.remote.is_empty());
+        assert!(plan.local.is_empty());
+        assert!(plan.conflicts.is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PORT, AGENT_PROTO};
+use syncth_core::scan;
 use syncth_core::transport::Transport;
 use tauri::Manager;
 
@@ -417,6 +418,59 @@ fn is_disconnect(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Пересылает ПК ход сканирования, не заваливая сокет сообщением на каждый
+/// файл: первый пакет, смена этапа и дальше примерно каждые 32 файла.
+struct ScanProgressRelay<'a> {
+    transport: &'a mut dyn Transport,
+    done: usize,
+    total: usize,
+    done_bytes: u64,
+    total_bytes: u64,
+    first: bool,
+}
+
+impl<'a> ScanProgressRelay<'a> {
+    fn new(transport: &'a mut dyn Transport) -> Self {
+        Self {
+            transport,
+            done: 0,
+            total: 0,
+            done_bytes: 0,
+            total_bytes: 0,
+            first: true,
+        }
+    }
+
+    fn update(&mut self, progress: scan::ScanProgress) {
+        let finished = progress.total > 0 && progress.done >= progress.total;
+        // Шлём не на каждый файл, а при смене этапа, каждые 32 файла или
+        // каждые 8 МиБ: на телефоне файлы мелкие, и пакет на каждый — лишний шум.
+        let bytes_advanced = progress.done_bytes >= self.done_bytes.saturating_add(8 * 1024 * 1024);
+        if self.first
+            || progress.total != self.total
+            || progress.total_bytes != self.total_bytes
+            || finished
+            || bytes_advanced
+            || progress.done >= self.done.saturating_add(32)
+        {
+            self.first = false;
+            self.done = progress.done;
+            self.total = progress.total;
+            self.done_bytes = progress.done_bytes;
+            self.total_bytes = progress.total_bytes;
+            let _ = agent::send(
+                self.transport,
+                &AgentMsg::ScanProgress {
+                    done: progress.done,
+                    total: progress.total,
+                    done_bytes: progress.done_bytes,
+                    total_bytes: progress.total_bytes,
+                },
+            );
+        }
+    }
+}
+
 fn command_loop(
     app: &tauri::AppHandle,
     runtime: &AgentRuntime,
@@ -493,7 +547,11 @@ fn command_loop(
                 // Скан не только отдаёт список файлов ПК, но и обновляет
                 // общий реплик: именно из него читает сервер полной
                 // синхронизации на 47887. Ошибку скана не скрываем.
-                match crate::scan_phone(app) {
+                let result = {
+                    let mut relay = ScanProgressRelay::new(transport);
+                    crate::scan_phone_with_progress(app, &mut |progress| relay.update(progress))
+                };
+                match result {
                     Ok((root, _)) => {
                         let entries = agent::manifest(&root)?;
                         agent::send(
@@ -514,26 +572,32 @@ fn command_loop(
                     }
                 }
             }
-            AgentMsg::ResetHistory => match crate::reset_phone_history(app) {
-                Ok((root, _)) => {
-                    let entries = agent::manifest(&root)?;
-                    agent::send(
-                        transport,
-                        &AgentMsg::Manifest {
-                            root: root.to_string_lossy().to_string(),
-                            entries,
-                        },
-                    )?;
+            AgentMsg::ResetHistory => {
+                let result = {
+                    let mut relay = ScanProgressRelay::new(transport);
+                    crate::reset_phone_history(app, &mut |progress| relay.update(progress))
+                };
+                match result {
+                    Ok((root, _)) => {
+                        let entries = agent::manifest(&root)?;
+                        agent::send(
+                            transport,
+                            &AgentMsg::Manifest {
+                                root: root.to_string_lossy().to_string(),
+                                entries,
+                            },
+                        )?;
+                    }
+                    Err(error) => {
+                        agent::send(
+                            transport,
+                            &AgentMsg::Error {
+                                message: error,
+                            },
+                        )?;
+                    }
                 }
-                Err(error) => {
-                    agent::send(
-                        transport,
-                        &AgentMsg::Error {
-                            message: error,
-                        },
-                    )?;
-                }
-            },
+            }
             AgentMsg::GetSyncInfo => {
                 crate::server::ensure_started(app.clone());
                 let info = crate::server::info_json();

@@ -148,6 +148,41 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Полностью очищает корзину: все строки и все файлы блобов.
+///
+/// Восстановить что-либо после этого нельзя — вызывающий код обязан спросить
+/// пользователя. Файлы библиотеки не затрагиваются: hardlink в корзине — лишь
+/// второе имя, его удаление не трогает оригинал.
+pub fn clear(replica: &Replica) -> Result<GcReport> {
+    let Some(data_dir) = replica.data_dir() else {
+        return Ok(GcReport::default());
+    };
+
+    let mut report = GcReport {
+        rows_removed: replica.clear_vault_rows()?,
+        ..GcReport::default()
+    };
+
+    let root = vault_root(data_dir);
+    if root.is_dir() {
+        for entry in walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                report.blobs_removed += 1;
+            }
+        }
+        // Каталог `vault` тоже убираем, если он опустел.
+        let _ = std::fs::remove_dir(&root);
+        if let Some(parent) = root.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    Ok(report)
+}
+
 /// Чистит корзину: строки старше `ttl_days`, блобы без ссылок и файлы-сироты
 /// (например, оставшиеся после ручного удаления БД).
 pub fn gc(replica: &Replica, ttl_days: u64) -> Result<GcReport> {

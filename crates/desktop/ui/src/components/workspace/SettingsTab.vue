@@ -2,12 +2,14 @@
 import Spinner from '../Spinner.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
-import { state } from '../../store.js';
+import { setToastSeconds, state } from '../../store.js';
 import { askClearHistory, toggleManual } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
 });
+
+const toastChoices = [3, 5, 8, 12, 20];
 
 const manual = computed(() => Boolean(props.data?.manual_additions));
 const busy = computed(() => Boolean(state.workspace.action || state.workspace.refreshing));
@@ -39,6 +41,26 @@ const clearing = computed(() => state.workspace.action === 'clear-history');
           <span class="ws-switch-dot"></span>
         </span>
       </button>
+    </section>
+
+    <section class="ws-card ws-setting-card">
+      <div class="ws-card-head">
+        <h2 class="ws-card-title">{{ t('workspace.settings.toasts_title') }}</h2>
+      </div>
+      <p class="ws-setting-hint">{{ t('workspace.settings.toasts_text') }}</p>
+      <div class="ws-segmented" role="group" :aria-label="t('workspace.settings.toasts_title')">
+        <button
+          v-for="value in toastChoices"
+          :key="value"
+          type="button"
+          class="ws-segment"
+          :class="{ 'is-on': value === state.toastSeconds }"
+          :aria-pressed="value === state.toastSeconds ? 'true' : 'false'"
+          @click="setToastSeconds(value)"
+        >
+          {{ t('workspace.settings.toasts_seconds', { count: value }) }}
+        </button>
+      </div>
     </section>
 
     <section class="ws-card ws-setting-card">

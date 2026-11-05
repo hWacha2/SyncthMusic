@@ -39,6 +39,14 @@ export function ago(ms) {
   return t('time.days', { count: Math.max(1, Math.round(seconds / 86400)) });
 }
 
+/// Короткая длительность для ETA: «~40 с», «~3 мин», «~1 ч».
+export function formatDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 60) return t('duration.seconds', { count: Math.max(1, value) });
+  if (value < 3600) return t('duration.minutes', { count: Math.max(1, Math.round(value / 60)) });
+  return t('duration.hours', { count: Math.max(1, Math.round(value / 3600)) });
+}
+
 export function basename(path) {
   const text = String(path || '');
   const parts = text.split(/[\\/]/).filter(Boolean);

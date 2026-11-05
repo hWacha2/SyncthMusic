@@ -1,17 +1,22 @@
 <script setup>
 import ChangesTab from '../components/workspace/ChangesTab.vue';
+import ExclusionsTab from '../components/workspace/ExclusionsTab.vue';
 import OverviewTab from '../components/workspace/OverviewTab.vue';
 import SettingsTab from '../components/workspace/SettingsTab.vue';
 import VaultTab from '../components/workspace/VaultTab.vue';
 import WorkspaceEmpty from '../components/workspace/WorkspaceEmpty.vue';
 import WorkspaceHead from '../components/workspace/WorkspaceHead.vue';
 import WorkspaceNotices from '../components/workspace/WorkspaceNotices.vue';
+import WorkspaceProgress from '../components/workspace/WorkspaceProgress.vue';
 import WorkspaceRail from '../components/workspace/WorkspaceRail.vue';
 import { computed, onMounted } from 'vue';
 import { state } from '../store.js';
 import { refreshWorkspace } from '../store.js';
 
 const data = computed(() => state.workspace.data);
+// Пока данные устарели после сброса, нижняя панель продолжает показывать
+// связь, а содержимое вкладок ждёт свежей проверки.
+const body = computed(() => (state.workspace.stale ? null : state.workspace.data));
 const tab = computed(() => state.workspace.tab);
 
 onMounted(() => {
@@ -25,14 +30,16 @@ onMounted(() => {
   <section class="workspace">
     <WorkspaceRail :data="data" />
     <div class="workspace-main">
-      <WorkspaceHead :data="data" :tab="tab" />
-      <WorkspaceNotices :data="data" />
+      <WorkspaceHead :data="body" :tab="tab" />
+      <WorkspaceNotices :data="body" />
+      <WorkspaceProgress />
       <div class="workspace-body">
-        <WorkspaceEmpty v-if="!data" />
-        <OverviewTab v-else-if="tab === 'overview'" :data="data" />
-        <ChangesTab v-else-if="tab === 'changes'" :data="data" />
-        <VaultTab v-else-if="tab === 'vault'" :data="data" />
-        <SettingsTab v-else-if="tab === 'settings'" :data="data" />
+        <WorkspaceEmpty v-if="!body" />
+        <OverviewTab v-else-if="tab === 'overview'" :data="body" />
+        <ChangesTab v-else-if="tab === 'changes'" :data="body" />
+        <ExclusionsTab v-else-if="tab === 'exclusions'" :data="body" />
+        <VaultTab v-else-if="tab === 'vault'" :data="body" />
+        <SettingsTab v-else-if="tab === 'settings'" :data="body" />
       </div>
     </div>
   </section>

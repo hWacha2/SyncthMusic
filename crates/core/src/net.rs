@@ -1293,7 +1293,18 @@ impl PreviewSession {
     /// обязана увидеть удаление в плане — иначе решение примет только та
     /// сторона, где файл пропал, а вторая даже не узнает о нём.
     fn send_pending_deletes(replica: &mut Replica, ops: &mut Vec<Op>) -> Result<()> {
+        // Исключённое удаление пиру не показываем: файл должен там остаться.
+        // Ожидание удаления сохраняется, поэтому после отмены исключения
+        // операция снова попадёт в preview.
+        let excluded = if replica.exclusions_enabled() {
+            replica.exclusion_paths()?
+        } else {
+            Default::default()
+        };
         for pending in replica.pending_deletes()? {
+            if excluded.contains(&pending.path) {
+                continue;
+            }
             ops.push(replica.make_op_at(
                 pending.hlc(),
                 OpKind::EntryDel {

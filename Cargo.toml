@@ -23,3 +23,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 proptest = "1"
 tempfile = "3"
+
+# Debug-сборка не должна быть в разы медленнее release на горячем пути скана:
+# телефон тратит почти всё время на BLAKE3. opt-level = 1 для своего кода и
+# opt-level = 3 для хешера дают основной прирост, не ломая отладочность.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.rusqlite]
+opt-level = 2

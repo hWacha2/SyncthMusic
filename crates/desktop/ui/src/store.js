@@ -3,6 +3,31 @@ import { hasBridge, invoke } from './bridge.js';
 import { chosen, setLang, t } from './i18n/index.js';
 import { isWorkspaceGeneration, nextWorkspaceGeneration } from './workspace/generation.js';
 
+const TOAST_KEY = 'syncth.toast_seconds';
+const TOAST_CHOICES = [3, 5, 8, 12, 20];
+const TOAST_DEFAULT = 8;
+
+function loadToastSeconds() {
+  try {
+    const value = Number(localStorage.getItem(TOAST_KEY));
+    return TOAST_CHOICES.includes(value) ? value : TOAST_DEFAULT;
+  } catch {
+    return TOAST_DEFAULT;
+  }
+}
+
+/// Меняет, сколько живут всплывающие уведомления. Уже показанные тосты
+/// доживают со своим таймером — настройка влияет на следующие.
+export function setToastSeconds(value) {
+  if (!TOAST_CHOICES.includes(value)) return;
+  state.toastSeconds = value;
+  try {
+    localStorage.setItem(TOAST_KEY, String(value));
+  } catch {
+    // Приватный режим или запрет хранилища — просто не запоминаем.
+  }
+}
+
 // Общее состояние приложения. Экраны читают его напрямую, а действия
 // меняют через функции ниже — так проще переносить старую логику по кускам.
 export const state = reactive({
@@ -22,6 +47,9 @@ export const state = reactive({
   phoneBusy: '',
   workspace: {
     data: null,
+    // Данные устарели после сброса истории: пока идёт проверка, показываем
+    // прогресс вместо старых цифр, но нижний индикатор связи не сбрасываем.
+    stale: false,
     refreshing: false,
     error: '',
     statusError: '',
@@ -31,8 +59,19 @@ export const state = reactive({
     changesSort: 'folders',
     note: '',
     noteError: false,
+    progress: {
+      stage: '',
+      done: 0,
+      total: 0,
+      done_bytes: 0,
+      total_bytes: 0,
+      speed: 0,
+    },
   },
   modal: null,
+  // Сколько секунд висят всплывающие уведомления. Настройка переживает
+  // перезапуск: это личное предпочтение, а не часть библиотеки.
+  toastSeconds: loadToastSeconds(),
 });
 
 // Ответы старых запросов не должны перетирать состояние нового устройства
@@ -50,6 +89,7 @@ export function resetWorkspace() {
   nextWorkspaceGeneration();
   workspacePendingRefresh = false;
   state.workspace.data = null;
+  state.workspace.stale = false;
   state.workspace.error = '';
   state.workspace.statusError = '';
 }
@@ -319,18 +359,90 @@ export async function refreshWorkspace(options = {}) {
   state.workspace.error = '';
   state.workspace.statusError = '';
   const gen = nextWorkspaceGeneration();
+  startProgressWatch();
   try {
     const data = await invoke('workspace_refresh');
-    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    if (isWorkspaceGeneration(gen)) {
+      state.workspace.data = data;
+      state.workspace.stale = false;
+    }
   } catch (error) {
     if (isWorkspaceGeneration(gen)) state.workspace.error = errorMessage(error);
   } finally {
     state.workspace.refreshing = false;
+    stopProgressWatch();
     if (workspacePendingRefresh) {
       workspacePendingRefresh = false;
       refreshWorkspace(options);
     }
   }
+}
+
+// ---------------------------------------------------------------- progress
+
+let progressTimer = null;
+let progressSample = null;
+
+function applyProgress(value) {
+  const stage = value && typeof value.stage === 'string' ? value.stage : '';
+  const doneBytes = Number(value?.done_bytes) || 0;
+  const totalBytes = Number(value?.total_bytes) || 0;
+  const now = Date.now();
+
+  // Скорость считаем по байтам: файлы разного размера, и по штукам она врёт.
+  // Сглаживаем, чтобы цифра не дёргалась на каждом опросе. Уменьшение байтов
+  // означает новый этап (обход → проверка) — начинаем замер заново.
+  let speed = 0;
+  if (
+    stage &&
+    progressSample &&
+    progressSample.stage === stage &&
+    doneBytes >= progressSample.bytes
+  ) {
+    const dt = (now - progressSample.at) / 1000;
+    const delta = doneBytes - progressSample.bytes;
+    if (dt >= 0.4) {
+      const instant = delta / dt;
+      speed = progressSample.speed
+        ? progressSample.speed * 0.7 + instant * 0.3
+        : instant;
+      progressSample = { stage, bytes: doneBytes, at: now, speed };
+    } else {
+      speed = progressSample.speed || 0;
+    }
+  } else {
+    progressSample = stage ? { stage, bytes: doneBytes, at: now, speed: 0 } : null;
+  }
+
+  state.workspace.progress = {
+    stage,
+    done: Number(value?.done) || 0,
+    total: Number(value?.total) || 0,
+    done_bytes: doneBytes,
+    total_bytes: totalBytes,
+    speed,
+  };
+}
+
+/// Ход проверки живёт в отдельном мьютексе на бэкенде, поэтому его можно
+/// опрашивать, пока `workspace_refresh` ещё считает файлы.
+export function startProgressWatch() {
+  if (progressTimer || !hasBridge) return;
+  const tick = async () => {
+    try {
+      applyProgress(await invoke('workspace_progress'));
+    } catch {
+      // Проверка могла закончиться между тиками — полосу уберёт stop.
+    }
+  };
+  tick();
+  progressTimer = setInterval(tick, 300);
+}
+
+export function stopProgressWatch() {
+  if (progressTimer) clearInterval(progressTimer);
+  progressTimer = null;
+  applyProgress(null);
 }
 
 // ---------------------------------------------------------------- status

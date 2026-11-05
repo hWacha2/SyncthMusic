@@ -185,7 +185,7 @@ export function canCommit(data = workspaceData()) {
 }
 
 export function headline(data = workspaceData()) {
-  if (!data && state.workspace.refreshing) {
+  if (!data && (state.workspace.refreshing || state.workspace.stale)) {
     return { title: t('workspace.status.checking'), text: t('workspace.sub.checking') };
   }
   if (!data) {

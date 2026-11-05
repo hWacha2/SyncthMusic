@@ -50,6 +50,18 @@ struct Desktop {
     child: Mutex<Option<std::process::Child>>,
     agent: Mutex<AgentState>,
     workspace: Mutex<WorkspaceState>,
+    /// Ход долгой проверки. Отдельный мьютекс: интерфейс опрашивает его,
+    /// пока `workspace` занят сканированием.
+    progress: Mutex<ProgressState>,
+}
+
+#[derive(Default)]
+struct ProgressState {
+    stage: String,
+    done: usize,
+    total: usize,
+    done_bytes: u64,
+    total_bytes: u64,
 }
 
 #[derive(Default)]
@@ -1092,8 +1104,10 @@ fn workspace_replica() -> Result<Replica, String> {
     }
     let data_dir = effective_data_dir(&config);
     std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
-    let replica = Replica::open(&data_dir, &default_device_id(&data_dir))
+    let mut replica = Replica::open(&data_dir, &default_device_id(&data_dir))
         .map_err(|error| format!("{error:#}"))?;
+    // Список «Исключения» и отмену ведёт только ПК.
+    replica.enable_exclusions();
     let known = replica.root().map_err(|error| format!("{error:#}"))?;
     if known.as_deref() != Some(root.as_path()) {
         replica
@@ -1184,6 +1198,19 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
     let local = replica.local_entries().map(|rows| rows.len()).unwrap_or(0);
     let vault_rows = replica.vault_rows().unwrap_or_default();
     let vault_size = vault_rows.iter().map(|row| row.size).sum::<u64>();
+    let exclusions = replica
+        .exclusions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            json!({
+                "path": row.path,
+                "side": row.side,
+                "size": row.size,
+                "created_at": row.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
     let pending = replica
         .pending_deletes()
         .unwrap_or_default()
@@ -1256,6 +1283,7 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
             "size": row.size,
             "deleted_at": row.deleted_at,
         })).collect::<Vec<_>>(),
+        "exclusions": exclusions,
     })
 }
 
@@ -1381,6 +1409,31 @@ fn ensure_preview(
     }
 }
 
+/// Обновить ход проверки для интерфейса. Мьютекс отдельный от `workspace`,
+/// поэтому опрос не ждёт конца сканирования.
+fn set_progress(
+    app: &tauri::AppHandle,
+    stage: &str,
+    done: usize,
+    total: usize,
+    done_bytes: u64,
+    total_bytes: u64,
+) {
+    if let Some(state) = app.try_state::<Desktop>() {
+        if let Ok(mut progress) = state.progress.lock() {
+            progress.stage = stage.to_string();
+            progress.done = done;
+            progress.total = total;
+            progress.done_bytes = done_bytes;
+            progress.total_bytes = total_bytes;
+        }
+    }
+}
+
+fn clear_progress(app: &tauri::AppHandle) {
+    set_progress(app, "", 0, 0, 0, 0);
+}
+
 /// Скан телефона через агентский сеанс. Заодно обновляет сохранённый корень.
 fn scan_phone_now(app: &tauri::AppHandle) -> Result<Value, String> {
     let (root, entries) = with_session(app, |session| {
@@ -1391,14 +1444,27 @@ fn scan_phone_now(app: &tauri::AppHandle) -> Result<Value, String> {
         agent::send(session.transport.as_mut(), &AgentMsg::Scan)
             .map_err(|error| format!("{error:#}"))?;
 
-        match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
-            AgentMsg::Manifest { root, entries } => {
-                session.root = Some(root.clone());
-                session.link.root = Some(root.clone());
-                Ok(Ok((root, entries)))
+        loop {
+            match agent::recv(session.transport.as_mut())
+                .map_err(|error| format!("{error:#}"))?
+            {
+                AgentMsg::Manifest { root, entries } => {
+                    session.root = Some(root.clone());
+                    session.link.root = Some(root.clone());
+                    return Ok(Ok((root, entries)));
+                }
+                AgentMsg::Error { message } => return Ok(Err(message)),
+                AgentMsg::ScanProgress {
+                    done,
+                    total,
+                    done_bytes,
+                    total_bytes,
+                } => {
+                    set_progress(app, "phone", done, total, done_bytes, total_bytes);
+                }
+                // В очереди мог остаться ответ на heartbeat `GetRoot`.
+                _ => {}
             }
-            AgentMsg::Error { message } => Ok(Err(message)),
-            other => Err(format!("телефон ответил неожиданно: {other:?}")),
         }
     })?;
 
@@ -1426,14 +1492,27 @@ fn clear_phone_history(app: &tauri::AppHandle) -> Result<Value, String> {
         agent::send(session.transport.as_mut(), &AgentMsg::ResetHistory)
             .map_err(|error| format!("{error:#}"))?;
 
-        match agent::recv(session.transport.as_mut()).map_err(|error| format!("{error:#}"))? {
-            AgentMsg::Manifest { root, entries } => {
-                session.root = Some(root.clone());
-                session.link.root = Some(root.clone());
-                Ok(Ok((root, entries)))
+        loop {
+            match agent::recv(session.transport.as_mut())
+                .map_err(|error| format!("{error:#}"))?
+            {
+                AgentMsg::Manifest { root, entries } => {
+                    session.root = Some(root.clone());
+                    session.link.root = Some(root.clone());
+                    return Ok(Ok((root, entries)));
+                }
+                AgentMsg::Error { message } => return Ok(Err(message)),
+                AgentMsg::ScanProgress {
+                    done,
+                    total,
+                    done_bytes,
+                    total_bytes,
+                } => {
+                    set_progress(app, "phone", done, total, done_bytes, total_bytes);
+                }
+                // В очереди мог остаться ответ на heartbeat `GetRoot`.
+                _ => {}
             }
-            AgentMsg::Error { message } => Ok(Err(message)),
-            other => Err(format!("телефон ответил неожиданно: {other:?}")),
         }
     })?;
 
@@ -1451,14 +1530,31 @@ fn clear_phone_history(app: &tauri::AppHandle) -> Result<Value, String> {
 }
 
 fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
+    set_progress(app, "pc_walk", 0, 0, 0, 0);
     let mut replica = workspace_replica()?;
     let root = replica
         .root()
         .map_err(|error| format!("{error:#}"))?
         .ok_or_else(|| "Корень библиотеки не задан".to_string())?;
-    let report = scan::scan(&root, &mut replica).map_err(|error| format!("{error:#}"))?;
+    let report = scan::scan_with_progress(&root, &mut replica, &mut |progress| {
+        let stage = match progress.stage {
+            scan::ScanStage::Walking => "pc_walk",
+            scan::ScanStage::Hashing => "pc_files",
+        };
+        set_progress(
+            app,
+            stage,
+            progress.done,
+            progress.total,
+            progress.done_bytes,
+            progress.total_bytes,
+        );
+    })
+    .map_err(|error| format!("{error:#}"))?;
 
+    set_progress(app, "phone", 0, 0, 0, 0);
     let phone = scan_phone_now(app);
+    set_progress(app, "plan", 0, 0, 0, 0);
     let desktop = app.state::<Desktop>();
     let mut ws = desktop
         .workspace
@@ -1501,7 +1597,9 @@ fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
         Ok(()) => None,
         Err(error) => Some(error),
     };
-    Ok(workspace_payload(app, &replica, &ws))
+    let payload = workspace_payload(app, &replica, &ws);
+    clear_progress(app);
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -1725,6 +1823,32 @@ async fn workspace_restore(path: String) -> Result<Value, String> {
     .await
 }
 
+/// Вернуть путь в синхронизацию. Старый план построен без этого пути, поэтому
+/// закрываем сеанс и сразу открываем новый: путь возвращается в «Изменения» без
+/// ручной проверки. Если телефон недоступен, исключение всё равно снято —
+/// ошибка связи показывается в статусе, а план построится при следующей проверке.
+#[tauri::command]
+async fn workspace_exclusion_undo(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        replica
+            .remove_exclusion(&path)
+            .map_err(|error| format!("{error:#}"))?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        ws.close();
+        ws.session_error = match ensure_preview(&app, &mut ws, &mut replica) {
+            Ok(()) => None,
+            Err(error) => Some(error),
+        };
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn workspace_gc(ttl_days: Option<u64>) -> Result<Value, String> {
     blocking(move || {
@@ -1735,6 +1859,19 @@ async fn workspace_gc(ttl_days: Option<u64>) -> Result<Value, String> {
             "rows": report.rows_removed,
             "blobs": report.blobs_removed,
             "orphans": report.orphans_removed,
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn workspace_clear_vault() -> Result<Value, String> {
+    blocking(move || {
+        let replica = workspace_replica()?;
+        let report = vault::clear(&replica).map_err(|error| format!("{error:#}"))?;
+        Ok(json!({
+            "rows": report.rows_removed,
+            "blobs": report.blobs_removed,
         }))
     })
     .await
@@ -1758,35 +1895,53 @@ async fn workspace_clear_history(app: tauri::AppHandle) -> Result<Value, String>
         // Проверяем корень до телефона: иначе телефон остался бы без истории,
         // хотя на ПК сбрасывать нечего.
         let mut replica = workspace_replica()?;
-        let root = replica
+        replica
             .root()
             .map_err(|error| format!("{error:#}"))?
             .ok_or_else(|| "Корень библиотеки не задан".to_string())?;
 
-        // Телефон сбрасываем первым: если он недоступен, ПК всё равно очистим,
-        // а интерфейс покажет предупреждение.
-        let phone = clear_phone_history(&app);
+        set_progress(&app, "reset", 0, 0, 0, 0);
+        // Сбрасываем телефон первым и без «половинчатого» сброса: если он
+        // не ответил, историю ПК не трогаем, иначе стороны разойдутся.
+        if let Err(error) = clear_phone_history(&app) {
+            clear_progress(&app);
+            return Err(error);
+        }
 
         replica
             .reset_history()
             .map_err(|error| format!("{error:#}"))?;
-        scan::scan(&root, &mut replica).map_err(|error| format!("{error:#}"))?;
         drop(replica);
+        clear_progress(&app);
 
-        let mut payload = refresh_workspace(&app)?;
-        let (phone_ok, phone_error) = match phone {
-            Ok(_) => (true, None),
-            Err(error) => (false, Some(error)),
-        };
-        if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "history_cleared".into(),
-                json!({ "pc": true, "phone": phone_ok, "phone_error": phone_error }),
-            );
-        }
-        Ok(payload)
+        // Скан и план строит отдельный шаг «Проверить»: так кнопка очистки
+        // не висит в «Очищаем…», пока идёт проверка, а старые цифры уже
+        // не показываются. Индекс ПК пересоберётся при следующем скане.
+        Ok(json!({ "pc": true, "phone": true }))
     })
     .await
+}
+
+#[tauri::command]
+fn workspace_progress(app: tauri::AppHandle) -> Value {
+    let state = app.state::<Desktop>();
+    let payload = match state.progress.lock() {
+        Ok(progress) => json!({
+            "stage": progress.stage,
+            "done": progress.done,
+            "total": progress.total,
+            "done_bytes": progress.done_bytes,
+            "total_bytes": progress.total_bytes,
+        }),
+        Err(_) => json!({
+            "stage": "",
+            "done": 0,
+            "total": 0,
+            "done_bytes": 0,
+            "total_bytes": 0,
+        }),
+    };
+    payload
 }
 
 #[tauri::command]
@@ -2221,9 +2376,12 @@ pub fn run() {
             workspace_undecide,
             workspace_set_manual,
             workspace_clear_history,
+            workspace_progress,
             workspace_commit,
             workspace_restore,
+            workspace_exclusion_undo,
             workspace_gc,
+            workspace_clear_vault,
             workspace_close,
             daemon_status,
             daemon_pair_code,

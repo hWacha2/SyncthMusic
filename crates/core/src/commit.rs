@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::plan::{ChangeKind, Decision, PathDecision, Plan};
+use crate::plan::{Change, ChangeKind, Decision, PathDecision, Plan, Side};
 use crate::resolve;
 use crate::store::Replica;
 use crate::vault;
@@ -519,6 +519,47 @@ fn staged_or_known(replica: &Replica, root: &Path, blob: &str) -> Option<PathBuf
     blob_source(replica, root, blob).ok().flatten()
 }
 
+/// Запомнить путь вне синхронизации. Сторона говорит, где файл остаётся:
+/// при добавлении — там, где он появился; при удалении — там, где он ещё есть.
+fn remember_exclusion(replica: &mut Replica, change: &Change) -> Result<()> {
+    if !replica.exclusions_enabled() {
+        return Ok(());
+    }
+    let side = match change.kind {
+        ChangeKind::Added => change.side,
+        ChangeKind::Deleted => match change.side {
+            Side::Local => Side::Remote,
+            Side::Remote => Side::Local,
+        },
+        _ => return Ok(()),
+    };
+    let side = match side {
+        Side::Local => "local",
+        Side::Remote => "remote",
+    };
+    replica.add_exclusion(
+        &change.path,
+        side,
+        &change.blob,
+        change.size,
+        change.mtime_ns,
+    )?;
+    // Прежнее локальное исключение больше не должно пережить отмену нового:
+    // план теперь смотрит на таблицу исключений, а не на флаг записи.
+    replica.clear_ignored(&change.path)?;
+    Ok(())
+}
+
+fn op_hits_exclusion(kind: &OpKind, excluded: &HashSet<String>) -> bool {
+    match kind {
+        OpKind::EntryPut { path, .. } | OpKind::EntryDel { path } => excluded.contains(path),
+        OpKind::EntryMove { from, to, .. } => {
+            excluded.contains(from) || excluded.contains(to)
+        }
+        OpKind::BlobHave { .. } => false,
+    }
+}
+
 /// Выполнить локальную часть решений до применения чужих операций. Блобы уже
 /// должны быть скачаны. Здесь освобождаются пути, которые заменяются версией
 /// пира, отменяются изменения и раскладываются конфликтные копии.
@@ -536,7 +577,10 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                     remove_to_vault(replica, &root, &change.path)?;
                     replica.clear_pending_delete(&change.path)?;
                 }
-                Decision::OnlyHere => replica.mark_present(&change.path)?,
+                Decision::OnlyHere => {
+                    remember_exclusion(replica, change)?;
+                    replica.mark_present(&change.path)?;
+                }
                 _ => {}
             },
             ChangeKind::Updated => {
@@ -580,8 +624,11 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                     replica.clear_pending_delete(&change.path)?;
                 }
                 Decision::OnlyHere => {
-                    replica.clear_pending_delete(&change.path)?;
-                    replica.set_ignored(&change.path, true)?;
+                    // Оставляем ожидание удаления: если человек вернёт путь в
+                    // синхронизацию, скан уже будет знать, что файл исчез, и
+                    // покажет удаление снова. Пока действует исключение, план
+                    // этот путь не видит.
+                    remember_exclusion(replica, change)?;
                 }
                 _ => {}
             },
@@ -636,10 +683,16 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
         let decision = plan
             .effective_decision(&change.path)
             .unwrap_or(Decision::Keep);
-        if decision == Decision::OnlyHere && change.kind == ChangeKind::Added {
-            // У пира файл есть, а у нас записи может не быть вовсе. Без
-            // отдельной «пустой» записи исключение не сохранится и путь
-            // будет всплывать в каждом следующем плане.
+        if decision != Decision::OnlyHere {
+            continue;
+        }
+        if replica.exclusions_enabled() {
+            // ПК ведёт список исключений сам. Чужую операцию по этому пути
+            // не применяем (см. `finalize`), поэтому запись не появляется.
+            remember_exclusion(replica, change)?;
+        } else if change.kind == ChangeKind::Added {
+            // Телефон остаётся минимальным агентом: старый механизм с
+            // локальным флагом ему достаточно.
             replica.ignore_missing(&change.path, &change.blob, change.size, change.mtime_ns)?;
             replica.clear_pending_delete(&change.path)?;
         }
@@ -679,8 +732,8 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                 replica.clear_pending_delete(&change.path)?;
             }
             (ChangeKind::Deleted, Decision::OnlyHere) => {
-                replica.clear_pending_delete(&change.path)?;
-                replica.set_ignored(&change.path, true)?;
+                // Ожидание удаления намеренно остаётся: оно понадобится,
+                // если человек вернёт путь в синхронизацию.
             }
             _ => {}
         }
@@ -707,7 +760,17 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
-    replica.apply_all(peer_ops)?;
+    // Операции по исключённым путям не применяем: иначе чужое добавление
+    // создало бы у нас запись, а чужое удаление убрало бы файл, который
+    // человек решил оставить. Watermark по ним не двигается, поэтому после
+    // отмены исключения пир пришлёт их снова.
+    let excluded = replica.exclusion_paths()?;
+    let peer_ops: Vec<Op> = peer_ops
+        .iter()
+        .filter(|op| !op_hits_exclusion(&op.kind, &excluded))
+        .cloned()
+        .collect();
+    replica.apply_all(&peer_ops)?;
     // Удаления приходят операцией, но файл на диске убирает эта функция
     // (с копией в корзину). Заодно спасает локальные правки.
     resolve::prune_deleted_files(replica, &root)?;
@@ -720,8 +783,13 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
             .effective_decision(&change.path)
             .unwrap_or(Decision::Keep);
         match (change.kind, decision) {
-            (ChangeKind::Added, Decision::Accept | Decision::OnlyHere) => {
+            (ChangeKind::Added, Decision::Accept) => {
                 confirmed.insert(change.path.clone());
+                outcome.accepted += 1;
+            }
+            (ChangeKind::Added, Decision::OnlyHere) => {
+                // Файл остаётся только здесь и в общую базу не входит:
+                // подтверждать его как согласованный нельзя.
                 outcome.accepted += 1;
             }
             (ChangeKind::Added, Decision::Revert) => outcome.accepted += 1,

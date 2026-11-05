@@ -64,7 +64,12 @@ fn open(app: &tauri::AppHandle) -> Result<Replica, String> {
     let dir = data_dir(app)?;
     let dev = boot_dev(&dir);
     let mut replica = Replica::open(&dir, &dev).map_err(err)?;
-    replica.set_device_name(&phone_name()).map_err(err)?;
+    // Имя пишем только при изменении: иначе каждый опрос статуса открывал бы
+    // запись в SQLite и мешал сканированию.
+    let name = phone_name();
+    if replica.device_name() != name.as_str() {
+        replica.set_device_name(&name).map_err(err)?;
+    }
     Ok(replica)
 }
 
@@ -84,14 +89,18 @@ pub(crate) fn sync_root(app: &tauri::AppHandle, root: &Path) -> Result<scan::Sca
     Ok(report)
 }
 
-/// Сканирует текущую папку телефона в реплику. Возвращает путь и отчёт.
-pub(crate) fn scan_phone(app: &tauri::AppHandle) -> Result<(PathBuf, scan::ScanReport), String> {
+/// Сканирует текущую папку телефона в реплику и сообщает о ходе: агент
+/// пересылает его ПК, чтобы там был виден прогресс долгой проверки.
+pub(crate) fn scan_phone_with_progress(
+    app: &tauri::AppHandle,
+    progress: &mut dyn FnMut(scan::ScanProgress),
+) -> Result<(PathBuf, scan::ScanReport), String> {
     let mut replica = open(app)?;
     let root = replica
         .root()
         .map_err(err)?
         .ok_or("Папка на телефоне не выбрана")?;
-    let report = scan::scan(&root, &mut replica).map_err(err)?;
+    let report = scan::scan_with_progress(&root, &mut replica, progress).map_err(err)?;
     let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
     Ok((root, report))
 }
@@ -100,6 +109,7 @@ pub(crate) fn scan_phone(app: &tauri::AppHandle) -> Result<(PathBuf, scan::ScanR
 /// Сопряжение, токен и выбранная папка не трогаются.
 pub(crate) fn reset_phone_history(
     app: &tauri::AppHandle,
+    progress: &mut dyn FnMut(scan::ScanProgress),
 ) -> Result<(PathBuf, scan::ScanReport), String> {
     let mut replica = open(app)?;
     let root = replica
@@ -107,7 +117,7 @@ pub(crate) fn reset_phone_history(
         .map_err(err)?
         .ok_or("Папка на телефоне не выбрана")?;
     replica.reset_history().map_err(err)?;
-    let report = scan::scan(&root, &mut replica).map_err(err)?;
+    let report = scan::scan_with_progress(&root, &mut replica, progress).map_err(err)?;
     let _ = replica.set_meta("last_scan", &Hlc::wall_ms().to_string());
     Ok((root, report))
 }

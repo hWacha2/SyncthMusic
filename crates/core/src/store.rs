@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +78,17 @@ CREATE TABLE IF NOT EXISTS blobs (
     size INTEGER NOT NULL
 );
 
+-- Кэш содержимого: путь + размер + mtime_ns → блоб. Это не история
+-- синхронизации, а локальное знание о файлах: таблица переживает
+-- `reset_history`, чтобы после сброса не читать всю библиотеку заново.
+CREATE TABLE IF NOT EXISTS content_cache (
+    path     TEXT PRIMARY KEY,
+    size     INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    blob     TEXT NOT NULL,
+    seen_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pending_deletes (
     path        TEXT PRIMARY KEY,
     blob        TEXT NOT NULL,
@@ -130,6 +142,19 @@ CREATE TABLE IF NOT EXISTS plan_decisions (
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (peer_dev, path)
 );
+
+-- Пути, которые человек вывел из синхронизации кнопкой «оставить только на
+-- одной стороне». Это намерение, а не журнал: таблица не реплицируется и
+-- переживает сброс истории. `side` — где файл остаётся относительно этого
+-- устройства: `local` или `remote`.
+CREATE TABLE IF NOT EXISTS exclusions (
+    path       TEXT PRIMARY KEY,
+    side       TEXT NOT NULL,
+    blob       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +165,22 @@ pub struct EntryRow {
     pub mtime_ns: i64,
     pub added_at: u64,
     pub deleted: bool,
+}
+
+/// Состояние пути, нужное сканеру: метаданные записи плюс локальные флаги.
+/// Читается один раз на скан, чтобы не делать SELECT на каждый файл.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRow {
+    pub path: String,
+    pub blob: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub added_at: u64,
+    pub deleted: bool,
+    pub present: bool,
+    pub ignored: bool,
+    pub dev: String,
+    pub synced_blob: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,12 +208,33 @@ pub struct VaultRow {
     pub deleted_at: u64,
 }
 
+/// Путь, выведенный из синхронизации по решению человека. `side` говорит, на
+/// какой стороне файл остаётся: `local` — на этом устройстве, `remote` — на
+/// сопряжённом. Значение не зависит от того, кто именно принял решение.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionRow {
+    pub path: String,
+    pub side: String,
+    pub blob: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub created_at: u64,
+}
+
 pub struct Replica {
     conn: Connection,
     dev: String,
     name: String,
     data_dir: Option<PathBuf>,
     key: SigningKey,
+    /// Часы в памяти. Читать и писать `meta` на каждый файл слишком дорого:
+    /// при долгом сканировании это тысячи лишних транзакций.
+    hlc: Cell<Option<Hlc>>,
+    hlc_dirty: Cell<bool>,
+    /// Вести ли таблицу исключений. Включается только на ПК: именно он
+    /// показывает список исключений и умеет их отменять. Телефон остаётся
+    /// минимальным агентом и продолжает слать свой журнал как раньше.
+    exclusions: bool,
 }
 
 /// Сопряжённое устройство. `name` — понятное имя, если пир его сообщил.
@@ -196,6 +258,22 @@ pub struct PlanRow {
     pub present: bool,
     pub ignored: bool,
     pub synced_blob: String,
+    /// HLC операции, которая сформировала текущее состояние пути. По нему
+    /// видно, устарела ли операция пира: журнал пира может содержать давние
+    /// записи, которые до нас так и не доехали.
+    pub hlc: Hlc,
+    /// Автор этой операции. Нужен для разрешения ничьей по HLC так же, как
+    /// в `is_newer` при применении операций.
+    pub dev: String,
+}
+
+impl Drop for Replica {
+    /// Часы живут в памяти, поэтому при закрытии реплики дописываем их в БД.
+    /// Ошибку здесь вернуть некому: при следующем открытии часы всё равно
+    /// поднимутся по системному времени.
+    fn drop(&mut self) {
+        let _ = self.flush_hlc();
+    }
 }
 
 impl Replica {
@@ -209,6 +287,9 @@ impl Replica {
             name: crate::device_name(),
             data_dir: None,
             key: load_or_create_key(None)?,
+            hlc: Cell::new(None),
+            hlc_dirty: Cell::new(false),
+            exclusions: false,
         };
         replica.migrate()?;
         Ok(replica)
@@ -228,6 +309,9 @@ impl Replica {
             name: crate::device_name(),
             data_dir: Some(data_dir.to_path_buf()),
             key: load_or_create_key(Some(data_dir))?,
+            hlc: Cell::new(None),
+            hlc_dirty: Cell::new(false),
+            exclusions: false,
         };
         replica.migrate()?;
         Ok(replica)
@@ -272,7 +356,9 @@ impl Replica {
             "CREATE INDEX IF NOT EXISTS ops_by_path ON ops(dev, path)",
             [],
         )?;
-        self.set_meta("schema_version", "6")?;
+        if self.get_meta("schema_version")?.as_deref() != Some("6") {
+            self.set_meta("schema_version", "6")?;
+        }
         match self.get_meta("device_id")? {
             Some(stored) => {
                 // Идентичность устройства стабильна: она важнее аргумента CLI.
@@ -281,9 +367,15 @@ impl Replica {
             None => self.set_meta("device_id", &self.dev)?,
         }
         // Имя не входит в идентичность: его можно менять без миграции данных.
-        // Всегда берём текущее системное имя, чтобы переименование ПК было видно.
-        self.name = crate::device_name();
-        self.set_meta("device_name", &self.name)?;
+        // Записанное имя не перезаписываем при каждом открытии: лишние
+        // записи в SQLite мешают долгому сканированию на телефоне.
+        match self.get_meta("device_name")? {
+            Some(stored) if !stored.is_empty() => self.name = stored,
+            _ => {
+                self.name = crate::device_name();
+                self.set_meta("device_name", &self.name)?;
+            }
+        }
         Ok(())
     }
 
@@ -317,7 +409,7 @@ impl Replica {
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (id, json) in rows {
             let Ok(op) = Op::from_json(&json) else {
                 continue;
@@ -364,7 +456,13 @@ impl Replica {
     }
 
     pub fn set_root(&self, root: &Path) -> Result<()> {
-        self.set_meta("root", &root.to_string_lossy())
+        let value = root.to_string_lossy();
+        // Кэш содержимого привязан к путям относительно корня. При смене
+        // библиотеки старые пути к новой не относятся — начинаем кэш заново.
+        if self.get_meta("root")?.as_deref() != Some(value.as_ref()) {
+            self.conn.execute("DELETE FROM content_cache", [])?;
+        }
+        self.set_meta("root", &value)
     }
 
     pub fn root(&self) -> Result<Option<PathBuf>> {
@@ -448,7 +546,7 @@ impl Replica {
     pub fn plan_rows(&self) -> Result<Vec<PlanRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, blob, size, mtime_ns, added_at, deleted,
-                    local_present, local_ignored, synced_blob
+                    local_present, local_ignored, synced_blob, hlc_ms, hlc_counter, dev
              FROM entries ORDER BY path",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -462,6 +560,8 @@ impl Replica {
                 present: r.get::<_, i64>(6)? != 0,
                 ignored: r.get::<_, i64>(7)? != 0,
                 synced_blob: r.get(8)?,
+                hlc: Hlc::new(r.get::<_, i64>(9)? as u64, r.get::<_, u32>(10)?),
+                dev: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -550,7 +650,7 @@ impl Replica {
     /// Записать набор решений целиком. Вызывается после ручного изменения
     /// или после слияния с пиром.
     pub fn save_decisions(&mut self, peer_dev: &str, set: &DecisionSet) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM plan_decisions WHERE peer_dev = ?1",
             params![peer_dev],
@@ -600,25 +700,47 @@ impl Replica {
 
     /// Часы реплики. Хранятся в БД, иначе перезапуск процесса с «уехавшими
     /// назад» системными часами выпустил бы операции со старым HLC.
+    ///
+    /// Внутри скана часы держим в памяти и пишем один раз в конце: запись в
+    /// `meta` на каждый файл — это отдельная транзакция на ровном месте.
     fn load_hlc(&self) -> Result<Hlc> {
-        Ok(match self.get_meta("hlc")? {
+        if let Some(cached) = self.hlc.get() {
+            return Ok(cached);
+        }
+        let clock = match self.get_meta("hlc")? {
             Some(s) => match s.split_once('.') {
                 Some((ms, c)) => Hlc::new(ms.parse().unwrap_or(0), c.parse().unwrap_or(0)),
                 None => Hlc::default(),
             },
             None => Hlc::default(),
-        })
+        };
+        self.hlc.set(Some(clock));
+        Ok(clock)
     }
 
-    fn save_hlc(&self, hlc: &Hlc) -> Result<()> {
-        self.set_meta("hlc", &format!("{}.{}", hlc.ms, hlc.counter))
+    fn save_hlc(&self, hlc: &Hlc) {
+        self.hlc.set(Some(*hlc));
+        self.hlc_dirty.set(true);
+    }
+
+    /// Сохранить часы в БД, если с прошлого раза они менялись.
+    pub fn flush_hlc(&self) -> Result<()> {
+        if !self.hlc_dirty.get() {
+            return Ok(());
+        }
+        let Some(clock) = self.hlc.get() else {
+            return Ok(());
+        };
+        self.set_meta("hlc", &format!("{}.{}", clock.ms, clock.counter))?;
+        self.hlc_dirty.set(false);
+        Ok(())
     }
 
     /// Следующая метка для локальной операции.
     pub fn next_hlc(&mut self) -> Result<Hlc> {
         let mut clock = self.load_hlc()?;
         let ticked = clock.tick();
-        self.save_hlc(&ticked)?;
+        self.save_hlc(&ticked);
         Ok(ticked)
     }
 
@@ -649,7 +771,11 @@ impl Replica {
     pub fn observe_hlc(&mut self, remote: Hlc) -> Result<()> {
         let mut clock = self.load_hlc()?;
         clock.observe(remote);
-        self.save_hlc(&clock)
+        self.save_hlc(&clock);
+        // Чужие операции приходят пачками в сеансе, но часы после них должны
+        // быть видны другим соединениям сразу: иначе два сеанса могут выдать
+        // операции с одинаковым HLC.
+        self.flush_hlc()
     }
 
     // ---------------------------------------------------------------- apply
@@ -691,64 +817,39 @@ impl Replica {
         self.check_author_key(op)?;
         self.observe_hlc(op.hlc)?;
 
-        let tx = self.conn.transaction()?;
-        let known: Option<i64> = tx
-            .query_row("SELECT 1 FROM ops WHERE id = ?1", params![op.id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if known.is_some() {
-            return Ok(false);
-        }
-
-        tx.execute(
-            "INSERT INTO ops(id, op_json, hlc_ms, hlc_counter, dev, kind, path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                op.id,
-                op.to_json(),
-                op.hlc.ms as i64,
-                op.hlc.counter as i64,
-                op.dev,
-                op.kind.name(),
-                op_path(&op.kind)
-            ],
-        )?;
-
-        let changed = match &op.kind {
-            OpKind::EntryPut {
-                path,
-                blob,
-                size,
-                mtime_ns,
-                added_at,
-            } => upsert_entry(&tx, op, path, blob, *size, *mtime_ns, *added_at)?,
-            OpKind::EntryDel { path } => delete_entry(&tx, op, path, true)?,
-            OpKind::EntryMove {
-                from,
-                to,
-                blob,
-                size,
-                mtime_ns,
-                added_at,
-            } => {
-                // Перенос не отменяет наше «файл пропал»: решение по старому
-                // пути ещё должно найти трек по блобу уже под новым именем.
-                let a = delete_entry(&tx, op, from, false)?;
-                let b = upsert_entry(&tx, op, to, blob, *size, *mtime_ns, *added_at)?;
-                a || b
-            }
-            OpKind::BlobHave { blob, size } => {
-                tx.execute(
-                    "INSERT INTO blobs(blob, size) VALUES (?1, ?2)
-                     ON CONFLICT(blob) DO NOTHING",
-                    params![blob, *size as i64],
-                )?;
-                false
-            }
-        };
-
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = apply_in_tx(&tx, op)?;
         tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Применяет пачку собственных операций одной транзакцией. Скан порождает
+    /// сотни `EntryPut`, и отдельная транзакция на каждый — заметная доля
+    /// времени на телефоне.
+    ///
+    /// Часы здесь не наблюдают: все операции уже созданы `make_op`, значит
+    /// HLC монотонен. Подписи всё равно проверяем — это дешёвая страховка от
+    /// повреждённой операции.
+    pub fn apply_local_batch(&mut self, ops: &[Op]) -> Result<usize> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut changed = 0;
+        for op in ops {
+            anyhow::ensure!(op.is_intact(), "операция повреждена: {}", op.id);
+            anyhow::ensure!(op.verify_signature(), "неверная подпись операции {}", op.id);
+            anyhow::ensure!(
+                op.dev == self.dev,
+                "чужая операция в локальной пачке: {}",
+                op.dev
+            );
+            if apply_in_tx(&tx, op)? {
+                changed += 1;
+            }
+        }
+        tx.commit()?;
+        self.flush_hlc()?;
         Ok(changed)
     }
 
@@ -810,6 +911,16 @@ impl Replica {
             let path = op_path(&op.kind);
             op.dev != self.dev || path.is_empty() || live.contains(path)
         });
+        // Исключённые пути пиру не показываем вовсе: иначе у него появится
+        // строка плана, которую мы никогда не подтвердим. Журнал при этом не
+        // трогается, поэтому после отмены исключения операции уйдут как обычно.
+        if self.exclusions {
+            let excluded = self.exclusion_paths()?;
+            ops.retain(|op| {
+                let path = op_path(&op.kind);
+                path.is_empty() || !excluded.contains(path)
+            });
+        }
         Ok(ops)
     }
 
@@ -904,11 +1015,131 @@ impl Replica {
 
     /// Записи, которые физически есть на этом устройстве.
     pub fn local_entries(&self) -> Result<Vec<EntryRow>> {
-        Ok(self
-            .entries()?
-            .into_iter()
-            .filter(|e| !e.deleted && self.is_present(&e.path).unwrap_or(false))
-            .collect())
+        let mut stmt = self.conn.prepare(
+            "SELECT path, blob, size, mtime_ns, added_at
+             FROM entries WHERE deleted = 0 AND local_present = 1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(EntryRow {
+                path: r.get(0)?,
+                blob: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime_ns: r.get(3)?,
+                added_at: r.get::<_, i64>(4)? as u64,
+                deleted: false,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Всё состояние путей одним запросом: скан использует его вместо
+    /// `entry()`/`is_present()`/`is_ignored()` на каждый файл.
+    pub fn scan_rows(&self) -> Result<Vec<ScanRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, blob, size, mtime_ns, added_at, deleted,
+                    local_present, local_ignored, dev, synced_blob
+             FROM entries ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let deleted = r.get::<_, i64>(5)? != 0;
+            let row = ScanRow {
+                path: r.get(0)?,
+                blob: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime_ns: r.get(3)?,
+                added_at: r.get::<_, i64>(4)? as u64,
+                deleted,
+                present: r.get::<_, i64>(6)? != 0,
+                ignored: r.get::<_, i64>(7)? != 0,
+                dev: r.get(8)?,
+                synced_blob: r.get(9)?,
+            };
+            Ok(if deleted {
+                ScanRow {
+                    blob: String::new(),
+                    size: 0,
+                    mtime_ns: 0,
+                    added_at: 0,
+                    present: false,
+                    ..row
+                }
+            } else {
+                row
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // -------------------------------------------------------- content cache
+
+    /// Кэш содержимого: `path → (size, mtime_ns, blob)`. Переживает
+    /// `reset_history`, поэтому после сброса файлы не читаются заново.
+    pub fn content_cache(&self) -> Result<HashMap<String, (u64, i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, size, mtime_ns, blob FROM content_cache")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, i64>(1)? as u64,
+                    r.get(2)?,
+                    r.get::<_, String>(3)?,
+                ),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Записать в кэш пачку посчитанных блобов одной транзакцией.
+    pub fn save_content_cache(&mut self, rows: &[(String, u64, i64, String)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let now = Hlc::wall_ms() as i64;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO content_cache(path, size, mtime_ns, blob, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(path) DO UPDATE SET
+                     size = excluded.size,
+                     mtime_ns = excluded.mtime_ns,
+                     blob = excluded.blob,
+                     seen_at = excluded.seen_at",
+            )?;
+            for (path, size, mtime_ns, blob) in rows {
+                stmt.execute(params![path, *size as i64, mtime_ns, blob, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Убрать из кэша пути, которых больше нет на диске.
+    pub fn prune_content_cache(&mut self, keep: &HashSet<String>) -> Result<usize> {
+        let stale: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM content_cache")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|row| match row {
+                Ok(path) if !keep.contains(&path) => Some(Ok(path)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM content_cache WHERE path = ?1")?;
+            for path in &stale {
+                stmt.execute(params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(stale.len())
     }
 
     pub fn is_present(&self, path: &str) -> Result<bool> {
@@ -937,6 +1168,84 @@ impl Replica {
             "UPDATE entries SET local_present = 0 WHERE path = ?1",
             params![path],
         )?;
+        Ok(())
+    }
+
+    /// Пакетное обновление локальных флагов после скана. Сканер передаёт
+    /// только те пути, где состояние действительно меняется.
+    pub fn mark_presence_batch(
+        &mut self,
+        present: &[String],
+        unignore: &[String],
+        clear_pending: &[String],
+    ) -> Result<()> {
+        if present.is_empty() && unignore.is_empty() && clear_pending.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE entries SET local_present = 1
+                 WHERE path = ?1 AND local_present = 0",
+            )?;
+            for path in present {
+                stmt.execute(params![path])?;
+            }
+            let mut stmt = tx.prepare(
+                "UPDATE entries SET local_ignored = 0
+                 WHERE path = ?1 AND local_ignored != 0",
+            )?;
+            for path in unignore {
+                stmt.execute(params![path])?;
+            }
+            let mut stmt = tx.prepare("DELETE FROM pending_deletes WHERE path = ?1")?;
+            for path in clear_pending {
+                stmt.execute(params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Пакетная фиксация пропавших файлов: `record` — новые ожидающие
+    /// удаления, `forget` — собственные добавления, которые ещё никому не
+    /// показывались. Одной транзакцией вместо одной на путь.
+    pub fn apply_missing_batch(
+        &mut self,
+        hlc: Hlc,
+        record: &[(String, String)],
+        forget: &[String],
+    ) -> Result<()> {
+        if record.is_empty() && forget.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO pending_deletes(path, blob, detected_at, hlc_counter)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO NOTHING",
+            )?;
+            let mut absent = tx.prepare("UPDATE entries SET local_present = 0 WHERE path = ?1")?;
+            for (path, blob) in record {
+                insert.execute(params![path, blob, hlc.ms as i64, hlc.counter as i64])?;
+                absent.execute(params![path])?;
+            }
+
+            let mut del_entry = tx.prepare(
+                "DELETE FROM entries
+                 WHERE path = ?1 AND dev = ?2 AND deleted = 0 AND synced_blob = ''",
+            )?;
+            let mut del_pending = tx.prepare("DELETE FROM pending_deletes WHERE path = ?1")?;
+            let mut del_decision = tx.prepare("DELETE FROM plan_decisions WHERE path = ?1")?;
+            for path in forget {
+                if del_entry.execute(params![path, self.dev])? > 0 {
+                    del_pending.execute(params![path])?;
+                    del_decision.execute(params![path])?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1037,6 +1346,103 @@ impl Replica {
             .prepare("SELECT path FROM entries WHERE local_ignored = 1 ORDER BY path")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Снять только флаг `local_ignored`, не трогая присутствие файла.
+    /// Нужно при переходе на явные исключения: запись может лежать на диске.
+    pub fn clear_ignored(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET local_ignored = 0 WHERE path = ?1",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ exclusions
+
+    /// Включить ведение исключений (только ПК).
+    pub fn enable_exclusions(&mut self) {
+        self.exclusions = true;
+    }
+
+    pub fn exclusions_enabled(&self) -> bool {
+        self.exclusions
+    }
+
+    pub fn exclusions(&self) -> Result<Vec<ExclusionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, side, blob, size, mtime_ns, created_at
+             FROM exclusions ORDER BY side, path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExclusionRow {
+                path: r.get(0)?,
+                side: r.get(1)?,
+                blob: r.get(2)?,
+                size: r.get::<_, i64>(3)? as u64,
+                mtime_ns: r.get(4)?,
+                created_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn exclusion_paths(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM exclusions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn exclusion(&self, path: &str) -> Result<Option<ExclusionRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path, side, blob, size, mtime_ns, created_at
+                 FROM exclusions WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok(ExclusionRow {
+                        path: r.get(0)?,
+                        side: r.get(1)?,
+                        blob: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
+                        mtime_ns: r.get(4)?,
+                        created_at: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Запомнить путь вне синхронизации. Повторное решение по тому же пути
+    /// обновляет сторону и содержимое, но не создаёт дубликат.
+    pub fn add_exclusion(
+        &self,
+        path: &str,
+        side: &str,
+        blob: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO exclusions(path, side, blob, size, mtime_ns, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                 side = excluded.side,
+                 blob = excluded.blob,
+                 size = excluded.size,
+                 mtime_ns = excluded.mtime_ns,
+                 created_at = excluded.created_at",
+            params![path, side, blob, size as i64, mtime_ns, Hlc::wall_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_exclusion(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM exclusions WHERE path = ?1", params![path])?
+            > 0)
     }
 
     /// Все живые пути, ссылающиеся на блоб. Нужно, чтобы «удалить навсегда»
@@ -1144,7 +1550,10 @@ impl Replica {
     /// устройства, выбранную папку, токен и корзину. Нужно для проверки
     /// синхронизации с чистого листа: следующий скан заново построит индекс.
     pub fn reset_history(&mut self) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // `content_cache` намеренно не в списке: это локальное знание о файлах,
+        // а не история синхронизации. Благодаря ему «Проверить» после сброса
+        // не перечитывает всю библиотеку заново.
         for table in [
             "ops",
             "entries",
@@ -1199,7 +1608,7 @@ impl Replica {
         if !self.is_local_only(path)? {
             return Ok(false);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM entries WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
@@ -1222,19 +1631,24 @@ impl Replica {
             let rows = stmt.query_map(params![self.dev], |r| r.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut forgotten = 0;
-        for path in paths {
-            let tx = self.conn.transaction()?;
-            tx.execute("DELETE FROM pending_deletes WHERE path = ?1", params![path])?;
-            tx.execute(
-                "DELETE FROM entries WHERE path = ?1 AND dev = ?2 AND deleted = 0 AND synced_blob = ''",
-                params![path, self.dev],
-            )?;
-            tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
-            tx.commit()?;
-            forgotten += 1;
+        if paths.is_empty() {
+            return Ok(0);
         }
-        Ok(forgotten)
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut del_pending = tx.prepare("DELETE FROM pending_deletes WHERE path = ?1")?;
+            let mut del_entry = tx.prepare(
+                "DELETE FROM entries WHERE path = ?1 AND dev = ?2 AND deleted = 0 AND synced_blob = ''",
+            )?;
+            let mut del_decision = tx.prepare("DELETE FROM plan_decisions WHERE path = ?1")?;
+            for path in &paths {
+                del_pending.execute(params![path])?;
+                del_entry.execute(params![path, self.dev])?;
+                del_decision.execute(params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(paths.len())
     }
 
     /// Полные метаданные записи, даже если она удалена. Нужно корзине:
@@ -1336,6 +1750,12 @@ impl Replica {
         Ok(())
     }
 
+    /// Убирает все строки корзины. Файлы блобов чистит `vault::clear`,
+    /// потому что путь к каталогу знает только он.
+    pub fn clear_vault_rows(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM vault", [])?)
+    }
+
     pub fn vault_refs(&self, blob: &str) -> Result<usize> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM vault WHERE blob = ?1",
@@ -1372,6 +1792,67 @@ fn normalize_row(mut e: EntryRow) -> EntryRow {
         e.added_at = 0;
     }
     e
+}
+
+/// Общая часть `apply` и `apply_local_batch`: записать операцию в журнал и
+/// материализовать её в `entries`. Транзакцию открывает вызывающий.
+fn apply_in_tx(tx: &Transaction<'_>, op: &Op) -> Result<bool> {
+    let known: Option<i64> = tx
+        .query_row("SELECT 1 FROM ops WHERE id = ?1", params![op.id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if known.is_some() {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "INSERT INTO ops(id, op_json, hlc_ms, hlc_counter, dev, kind, path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            op.id,
+            op.to_json(),
+            op.hlc.ms as i64,
+            op.hlc.counter as i64,
+            op.dev,
+            op.kind.name(),
+            op_path(&op.kind)
+        ],
+    )?;
+
+    let changed = match &op.kind {
+        OpKind::EntryPut {
+            path,
+            blob,
+            size,
+            mtime_ns,
+            added_at,
+        } => upsert_entry(tx, op, path, blob, *size, *mtime_ns, *added_at)?,
+        OpKind::EntryDel { path } => delete_entry(tx, op, path, true)?,
+        OpKind::EntryMove {
+            from,
+            to,
+            blob,
+            size,
+            mtime_ns,
+            added_at,
+        } => {
+            // Перенос не отменяет наше «файл пропал»: решение по старому
+            // пути ещё должно найти трек по блобу уже под новым именем.
+            let a = delete_entry(tx, op, from, false)?;
+            let b = upsert_entry(tx, op, to, blob, *size, *mtime_ns, *added_at)?;
+            a || b
+        }
+        OpKind::BlobHave { blob, size } => {
+            tx.execute(
+                "INSERT INTO blobs(blob, size) VALUES (?1, ?2)
+                 ON CONFLICT(blob) DO NOTHING",
+                params![blob, *size as i64],
+            )?;
+            false
+        }
+    };
+    Ok(changed)
 }
 
 /// LWW: побеждает строго больший `(hlc_ms, hlc_counter, device_id)`.
@@ -1582,6 +2063,33 @@ mod tests {
     }
 
     #[test]
+    fn preview_ops_skip_excluded_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut replica = Replica::open(tmp.path(), "dev-a").unwrap();
+        replica.enable_exclusions();
+        let op = replica
+            .make_op(OpKind::EntryPut {
+                path: "a.mp3".into(),
+                blob: "b3:a".into(),
+                size: 1,
+                mtime_ns: 1,
+                added_at: 1,
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+        assert_eq!(replica.preview_ops(&HashMap::new()).unwrap().len(), 1);
+
+        replica
+            .add_exclusion("a.mp3", "local", "b3:a", 1, 1)
+            .unwrap();
+        // Пиру не показываем операцию по исключённому пути: иначе у него
+        // появится строка плана, которую мы никогда не подтвердим.
+        assert!(replica.preview_ops(&HashMap::new()).unwrap().is_empty());
+        // Но из журнала операция не исчезла: после отмены исключения уйдёт.
+        assert_eq!(replica.op_count().unwrap(), 1);
+    }
+
+    #[test]
     fn reset_history_keeps_identity_root_and_token() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("music");
@@ -1600,6 +2108,9 @@ mod tests {
             })
             .unwrap();
         replica.apply(&op).unwrap();
+        replica
+            .add_exclusion("a.mp3", "local", "b3:a", 1, 1)
+            .unwrap();
         assert_eq!(replica.op_count().unwrap(), 1);
         assert!(!replica.entries().unwrap().is_empty());
 
@@ -1607,6 +2118,9 @@ mod tests {
 
         assert_eq!(replica.op_count().unwrap(), 0);
         assert!(replica.entries().unwrap().is_empty());
+        // Исключение — намерение человека, а не история: сброс его не трогает.
+        assert_eq!(replica.exclusions().unwrap().len(), 1);
+        assert!(replica.exclusion_paths().unwrap().contains("a.mp3"));
         assert_eq!(replica.device_id(), "dev-a");
         assert_eq!(replica.root().unwrap().as_deref(), Some(root.as_path()));
         assert_eq!(replica.ensure_token().unwrap(), token);

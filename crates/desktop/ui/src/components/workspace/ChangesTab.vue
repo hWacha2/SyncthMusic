@@ -158,7 +158,7 @@ watch(activeEntries, (list) => {
 // ---------------------------------------------------------------- массовые решения
 
 const ACTION_SETS = {
-  deletion: ['keep_in_library', 'delete_everywhere'],
+  deletion: ['keep_in_library', 'only_here', 'delete_everywhere'],
   addition: ['accept', 'only_here', 'delete_everywhere'],
   conflict: ['keep', 'accept', 'keep_both'],
 };
@@ -172,18 +172,25 @@ const bulkActions = computed(() => {
 
 function bulkLabel(action) {
   if (action === 'accept') {
-    return selectedEntries.value.some((entry) => entry.type === 'conflict')
-      ? t('workspace.attention.keep_phone')
-      : t('workspace.attention.transfer');
+    if (selectedEntries.value.some((entry) => entry.type === 'conflict')) {
+      return t('workspace.attention.keep_phone');
+    }
+    const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
+    if (sides.size === 1 && sides.has('remote')) return t('workspace.attention.copy_to_pc');
+    if (sides.size === 1 && sides.has('local')) return t('workspace.attention.copy_to_phone');
+    return t('workspace.attention.copy_to_phone');
   }
   if (action === 'only_here') {
-    const sidesChosen = new Set(
-      selectedEntries.value
-        .filter((entry) => entry.type === 'addition')
-        .map((entry) => entry.change?.side),
-    );
-    if (sidesChosen.size === 1) {
-      return sidesChosen.has('remote')
+    const kinds = new Set(selectedEntries.value.map((entry) => entry.type));
+    if (kinds.size > 1) return t('workspace.attention.only_one_side');
+    const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
+    if (sides.size === 1) {
+      // Для удаления «только здесь» — сторона, где файл остался, то есть
+      // противоположная месту удаления.
+      const addition = kinds.has('addition');
+      const remote = sides.has('remote');
+      const keepsPhone = addition ? remote : !remote;
+      return keepsPhone
         ? t('workspace.attention.keep_phone_only')
         : t('workspace.attention.keep_pc_only');
     }
@@ -193,14 +200,29 @@ function bulkLabel(action) {
     const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
     if (sides.size === 1) {
       return sides.has('local')
-        ? t('workspace.attention.restore_from_phone')
-        : t('workspace.attention.keep_pc');
+        ? t('workspace.attention.restore_to_pc')
+        : t('workspace.attention.restore_to_phone');
     }
     return t('decision.keep_in_library');
   }
   if (action === 'keep') return t('workspace.attention.keep_pc');
   if (action === 'keep_both') return t('workspace.attention.keep_both');
-  if (action === 'delete_everywhere') return t('workspace.attention.delete_everywhere');
+  if (action === 'delete_everywhere') {
+    const kinds = new Set(selectedEntries.value.map((entry) => entry.type));
+    if (kinds.size > 1) return t('workspace.attention.delete_files');
+    const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
+    if (sides.size === 1) {
+      const addition = kinds.has('addition');
+      const remote = sides.has('remote');
+      // Добавление удаляется там, где появилось; удаление — там, где файл
+      // ещё лежит, то есть на противоположной стороне.
+      const deletesPhone = addition ? remote : !remote;
+      return deletesPhone
+        ? t('workspace.attention.delete_from_phone')
+        : t('workspace.attention.delete_from_pc');
+    }
+    return t('workspace.attention.delete_files');
+  }
   return action;
 }
 
@@ -209,7 +231,7 @@ async function applyBulk(action) {
   const paths = selectedEntries.value.map((entry) => entry.path);
   if (!paths.length) return;
   if (action === 'delete_everywhere') {
-    askBulkDelete(paths);
+    askBulkDelete(paths, bulkLabel(action));
     return;
   }
   if (await decideMany(paths, action)) selected.value = [];

@@ -4,15 +4,39 @@
 //! наблюдает и создаёт операции.
 
 use crate::hlc::Hlc;
-use crate::op::OpKind;
+use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::{EntryRow, Replica};
+use crate::store::{Replica, ScanRow};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+
+/// Этап сканирования — интерфейс показывает по нему подпись и полосу.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanStage {
+    /// Обходим папку и считаем файлы; `total` ещё неизвестен.
+    Walking,
+    /// Сверяем содержимое; `total` — сколько файлов нашлось.
+    Hashing,
+}
+
+/// Прогресс сканирования. `total == 0` на этапе `Walking`: список файлов
+/// ещё не собран, поэтому полоса будет неопределённой.
+///
+/// Байты нужны интерфейсу: файлы сильно разного размера, и по штукам полоса
+/// может стоять на месте, хотя чтение идёт. `total_bytes == 0` — размер ещё
+/// неизвестен.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanProgress {
+    pub stage: ScanStage,
+    pub done: usize,
+    pub total: usize,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanReport {
@@ -29,6 +53,19 @@ pub struct ScanReport {
 }
 
 pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
+    scan_with_progress(root, replica, &mut |_| {})
+}
+
+/// Сколько собственных операций накапливаем до записи одной транзакцией.
+const OP_BATCH: usize = 128;
+
+/// То же, что [`scan`], но сообщает о ходе обхода и хеширования. Колбэк
+/// вызывается на каждом файле; вызывающий сам решает, как часто обновлять UI.
+pub fn scan_with_progress(
+    root: &Path,
+    replica: &mut Replica,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> Result<ScanReport> {
     anyhow::ensure!(
         root.is_dir(),
         "корень библиотеки не найден: {}",
@@ -36,12 +73,17 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
     );
 
     let mut report = ScanReport::default();
+    // Пути вне синхронизации: их нельзя ни хешировать, ни превращать в
+    // операции, ни считать пропавшими. Иначе исключение вернулось бы в план
+    // при следующей же проверке.
+    let excluded = replica.exclusion_paths()?;
 
     // Сначала собираем список файлов. Иначе нельзя отличить переименование
     // `Foo.flac → foo.flac` от двух реально существующих файлов, различающихся
     // только регистром: к моменту обработки второго первый мог быть ещё не
     // встречен обходом.
     let mut files: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut total_bytes: u64 = 0;
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -63,56 +105,150 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
             Err(_) => continue,
         };
         match path::normalize(&rel_raw) {
-            Ok(rel) => files.push((abs, rel)),
+            Ok(rel) => {
+                if excluded.contains(&rel) {
+                    continue;
+                }
+                if let Ok(meta) = abs.metadata() {
+                    total_bytes = total_bytes.saturating_add(meta.len());
+                }
+                files.push((abs, rel));
+                progress(ScanProgress {
+                    stage: ScanStage::Walking,
+                    done: files.len(),
+                    total: 0,
+                    done_bytes: total_bytes,
+                    total_bytes: 0,
+                });
+            }
             Err(e) => tracing::warn!("некорректный путь {rel_raw}: {e}"),
         }
     }
 
+    let total = files.len();
+    progress(ScanProgress {
+        stage: ScanStage::Hashing,
+        done: 0,
+        total,
+        done_bytes: 0,
+        total_bytes,
+    });
+
     let seen: BTreeSet<String> = files.iter().map(|(_, rel)| rel.clone()).collect();
 
+    // Всё состояние путей читаем один раз. Раньше на каждый файл делались
+    // отдельные SELECT'ы `entry`/`is_present`/`is_ignored`, а на телефоне это
+    // заметная часть времени скана.
+    let mut rows: HashMap<String, ScanRow> = replica
+        .scan_rows()?
+        .into_iter()
+        .map(|row| (row.path.clone(), row))
+        .collect();
+    let pending: HashSet<String> = replica
+        .pending_deletes()?
+        .into_iter()
+        .map(|delete| delete.path)
+        .collect();
+    let cache = replica.content_cache()?;
+    let my_dev = replica.device_id().to_string();
+
     // Живые локальные записи по блобу — кандидаты в «старое имя» переименования.
-    let mut by_blob: HashMap<String, Vec<EntryRow>> = HashMap::new();
-    let mut by_key: HashMap<String, Vec<EntryRow>> = HashMap::new();
-    for e in replica.local_entries()? {
-        by_blob.entry(e.blob.clone()).or_default().push(e.clone());
-        by_key.entry(path::key(&e.path)).or_default().push(e);
+    let mut by_blob: HashMap<String, Vec<ScanRow>> = HashMap::new();
+    let mut by_key: HashMap<String, Vec<ScanRow>> = HashMap::new();
+    for row in rows.values() {
+        if row.deleted || !row.present || excluded.contains(&row.path) {
+            continue;
+        }
+        by_blob.entry(row.blob.clone()).or_default().push(row.clone());
+        by_key
+            .entry(path::key(&row.path))
+            .or_default()
+            .push(row.clone());
     }
     let mut moved_from: HashSet<String> = HashSet::new();
 
-    for (abs, rel) in files {
+    let mut hashed: Vec<(String, u64, i64, String)> = Vec::new();
+    let mut ops: Vec<Op> = Vec::new();
+    let mut hash_buf = vec![0u8; 1024 * 1024];
+    let mut done_bytes: u64 = 0;
+
+    for (index, (abs, rel)) in files.into_iter().enumerate() {
+        progress(ScanProgress {
+            stage: ScanStage::Hashing,
+            done: index,
+            total,
+            done_bytes,
+            total_bytes,
+        });
         let before = match abs.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
         let size = before.len();
         let mtime_before = mtime_ns(&before);
+        done_bytes = done_bytes.saturating_add(size);
 
-        let existing = replica.entry(&rel)?;
+        let existing = rows.get(&rel).cloned();
+
+        // Быстрый путь 1: запись уже есть и размер с mtime не менялись.
+        // Блоб при этом кладём в кэш содержимого — для будущего сброса истории.
         if let Some(e) = &existing {
             if !e.deleted && e.size == size && e.mtime_ns == mtime_before {
                 report.unchanged += 1;
+                hashed.push((rel, size, mtime_before, e.blob.clone()));
                 continue;
             }
         }
 
-        let blob = match hash_file(&abs) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("не удалось прочитать {}: {e}", abs.display());
-                report.skipped_busy += 1;
-                continue;
+        // Быстрый путь 2: тот же размер и mtime уже встречались. Файл не
+        // читаем — берём блоб из кэша, который переживает `reset_history`.
+        let cached = cache
+            .get(&rel)
+            .filter(|(cached_size, cached_mtime, _)| {
+                *cached_size == size && *cached_mtime == mtime_before
+            })
+            .map(|(_, _, blob)| blob.clone());
+
+        let blob = match cached {
+            Some(blob) => {
+                // Ничего не писали, но файл мог измениться параллельно.
+                let after = match abs.metadata() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        report.skipped_busy += 1;
+                        continue;
+                    }
+                };
+                if after.len() != size || mtime_ns(&after) != mtime_before {
+                    report.skipped_busy += 1;
+                    continue;
+                }
+                blob
+            }
+            None => {
+                let blob = match hash_file_with(&abs, &mut hash_buf) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("не удалось прочитать {}: {e}", abs.display());
+                        report.skipped_busy += 1;
+                        continue;
+                    }
+                };
+
+                // Файл мог измениться прямо во время хеширования (плеер пишет теги).
+                let after = match abs.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if after.len() != size || mtime_ns(&after) != mtime_before {
+                    report.skipped_busy += 1;
+                    continue;
+                }
+                blob
             }
         };
 
-        // Файл мог измениться прямо во время хеширования (плеер пишет теги).
-        let after = match abs.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if after.len() != size || mtime_ns(&after) != mtime_before {
-            report.skipped_busy += 1;
-            continue;
-        }
+        hashed.push((rel.clone(), size, mtime_before, blob.clone()));
 
         let is_new = existing.as_ref().map(|e| e.deleted).unwrap_or(true);
 
@@ -130,11 +266,30 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
                     mtime_ns: mtime_before,
                     added_at: cand.added_at,
                 };
-                let op = replica.make_op(kind)?;
-                replica.apply(&op)?;
+                ops.push(replica.make_op(kind)?);
+                if let Some(from) = rows.get_mut(&cand.path) {
+                    from.deleted = true;
+                    from.present = false;
+                }
+                rows.insert(
+                    rel.clone(),
+                    ScanRow {
+                        path: rel.clone(),
+                        blob: blob.clone(),
+                        size,
+                        mtime_ns: mtime_before,
+                        added_at: cand.added_at,
+                        deleted: false,
+                        present: false,
+                        ignored: false,
+                        dev: my_dev.clone(),
+                        synced_blob: String::new(),
+                    },
+                );
                 moved_from.insert(cand.path.clone());
                 report.renamed += 1;
                 report.ops_emitted += 1;
+                flush_ops(replica, &mut ops)?;
                 continue;
             }
             // Тот же ключ, но оба файла реально лежат на диске — это не перенос,
@@ -167,10 +322,13 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
                         mtime_ns: mtime_before,
                         added_at: e.added_at,
                     };
-                    let op = replica.make_op(kind)?;
-                    replica.apply(&op)?;
+                    ops.push(replica.make_op(kind)?);
+                    if let Some(row) = rows.get_mut(&rel) {
+                        row.mtime_ns = mtime_before;
+                    }
                     report.changed += 1;
                     report.ops_emitted += 1;
+                    flush_ops(replica, &mut ops)?;
                     continue;
                 }
             }
@@ -181,31 +339,89 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
             .map(|e| e.added_at)
             .unwrap_or_else(Hlc::wall_ms);
         let kind = OpKind::EntryPut {
-            path: rel,
-            blob,
+            path: rel.clone(),
+            blob: blob.clone(),
             size,
             mtime_ns: mtime_before,
             added_at,
         };
-        let op = replica.make_op(kind)?;
-        replica.apply(&op)?;
+        ops.push(replica.make_op(kind)?);
+        match rows.get_mut(&rel) {
+            Some(row) => {
+                row.blob = blob;
+                row.size = size;
+                row.mtime_ns = mtime_before;
+                row.added_at = added_at;
+                row.deleted = false;
+                row.dev = my_dev.clone();
+                row.synced_blob = String::new();
+            }
+            None => {
+                rows.insert(
+                    rel.clone(),
+                    ScanRow {
+                        path: rel.clone(),
+                        blob,
+                        size,
+                        mtime_ns: mtime_before,
+                        added_at,
+                        deleted: false,
+                        present: false,
+                        ignored: false,
+                        dev: my_dev.clone(),
+                        synced_blob: String::new(),
+                    },
+                );
+            }
+        }
         if is_new {
             report.added += 1;
         } else {
             report.changed += 1;
         }
         report.ops_emitted += 1;
+        flush_ops(replica, &mut ops)?;
     }
+
+    finish_ops(replica, &mut ops)?;
+    replica.flush_hlc()?;
+
+    progress(ScanProgress {
+        stage: ScanStage::Hashing,
+        done: total,
+        total,
+        done_bytes: total_bytes.max(done_bytes),
+        total_bytes,
+    });
+
+    // Кэш содержимого: всё, что реально посчитали или подтвердили по mtime.
+    // Он не входит в историю синхронизации и не стирается при её сбросе.
+    replica.save_content_cache(&hashed)?;
+    let keep: HashSet<String> = seen.iter().cloned().collect();
+    replica.prune_content_cache(&keep)?;
 
     // Всё, что реально лежит на диске: локально присутствует, ожидание
     // удаления снимается, ручное исключение снимается (файл вернули).
+    let mut present = Vec::new();
+    let mut unignore = Vec::new();
+    let mut clear_pending = Vec::new();
     for rel in &seen {
-        if replica.is_ignored(rel)? {
-            replica.set_ignored(rel, false)?;
+        if excluded.contains(rel) {
+            continue;
         }
-        replica.clear_pending_delete(rel)?;
-        replica.mark_present(rel)?;
+        if let Some(row) = rows.get(rel) {
+            if !row.deleted && !row.present {
+                present.push(rel.clone());
+            }
+            if row.ignored {
+                unignore.push(rel.clone());
+            }
+        }
+        if pending.contains(rel) {
+            clear_pending.push(rel.clone());
+        }
     }
+    replica.mark_presence_batch(&present, &unignore, &clear_pending)?;
 
     // Пропавшие файлы: только те, что раньше были здесь. «Ещё не скачано» и
     // «намеренно не держим здесь» удалением не считается. Ничего не удаляем.
@@ -218,20 +434,46 @@ pub fn scan(root: &Path, replica: &mut Replica) -> Result<ScanReport> {
         replica.prune_ghost_deletes()?;
     }
     let hlc = replica.next_hlc()?;
-    for e in replica.local_entries()? {
-        if e.deleted || seen.contains(&e.path) || replica.is_ignored(&e.path)? {
+    let mut record = Vec::new();
+    let mut forget = Vec::new();
+    for row in rows.values() {
+        if row.deleted
+            || !row.present
+            || seen.contains(&row.path)
+            || row.ignored
+            || excluded.contains(&row.path)
+        {
             continue;
         }
-        if has_peers && replica.is_local_only(&e.path)? {
-            replica.forget_never_shared(&e.path)?;
+        if has_peers && row.dev == my_dev && row.synced_blob.is_empty() {
+            forget.push(row.path.clone());
             continue;
         }
-        replica.record_pending_delete(&e.path, &e.blob, hlc)?;
-        replica.mark_absent(&e.path)?;
-        report.missing.push(e.path);
+        record.push((row.path.clone(), row.blob.clone()));
+        report.missing.push(row.path.clone());
     }
+    replica.apply_missing_batch(hlc, &record, &forget)?;
+    replica.flush_hlc()?;
 
     Ok(report)
+}
+
+/// Записать накопленные операции, когда их стало достаточно много.
+fn flush_ops(replica: &mut Replica, ops: &mut Vec<Op>) -> Result<()> {
+    if ops.len() >= OP_BATCH {
+        replica.apply_local_batch(ops)?;
+        ops.clear();
+    }
+    Ok(())
+}
+
+/// Дописать остаток перед концом скана.
+fn finish_ops(replica: &mut Replica, ops: &mut Vec<Op>) -> Result<()> {
+    if !ops.is_empty() {
+        replica.apply_local_batch(ops)?;
+        ops.clear();
+    }
+    Ok(())
 }
 
 /// Ищет живой локальный путь с тем же блобом, которого больше нет в `seen`.
@@ -242,10 +484,10 @@ fn rename_candidate<'a>(
     new_path: &str,
     blob: &str,
     seen: &BTreeSet<String>,
-    by_blob: &'a HashMap<String, Vec<EntryRow>>,
-    by_key: &'a HashMap<String, Vec<EntryRow>>,
+    by_blob: &'a HashMap<String, Vec<ScanRow>>,
+    by_key: &'a HashMap<String, Vec<ScanRow>>,
     moved_from: &HashSet<String>,
-) -> Option<&'a EntryRow> {
+) -> Option<&'a ScanRow> {
     let new_key = path::key(new_path);
 
     // Сначала путь, совпадающий с точностью до регистра/NFC. Он не должен
@@ -301,11 +543,16 @@ pub fn mtime_ns_public(meta: &std::fs::Metadata) -> i64 {
 }
 
 pub fn hash_file(path: &Path) -> Result<String> {
+    let mut buf = vec![0u8; 1024 * 1024];
+    hash_file_with(path, &mut buf)
+}
+
+/// Хеширование с переиспользуемым буфером: в скане он один на всю папку.
+fn hash_file_with(path: &Path, buf: &mut [u8]) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("открытие {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file.read(buf)?;
         if n == 0 {
             break;
         }
