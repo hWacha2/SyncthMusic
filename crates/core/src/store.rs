@@ -183,6 +183,18 @@ pub struct ScanRow {
     pub synced_blob: String,
 }
 
+/// Перенос, уже записанный в локальный журнал. Нужен плану, чтобы отличить
+/// переименование от добавления: в `entries` от переноса остаются только
+/// «старый путь удалён» и «новый путь жив», а связь между ними хранится в
+/// операции `entry_move`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalMove {
+    pub from: String,
+    pub to: String,
+    pub blob: String,
+    pub hlc: Hlc,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDelete {
     pub path: String,
@@ -964,25 +976,78 @@ impl Replica {
             .query_row("SELECT COUNT(*) FROM ops", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
-    /// HLC последнего удаления, которое это устройство отправило по пути.
-    /// По нему видно, успел ли пир применить наше удаление: его watermark
-    /// должен покрывать эту метку.
-    pub fn last_delete_hlc(&self, dev: &str, path: &str) -> Result<Option<Hlc>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT hlc_ms, hlc_counter FROM ops
-                 WHERE dev = ?1 AND path = ?2 AND kind = 'entry_del'
-                 ORDER BY hlc_ms DESC, hlc_counter DESC LIMIT 1",
-                params![dev, path],
-                |r| {
-                    Ok(Hlc::new(
-                        r.get::<_, i64>(0)? as u64,
-                        r.get::<_, i64>(1)? as u32,
-                    ))
-                },
-            )
-            .optional()?)
+    /// Переносы, которые это устройство записало в журнал. Порядок — по HLC и
+    /// затем `id`, поэтому при нескольких переносах в один и тот же путь
+    /// побеждает последний.
+    pub fn local_moves(&self, dev: &str) -> Result<Vec<LocalMove>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT op_json, hlc_ms, hlc_counter FROM ops
+             WHERE dev = ?1 AND kind = 'entry_move'
+             ORDER BY hlc_ms, hlc_counter, id",
+        )?;
+        let rows = stmt.query_map(params![dev], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut moves = Vec::new();
+        for row in rows {
+            let (json, ms, counter) = row?;
+            let Ok(op) = Op::from_json(&json) else {
+                continue;
+            };
+            if let OpKind::EntryMove { from, to, blob, .. } = op.kind {
+                moves.push(LocalMove {
+                    from,
+                    to,
+                    blob,
+                    hlc: Hlc::new(ms as u64, counter as u32),
+                });
+            }
+        }
+        Ok(moves)
+    }
+
+    /// HLC последней операции, которая убрала путь: удаления или источника
+    /// переноса. У `entry_move` колонка `path` указывает на цель, поэтому
+    /// источник приходится доставать из `op_json`. По этой метке видно,
+    /// успел ли пир применить наше удаление/перенос: его watermark должен
+    /// покрывать HLC.
+    pub fn removal_hlcs(&self, dev: &str) -> Result<HashMap<String, Hlc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT op_json, hlc_ms, hlc_counter FROM ops
+             WHERE dev = ?1 AND kind IN ('entry_del', 'entry_move')",
+        )?;
+        let rows = stmt.query_map(params![dev], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut map: HashMap<String, Hlc> = HashMap::new();
+        for row in rows {
+            let (json, ms, counter) = row?;
+            let Ok(op) = Op::from_json(&json) else {
+                continue;
+            };
+            let path = match op.kind {
+                OpKind::EntryDel { path } => path,
+                OpKind::EntryMove { from, .. } => from,
+                _ => continue,
+            };
+            let hlc = Hlc::new(ms as u64, counter as u32);
+            map.entry(path)
+                .and_modify(|current| {
+                    if hlc > *current {
+                        *current = hlc;
+                    }
+                })
+                .or_insert(hlc);
+        }
+        Ok(map)
     }
 
     /// Все записи, включая tombstone'ы (нужно для сверки реплик).

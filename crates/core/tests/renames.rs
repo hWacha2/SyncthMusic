@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use syncth_core::plan::{self, ChangeKind};
 use syncth_core::{resolve, scan, Replica};
 use tempfile::TempDir;
 
@@ -124,6 +125,36 @@ fn case_only_rename_with_a_tag_edit_is_still_a_move() {
     );
     resolve::prune_deleted_files(&mut a, &ctx.root).unwrap();
     assert!(ctx.root.join("Album/01.FLAC").is_file());
+}
+
+#[test]
+fn scanned_rename_becomes_one_moved_change_in_the_plan() {
+    let ctx = setup(&[("Telegram/10-Panda-Eyes-Ily.flac", b"panda")]);
+    let mut a = open(&ctx);
+    scan::scan(&ctx.root, &mut a).unwrap();
+    // Первая синхронизация прошла: путь стал общей базой.
+    a.confirm_synced().unwrap();
+
+    rename(
+        &ctx,
+        "Telegram/10-Panda-Eyes-Ily.flac",
+        "Telegram/10-Panda-Eyes-Ily - копия.flac",
+    );
+    let report = scan::scan(&ctx.root, &mut a).unwrap();
+    assert_eq!(report.renamed, 1, "{report:?}");
+
+    let plan = plan::build(&a, "dev-phone", "Phone", &[]).unwrap();
+    assert_eq!(plan.local.len(), 1, "перенос не должен выглядеть добавлением");
+    assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+    assert_eq!(
+        plan.local[0].from.as_deref(),
+        Some("Telegram/10-Panda-Eyes-Ily.flac"),
+        "в плане должен быть старый путь"
+    );
+    assert_eq!(
+        plan.local[0].path,
+        "Telegram/10-Panda-Eyes-Ily - копия.flac"
+    );
 }
 
 #[test]

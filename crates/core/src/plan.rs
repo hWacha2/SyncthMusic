@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
-use crate::store::{PlanRow, Replica};
+use crate::store::{LocalMove, PlanRow, Replica};
 
 /// Сколько живёт план. Просроченный план не применяется: состояние могло
 /// измениться, а решения относятся к конкретным блобам.
@@ -554,6 +554,49 @@ pub fn build_with_peer_have(
         .map(|row| (row.path, (row.blob, row.detected_at)))
         .collect();
     let remote = remote_state(remote_ops);
+    let me = replica.device_id();
+    let local_moves = replica.local_moves(me)?;
+    let removals = replica.removal_hlcs(me)?;
+
+    // Последний перенос в каждый путь. В `entries` связи «откуда» нет,
+    // поэтому без журнала новый путь неотличим от добавления.
+    let mut move_to: HashMap<&str, &LocalMove> = HashMap::new();
+    for mv in &local_moves {
+        move_to.insert(mv.to.as_str(), mv);
+    }
+
+    // Источники переносов, которые всё ещё описывают текущее содержимое цели.
+    // Их удаление не показываем отдельной строкой: иначе «принять перенос» и
+    // «оставить удаление» противоречили бы друг другу. Если после переноса
+    // содержимое изменилось, это уже не перенос, и старый путь должен
+    // остаться в плане обычным удалением — иначе на телефоне будет дубль.
+    let mut move_sources: HashSet<&str> = HashSet::new();
+    for mv in &local_moves {
+        let Some(target) = by_path.get(mv.to.as_str()) else {
+            continue;
+        };
+        if target.deleted || target.ignored || excluded.contains(&target.path) {
+            continue;
+        }
+        let still_describes_target = mv.blob == target.blob
+            && (mv.hlc == target.hlc || target.synced_blob.is_empty());
+        if !still_describes_target {
+            continue;
+        }
+        // Цепочка a→b→c: цель у c, но старый файл на телефоне может называться
+        // a. Пока блоб тот же, все промежуточные источники — часть переноса.
+        let mut current = mv;
+        loop {
+            move_sources.insert(current.from.as_str());
+            let Some(previous) = move_to.get(current.from.as_str()).copied() else {
+                break;
+            };
+            if previous.blob != current.blob {
+                break;
+            }
+            current = previous;
+        }
+    }
 
     let mut local = Vec::new();
     let mut conflicts = Vec::new();
@@ -564,6 +607,11 @@ pub fn build_with_peer_have(
         if row.ignored || excluded.contains(&row.path) {
             // «Только здесь» или явное исключение: путь не участвует в плане
             // ни с одной стороны, пока человек не вернёт его в синхронизацию.
+            continue;
+        }
+        if row.deleted && move_sources.contains(row.path.as_str()) {
+            // Старый путь уже описан строкой переноса — отдельное удаление
+            // заставило бы выбирать между двумя решениями по одному событию.
             continue;
         }
         if let Some((blob, _)) = pending.get(&row.path) {
@@ -600,7 +648,11 @@ pub fn build_with_peer_have(
                 .get(&row.path)
                 .is_some_and(|state| state.present)
                 || (!peer_deleted
-                    && !peer_applied_delete(replica, peer_have, &row.path)?);
+                    && !peer_applied_delete(
+                        peer_have,
+                        me,
+                        removals.get(&row.path).copied(),
+                    ));
             if peer_has_it && !row.synced_blob.is_empty() {
                 local.push(Change {
                     path: row.path.clone(),
@@ -625,10 +677,27 @@ pub fn build_with_peer_have(
                 && remote
                     .get(&row.path)
                     .is_some_and(|state| state.present && state.blob == row.blob);
+
+            // Сканер уже распознал переименование и записал `entry_move`.
+            // Проверяем, что перенос всё ещё относится к текущему содержимому:
+            // если путь позже переписали другим блобом, это обычная правка.
+            let moved_from = move_to.get(row.path.as_str()).and_then(|mv| {
+                let source_is_gone = by_path
+                    .get(mv.from.as_str())
+                    .map_or(true, |source| source.deleted);
+                (mv.from != row.path
+                    && mv.blob == row.blob
+                    && source_is_gone
+                    && (mv.hlc == row.hlc || row.synced_blob.is_empty()))
+                    .then(|| mv.from.clone())
+            });
+
             local.push(Change {
                 path: row.path.clone(),
-                from: None,
-                kind: if row.synced_blob.is_empty() {
+                from: moved_from.clone(),
+                kind: if moved_from.is_some() {
+                    ChangeKind::Moved
+                } else if row.synced_blob.is_empty() {
                     ChangeKind::Added
                 } else {
                     ChangeKind::Updated
@@ -900,21 +969,20 @@ struct RemoteState {
 /// Последнее состояние каждого пути по присланным операциям. Порядок —
 /// HLC и затем `dev`, чтобы результат не зависел от порядка доставки.
 fn peer_applied_delete(
-    replica: &Replica,
     peer_have: Option<&HashMap<String, (i64, i64)>>,
-    path: &str,
-) -> Result<bool> {
+    me: &str,
+    removal: Option<Hlc>,
+) -> bool {
     let Some(have) = peer_have else {
-        return Ok(false);
+        return false;
     };
-    let Some(hlc) = replica.last_delete_hlc(replica.device_id(), path)? else {
+    let Some(hlc) = removal else {
         // Своего удаления мы не отправляли: запись закрылась операцией пира,
         // а он про неё уже знает.
-        return Ok(true);
+        return true;
     };
-    Ok(have
-        .get(replica.device_id())
-        .is_some_and(|&(ms, counter)| Hlc::new(ms as u64, counter as u32) >= hlc))
+    have.get(me)
+        .is_some_and(|&(ms, counter)| Hlc::new(ms as u64, counter as u32) >= hlc)
 }
 
 fn remote_state(ops: &[Op]) -> BTreeMap<String, RemoteState> {
@@ -1032,6 +1100,24 @@ mod tests {
         replica.confirm_synced().unwrap();
     }
 
+    /// То, что делает сканер, увидев переименование: одна операция переноса
+    /// и обновлённые флаги присутствия. Файл на диске здесь не нужен.
+    fn apply_move(replica: &mut Replica, from: &str, to: &str, blob: &str) {
+        let op = replica
+            .make_op(OpKind::EntryMove {
+                from: from.into(),
+                to: to.into(),
+                blob: blob.into(),
+                size: blob.len() as u64,
+                mtime_ns: 2,
+                added_at: 1,
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+        replica.mark_present(to).unwrap();
+        replica.mark_absent(from).unwrap();
+    }
+
     #[test]
     fn identical_replicas_produce_empty_plan() {
         let mut a = Replica::in_memory("dev-a").unwrap();
@@ -1072,6 +1158,148 @@ mod tests {
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].kind, ChangeKind::Added);
         assert_eq!(plan.effective_decision("new.flac"), Some(Decision::Accept));
+    }
+
+    #[test]
+    fn local_rename_is_one_change_with_source() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "Telegram/old.flac", "b3:aa");
+        apply_move(&mut a, "Telegram/old.flac", "Telegram/new.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1, "перенос не должен двоиться");
+        assert_eq!(plan.local[0].path, "Telegram/new.flac");
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(
+            plan.local[0].from.as_deref(),
+            Some("Telegram/old.flac"),
+            "старый путь должен быть виден в плане"
+        );
+        assert_eq!(
+            plan.effective_decision("Telegram/new.flac"),
+            Some(Decision::Accept)
+        );
+    }
+
+    #[test]
+    fn local_rename_while_phone_still_has_the_old_path() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "old.flac", "b3:aa");
+        apply_move(&mut a, "old.flac", "new.flac", "b3:aa");
+
+        // Телефон присылает своё старое добавление: у него всё ещё old.flac.
+        let plan = build(&a, "dev-b", "Phone", &[remote(put("old.flac", "b3:aa"), 10)])
+            .unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].from.as_deref(), Some("old.flac"));
+        assert!(plan.remote.is_empty(), "старая версия телефона — не его правка");
+    }
+
+    #[test]
+    fn local_move_to_another_folder_is_moved() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "Album/01.flac", "b3:aa");
+        apply_move(&mut a, "Album/01.flac", "Compilations/01.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].path, "Compilations/01.flac");
+        assert_eq!(plan.local[0].from.as_deref(), Some("Album/01.flac"));
+    }
+
+    #[test]
+    fn local_move_over_an_existing_target_is_still_a_move() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "source.flac", "b3:source");
+        synced(&mut a, "target.flac", "b3:target");
+        apply_move(&mut a, "source.flac", "target.flac", "b3:source");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1, "занятая цель не должна давать лишних строк");
+        assert_eq!(plan.local[0].path, "target.flac");
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].from.as_deref(), Some("source.flac"));
+        assert_eq!(plan.local[0].blob, "b3:source");
+    }
+
+    #[test]
+    fn renamed_then_deleted_still_reports_the_old_path_as_deleted() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "old.flac", "b3:aa");
+        apply_move(&mut a, "old.flac", "new.flac", "b3:aa");
+
+        // Новый путь так и не попал в общую базу и был удалён. Телефон при
+        // этом ещё не получил даже перенос, поэтому old.flac у него остался.
+        let op = a.make_op(del("new.flac")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_absent("new.flac").unwrap();
+
+        let peer_have = HashMap::from([("dev-a".to_string(), (0i64, 0i64))]);
+        let plan = build_with_peer_have(&a, "dev-b", "Phone", &[], Some(&peer_have)).unwrap();
+
+        let deleted: Vec<_> = plan
+            .local
+            .iter()
+            .filter(|change| change.kind == ChangeKind::Deleted)
+            .collect();
+        assert_eq!(deleted.len(), 1, "удаление источника переноса не должно теряться");
+        assert_eq!(deleted[0].path, "old.flac");
+    }
+
+    #[test]
+    fn chained_local_moves_are_one_change_without_ghost_deletions() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "a.flac", "b3:aa");
+        apply_move(&mut a, "a.flac", "b.flac", "b3:aa");
+        apply_move(&mut a, "b.flac", "c.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1, "промежуточные имена — не отдельные изменения");
+        assert_eq!(plan.local[0].path, "c.flac");
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].from.as_deref(), Some("b.flac"));
+        assert!(plan
+            .local
+            .iter()
+            .all(|change| change.kind != ChangeKind::Deleted));
+    }
+
+    #[test]
+    fn local_edit_after_move_is_add_plus_delete_not_a_false_move() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "old.flac", "b3:aa");
+        apply_move(&mut a, "old.flac", "new.flac", "b3:aa");
+
+        // После переноса содержимое изменилось. Сканер в такой ситуации увидел
+        // бы удаление + добавление, поэтому и план не должен притворяться, что
+        // старый путь исчез вместе с переносом.
+        let op = a.make_op(put("new.flac", "b3:bb")).unwrap();
+        a.apply(&op).unwrap();
+        a.mark_present("new.flac").unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 2);
+        let added = plan
+            .local
+            .iter()
+            .find(|change| change.path == "new.flac")
+            .unwrap();
+        assert_eq!(added.kind, ChangeKind::Added);
+        assert_eq!(added.from, None);
+        let deleted = plan
+            .local
+            .iter()
+            .find(|change| change.path == "old.flac")
+            .unwrap();
+        assert_eq!(deleted.kind, ChangeKind::Deleted);
     }
 
     #[test]
