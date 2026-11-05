@@ -30,7 +30,6 @@ export default {
   "workspace.no_folder": "No folder chosen",
   "workspace.nav": "Sections",
   "workspace.kicker": "Sync",
-  "workspace.devices": "Devices",
   "workspace.back": "Back to sync",
   "workspace.tab.overview": "Overview",
   "workspace.tab.changes": "Changes",

@@ -30,7 +30,6 @@ export default {
   "workspace.no_folder": "Папка не выбрана",
   "workspace.nav": "Разделы",
   "workspace.kicker": "Синхронизация",
-  "workspace.devices": "Устройства",
   "workspace.back": "К синхронизации",
   "workspace.tab.overview": "Обзор",
   "workspace.tab.changes": "Изменения",

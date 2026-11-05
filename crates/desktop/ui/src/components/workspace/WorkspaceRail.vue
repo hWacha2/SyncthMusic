@@ -6,7 +6,7 @@ import IconVault from '../icons/IconVault.vue';
 import IconExclude from '../icons/IconExclude.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
-import { openDevices, state } from '../../store.js';
+import { state } from '../../store.js';
 import { basename, connectionState, pendingCount } from '../../workspace/model.js';
 import { selectTab } from '../../workspace/actions.js';
 
@@ -83,7 +83,6 @@ function countFor(id, data) {
         ></span>
         <span>{{ conn.label }}</span>
       </div>
-      <button class="ws-link" @click="openDevices">{{ t('workspace.devices') }}</button>
       <span v-if="state.info?.version" class="ws-version">v{{ state.info.version }} · AGPL-3.0</span>
     </div>
   </aside>
