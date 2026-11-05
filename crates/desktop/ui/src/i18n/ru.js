@@ -39,7 +39,6 @@ export default {
   "workspace.settings.sub": "Ручной режим и обслуживание библиотеки.",
   "workspace.settings.sync": "Синхронизация",
   "workspace.settings.history_title": "История библиотеки",
-  "workspace.settings.history_tag": "Данные",
   "workspace.settings.history_text": "Журнал, решения и планы синхронизации на этом ПК и на телефоне. Папки с музыкой не изменяются.",
   "workspace.settings.history_note": "«Хранилище» с копиями удалённых файлов остаётся. После очистки «Проверить» заново сравнит папки.",
   "workspace.settings.clear_history": "Очистить историю",

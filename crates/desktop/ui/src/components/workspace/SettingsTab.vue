@@ -63,7 +63,6 @@ const clearing = computed(() => state.workspace.action === 'clear-history');
     <section class="ws-card ws-setting-card">
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.history_title') }}</h2>
-        <span class="ws-tag is-warn">{{ t('workspace.settings.history_tag') }}</span>
       </div>
       <p class="ws-setting-hint">{{ t('workspace.settings.history_text') }}</p>
       <p class="ws-setting-note">{{ t('workspace.settings.history_note') }}</p>

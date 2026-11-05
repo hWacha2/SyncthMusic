@@ -39,7 +39,6 @@ export default {
   "workspace.settings.sub": "Manual mode and library maintenance.",
   "workspace.settings.sync": "Sync",
   "workspace.settings.history_title": "Library history",
-  "workspace.settings.history_tag": "Data",
   "workspace.settings.history_text": "The sync journal, decisions and plans on this PC and on the phone. Music folders are not modified.",
   "workspace.settings.history_note": "The Vault with copies of deleted files stays. After clearing, Check compares the folders from scratch.",
   "workspace.settings.clear_history": "Clear history",
