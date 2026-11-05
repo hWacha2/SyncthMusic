@@ -4,11 +4,13 @@ import RejectButton from './RejectButton.vue';
 import UndoButton from './UndoButton.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
+import { basename } from '../../format.js';
 import { changeMeta, decisionLabel, kindLabel } from '../../workspace/model.js';
 
 const props = defineProps({
   entry: { type: Object, required: true },
   manual: { type: Boolean, default: false },
+  showFolder: { type: Boolean, default: false },
   selection: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
   selectable: { type: Boolean, default: false },
@@ -17,6 +19,15 @@ const props = defineProps({
 const emit = defineEmits(['toggle']);
 
 const kind = computed(() => props.entry.change?.kind || 'conflict');
+
+// Переименование и перенос показываем именем файла: папка уже видна в
+// заголовке группы или в мете, а человеку важен именно новый файл.
+const title = computed(() => {
+  if (kind.value === 'renamed' || kind.value === 'moved' || props.showFolder) {
+    return basename(props.entry.path);
+  }
+  return props.entry.path;
+});
 
 const item = computed(() => ({
   type: props.entry.type === 'conflict'
@@ -34,7 +45,7 @@ const meta = computed(() => {
       ? t('workspace.changes.undecided')
       : decisionLabel(props.entry.conflict?.decision);
   }
-  return changeMeta(props.entry.change, props.manual);
+  return changeMeta(props.entry.change, props.manual, props.showFolder);
 });
 
 // Клик по строке включает/выключает её в выделении. Кнопки решений и чекбокс
@@ -71,7 +82,7 @@ function onClick(event) {
 
     <span class="ws-row-kind" :class="`is-${kind}`">{{ kindLabel(kind) }}</span>
     <div class="ws-row-main">
-      <div class="ws-row-path" :title="entry.path">{{ entry.path }}</div>
+      <div class="ws-row-path" :title="entry.path">{{ title }}</div>
       <div class="ws-row-meta">{{ meta }}</div>
     </div>
     <div v-if="entry.pending" class="ws-row-actions">

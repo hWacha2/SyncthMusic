@@ -19,6 +19,7 @@ use crate::op::{Op, OpKind};
 use crate::path;
 use crate::plan::{Change, ChangeKind, Decision, PathDecision, Plan, Side};
 use crate::resolve;
+use crate::scan;
 use crate::store::Replica;
 use crate::vault;
 
@@ -270,7 +271,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
                     _ => {}
                 }
             }
-            ChangeKind::Moved => {
+            ChangeKind::Renamed | ChangeKind::Moved => {
                 let Some(from) = &change.from else {
                     bail!("перенос без старого пути: {}", change.path);
                 };
@@ -408,7 +409,10 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
             .effective_decision(&change.path)
             .unwrap_or(Decision::Keep);
         let wanted = match change.kind {
-            ChangeKind::Added | ChangeKind::Updated | ChangeKind::Moved => {
+            ChangeKind::Added
+            | ChangeKind::Updated
+            | ChangeKind::Renamed
+            | ChangeKind::Moved => {
                 decision == Decision::Accept
             }
             ChangeKind::Deleted => decision == Decision::KeepInLibrary,
@@ -479,11 +483,22 @@ pub(crate) fn save_conflict_copy(
     Ok(())
 }
 
-fn remove_to_vault(replica: &Replica, root: &Path, rel: &str) -> Result<()> {
+fn remove_to_vault(
+    replica: &mut Replica,
+    root: &Path,
+    rel: &str,
+    expected_blob: &str,
+) -> Result<()> {
+    let abs = resolve::disk_path(root, rel);
+    // Файл мог измениться после построения плана (или это чужая правка под тем
+    // же путём). Такую версию не удаляем: сохраняем рядом как conflict-copy.
+    if abs.is_file() && scan::hash_file(&abs).ok().as_deref() != Some(expected_blob) {
+        save_conflict_copy(replica, root, &abs, rel)?;
+        return Ok(());
+    }
     if replica.data_dir().is_some() {
         let _ = vault::preserve_file(replica, root, rel)?;
     }
-    let abs = resolve::disk_path(root, rel);
     match std::fs::remove_file(&abs) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -508,6 +523,10 @@ fn restore_from_vault(replica: &mut Replica, root: &Path, rel: &str) -> Result<b
     let dst = resolve::disk_path(root, rel);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    // Не перезаписываем версию, появившуюся на этом пути после удаления.
+    if dst.is_file() && scan::hash_file(&dst).ok().as_deref() != Some(row.blob.as_str()) {
+        save_conflict_copy(replica, root, &dst, rel)?;
     }
     std::fs::copy(&src, &dst).with_context(|| format!("восстановление {}", dst.display()))?;
     crate::scan::restore_mtime(&dst, row.mtime_ns)?;
@@ -574,7 +593,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
         match change.kind {
             ChangeKind::Added => match decision {
                 Decision::Revert | Decision::DeleteEverywhere => {
-                    remove_to_vault(replica, &root, &change.path)?;
+                    remove_to_vault(replica, &root, &change.path, &change.blob)?;
                     replica.clear_pending_delete(&change.path)?;
                 }
                 Decision::OnlyHere => {
@@ -590,7 +609,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                     write_blob(&root, &change.path, &src, change.mtime_ns)?;
                 }
             }
-            ChangeKind::Moved => {
+            ChangeKind::Renamed | ChangeKind::Moved => {
                 if decision == Decision::Revert {
                     let Some(from) = &change.from else { continue };
                     let src = resolve::disk_path(&root, &change.path);
@@ -605,7 +624,9 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                 }
             }
             ChangeKind::Deleted => match decision {
-                Decision::DeleteEverywhere => remove_to_vault(replica, &root, &change.path)?,
+                Decision::DeleteEverywhere => {
+                    remove_to_vault(replica, &root, &change.path, &change.blob)?
+                }
                 Decision::KeepInLibrary => {
                     let restored = restore_from_vault(replica, &root, &change.path)?;
                     if !restored {
@@ -647,7 +668,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
                 if !keep_local {
                     // Чужую версию поставит операция автора решения.
                     let local = conflict_local_path(conflict);
-                    remove_to_vault(replica, &root, local)?;
+                    remove_to_vault(replica, &root, local, &conflict.local_blob)?;
                     replica.mark_absent(local)?;
                     if local != conflict.path {
                         replica.mark_absent(&conflict.path)?;
@@ -715,7 +736,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
             (ChangeKind::Updated, Decision::Revert) => {
                 replica.mark_present(&change.path)?;
             }
-            (ChangeKind::Moved, Decision::Revert) => {
+            (ChangeKind::Renamed | ChangeKind::Moved, Decision::Revert) => {
                 if let Some(from) = &change.from {
                     if resolve::disk_path(&root, from).is_file() {
                         replica.mark_present(from)?;
@@ -798,11 +819,11 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
                 confirmed.insert(change.path.clone());
                 outcome.accepted += 1;
             }
-            (ChangeKind::Moved, Decision::Accept) => {
+            (ChangeKind::Renamed | ChangeKind::Moved, Decision::Accept) => {
                 confirmed.insert(change.path.clone());
                 outcome.accepted += 1;
             }
-            (ChangeKind::Moved, Decision::Revert) => {
+            (ChangeKind::Renamed | ChangeKind::Moved, Decision::Revert) => {
                 if let Some(from) = &change.from {
                     confirmed.insert(from.clone());
                 }
@@ -873,7 +894,10 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
             .unwrap_or(Decision::Keep);
         if matches!(
             change.kind,
-            ChangeKind::Added | ChangeKind::Updated | ChangeKind::Moved
+            ChangeKind::Added
+                | ChangeKind::Updated
+                | ChangeKind::Renamed
+                | ChangeKind::Moved
         ) && decision == Decision::Accept
         {
             place.insert(change.path.clone());

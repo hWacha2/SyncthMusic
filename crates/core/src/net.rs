@@ -455,15 +455,34 @@ fn apply_moves(replica: &mut Replica, root: &Path, ops: &[Op]) -> Result<usize> 
             continue;
         }
         // Занятый destination не перезаписываем: это может быть чужая правка.
-        if !same_key && dst.exists() {
-            continue;
+        // Для совпадающего ключа нужно убедиться, что это действительно тот же
+        // файл (смена регистра/NFC), а не два разных файла на регистрозависимой ФС.
+        if dst.exists() {
+            if !same_key {
+                continue;
+            }
+            if !same_existing_file(&src, &dst) {
+                tracing::warn!(
+                    "не переношу {from} → {to}: на диске уже есть другой файл"
+                );
+                continue;
+            }
         }
         match scan::hash_file(&src) {
             Ok(h) if &h == blob => {
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                match std::fs::rename(&src, &dst) {
+                let result = if from == to {
+                    Ok(())
+                } else if same_key {
+                    // Windows/macOS считают `A.flac` и `a.flac` одним файлом и
+                    // могут отказать в прямом rename. Идём через временное имя.
+                    rename_case_safe(&src, &dst)
+                } else {
+                    std::fs::rename(&src, &dst)
+                };
+                match result {
                     Ok(()) => {
                         scan::restore_mtime(&dst, *mtime_ns)?;
                         replica.mark_present(to)?;
@@ -492,6 +511,66 @@ fn apply_moves(replica: &mut Replica, root: &Path, ops: &[Op]) -> Result<usize> 
         }
     }
     Ok(moved)
+}
+
+/// Один и тот же файл на диске? Нужно для смены только регистра/NFC, когда
+/// `dst.exists()` — это не занятый путь, а тот же самый inode.
+fn same_existing_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Метаданные Windows не дают стабильного file index в std; канонизация
+        // разрешает регистр через саму ФС и возвращает одно и то же имя.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Переименование, меняющее только регистр/NFC. Прямой `rename` на Windows и
+/// macOS может отказать, потому что целевое имя «уже занято» тем же файлом.
+/// Поэтому сначала уводим файл во временное служебное имя, затем — в целевое.
+fn rename_case_safe(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let mut tmp = None;
+    for index in 0..1024u32 {
+        let candidate = parent.join(format!(".syncth-tmp-{pid}-{index}"));
+        if !candidate.exists() {
+            tmp = Some(candidate);
+            break;
+        }
+    }
+    let Some(tmp) = tmp else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "не удалось подобрать временное имя",
+        ));
+    };
+    std::fs::rename(src, &tmp)?;
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Возвращаем файл на место, чтобы не потерять его под temp-именем.
+            let _ = std::fs::rename(&tmp, src);
+            Err(e)
+        }
+    }
 }
 
 /// Пути, которых коснулись операции.
@@ -2082,5 +2161,45 @@ mod tests {
             b"one"
         );
         assert!(b.is_present("Compilations/01.flac").unwrap());
+    }
+
+    #[test]
+    fn applying_a_case_only_rename_changes_the_file_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        std::fs::create_dir_all(root_a.join("Album")).unwrap();
+        std::fs::create_dir_all(root_b.join("Album")).unwrap();
+        std::fs::write(root_a.join("Album/01.flac"), b"one").unwrap();
+        std::fs::write(root_b.join("Album/01.flac"), b"one").unwrap();
+
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        a.set_root(&root_a).unwrap();
+        scan::scan(&root_a, &mut a).unwrap();
+
+        std::fs::rename(
+            root_a.join("Album/01.flac"),
+            root_a.join("Album/01.FLAC"),
+        )
+        .unwrap();
+        scan::scan(&root_a, &mut a).unwrap();
+
+        let mut b = Replica::in_memory("dev-b").unwrap();
+        b.set_root(&root_b).unwrap();
+        let ops = a.ops().unwrap();
+        b.apply_all(&ops).unwrap();
+        let moved = apply_moves(&mut b, &root_b, &ops).unwrap();
+
+        assert_eq!(moved, 1);
+        let names: Vec<String> = std::fs::read_dir(root_b.join("Album"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "01.FLAC"),
+            "на диске должно остаться новое имя: {names:?}"
+        );
+        assert!(b.is_present("Album/01.FLAC").unwrap());
     }
 }

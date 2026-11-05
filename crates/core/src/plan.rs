@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
+use crate::path;
 use crate::store::{LocalMove, PlanRow, Replica};
 
 /// Сколько живёт план. Просроченный план не применяется: состояние могло
@@ -34,6 +35,9 @@ pub enum Side {
 pub enum ChangeKind {
     Added,
     Updated,
+    /// Файл переименован в той же папке.
+    Renamed,
+    /// Файл перенесён в другую папку (возможно, с новым именем).
     Moved,
     Deleted,
 }
@@ -43,10 +47,31 @@ impl ChangeKind {
     /// галочка — это осознанное «Остаётся», а не «ещё не решил».
     pub fn default_decision(self) -> Decision {
         match self {
-            ChangeKind::Added | ChangeKind::Updated | ChangeKind::Moved => Decision::Accept,
+            ChangeKind::Added
+            | ChangeKind::Updated
+            | ChangeKind::Renamed
+            | ChangeKind::Moved => Decision::Accept,
             ChangeKind::Deleted => Decision::Keep,
         }
     }
+
+    /// Отличить переименование от переноса по родительским папкам. Регистр и
+    /// NFC не должны превращать смену регистра имени в перенос.
+    pub fn for_move(from: &str, to: &str) -> Self {
+        if same_folder(from, to) {
+            ChangeKind::Renamed
+        } else {
+            ChangeKind::Moved
+        }
+    }
+}
+
+fn parent(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+fn same_folder(from: &str, to: &str) -> bool {
+    path::key(parent(from)) == path::key(parent(to))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,8 +720,8 @@ pub fn build_with_peer_have(
             local.push(Change {
                 path: row.path.clone(),
                 from: moved_from.clone(),
-                kind: if moved_from.is_some() {
-                    ChangeKind::Moved
+                kind: if let Some(from) = &moved_from {
+                    ChangeKind::for_move(from, &row.path)
                 } else if row.synced_blob.is_empty() {
                     ChangeKind::Added
                 } else {
@@ -865,8 +890,8 @@ pub fn build_with_peer_have(
             remote_changes.push(Change {
                 path: path.clone(),
                 from: state.moved_from.clone(),
-                kind: if state.moved_from.is_some() {
-                    ChangeKind::Moved
+                kind: if let Some(from) = &state.moved_from {
+                    ChangeKind::for_move(from, path)
                 } else if row.is_none() || row.is_some_and(|row| row.synced_blob.is_empty()) {
                     ChangeKind::Added
                 } else {
@@ -1170,7 +1195,7 @@ mod tests {
 
         assert_eq!(plan.local.len(), 1, "перенос не должен двоиться");
         assert_eq!(plan.local[0].path, "Telegram/new.flac");
-        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
         assert_eq!(
             plan.local[0].from.as_deref(),
             Some("Telegram/old.flac"),
@@ -1193,7 +1218,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.local.len(), 1);
-        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
         assert_eq!(plan.local[0].from.as_deref(), Some("old.flac"));
         assert!(plan.remote.is_empty(), "старая версия телефона — не его правка");
     }
@@ -1213,6 +1238,34 @@ mod tests {
     }
 
     #[test]
+    fn local_move_and_rename_is_moved() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "Album/01.flac", "b3:aa");
+        apply_move(&mut a, "Album/01.flac", "Compilations/02.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].path, "Compilations/02.flac");
+        assert_eq!(plan.local[0].from.as_deref(), Some("Album/01.flac"));
+    }
+
+    #[test]
+    fn local_case_only_rename_is_renamed() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "Album/Panda.flac", "b3:aa");
+        apply_move(&mut a, "Album/Panda.flac", "album/panda.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
+        assert_eq!(plan.local[0].path, "album/panda.flac");
+        assert_eq!(plan.local[0].from.as_deref(), Some("Album/Panda.flac"));
+    }
+
+    #[test]
     fn local_move_over_an_existing_target_is_still_a_move() {
         let mut a = Replica::in_memory("dev-a").unwrap();
         synced(&mut a, "source.flac", "b3:source");
@@ -1223,7 +1276,7 @@ mod tests {
 
         assert_eq!(plan.local.len(), 1, "занятая цель не должна давать лишних строк");
         assert_eq!(plan.local[0].path, "target.flac");
-        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
         assert_eq!(plan.local[0].from.as_deref(), Some("source.flac"));
         assert_eq!(plan.local[0].blob, "b3:source");
     }
@@ -1263,7 +1316,7 @@ mod tests {
 
         assert_eq!(plan.local.len(), 1, "промежуточные имена — не отдельные изменения");
         assert_eq!(plan.local[0].path, "c.flac");
-        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
         assert_eq!(plan.local[0].from.as_deref(), Some("b.flac"));
         assert!(plan
             .local

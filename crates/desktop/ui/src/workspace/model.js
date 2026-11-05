@@ -281,10 +281,20 @@ export function attentionKind(item) {
   return { css: 'is-delete', label: t('workspace.attention.deletion') };
 }
 
-export function changeMeta(change, manual = false) {
+export function changeMeta(change, manual = false, showFolder = false) {
   const parts = [];
-  if (change.kind === 'moved' && change.from) {
-    parts.push(t('workspace.changes.from', { path: change.from }));
+  if (showFolder) {
+    parts.push(dirname(change.path) || t('workspace.changes.root'));
+  }
+  if (change.kind === 'renamed' && change.from) {
+    parts.push(t('workspace.changes.renamed_meta', { name: basename(change.from) }));
+  } else if (change.kind === 'moved' && change.from) {
+    if (basename(change.from) === basename(change.path)) {
+      const folder = dirname(change.from) || t('workspace.changes.root');
+      parts.push(t('workspace.changes.moved_meta', { folder }));
+    } else {
+      parts.push(t('workspace.changes.moved_from', { path: change.from }));
+    }
   }
   if (change.size) parts.push(formatSize(change.size));
   if (change.kind === 'deleted') {

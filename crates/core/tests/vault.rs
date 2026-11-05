@@ -114,6 +114,42 @@ fn deleted_track_can_be_restored_from_the_vault_and_it_propagates() {
 }
 
 #[test]
+fn restore_over_a_new_file_keeps_both_versions() {
+    let (ctx, mut a, mut b) = pair();
+
+    // Удаление пришло на B, где файл ещё лежал: версия попала в корзину B.
+    fs::remove_file(ctx.root_a.join("Album/01.flac")).unwrap();
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
+    sync(&mut a, &mut b, &ctx.pipe);
+    resolve::prune_deleted_files(&mut b, &ctx.root_b).unwrap();
+    assert!(!ctx.root_b.join("Album/01.flac").exists());
+
+    // Пока трек лежал в корзине, на его место положили новый файл.
+    fs::write(ctx.root_b.join("Album/01.flac"), b"new version").unwrap();
+
+    vault::restore(&mut b, "Album/01.flac").unwrap();
+
+    // Восстановленная версия занимает исходный путь, новая не теряется.
+    assert_eq!(
+        fs::read(ctx.root_b.join("Album/01.flac")).unwrap(),
+        b"one".to_vec()
+    );
+    let conflicts: Vec<_> = fs::read_dir(ctx.root_b.join("Album"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".sync-conflict-")
+        })
+        .collect();
+    assert_eq!(conflicts.len(), 1, "новая версия должна остаться копией");
+    assert_eq!(fs::read(conflicts[0].path()).unwrap(), b"new version");
+}
+
+#[test]
 fn delete_everywhere_vaults_a_second_copy_of_the_same_track() {
     let ctx = setup(&[("Album/01.flac", b"one"), ("Copy/01.flac", b"one")]);
     let mut a = open(&ctx, "data_a", &ctx.root_a);

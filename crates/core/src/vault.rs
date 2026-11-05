@@ -127,6 +127,12 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("создание {}", parent.display()))?;
     }
+    // На пути уже может лежать новый файл с тем же именем: скачали заново или
+    // создали вручную. Восстановление не имеет права его перезаписать, поэтому
+    // занятую версию сохраняем рядом как conflict-copy.
+    if dst.is_file() && scan::hash_file(&dst).ok().as_deref() != Some(row.blob.as_str()) {
+        crate::commit::save_conflict_copy(replica, &root, &dst, path)?;
+    }
     // Копия, а не hardlink: восстановленный файл будут править тегами, и он не
     // должен менять содержимое корзины (там может лежать тот же блоб).
     std::fs::copy(&src, &dst).with_context(|| format!("восстановление {}", dst.display()))?;

@@ -128,7 +128,7 @@ fn case_only_rename_with_a_tag_edit_is_still_a_move() {
 }
 
 #[test]
-fn scanned_rename_becomes_one_moved_change_in_the_plan() {
+fn scanned_rename_becomes_one_renamed_change_in_the_plan() {
     let ctx = setup(&[("Telegram/10-Panda-Eyes-Ily.flac", b"panda")]);
     let mut a = open(&ctx);
     scan::scan(&ctx.root, &mut a).unwrap();
@@ -145,7 +145,7 @@ fn scanned_rename_becomes_one_moved_change_in_the_plan() {
 
     let plan = plan::build(&a, "dev-phone", "Phone", &[]).unwrap();
     assert_eq!(plan.local.len(), 1, "перенос не должен выглядеть добавлением");
-    assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+    assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
     assert_eq!(
         plan.local[0].from.as_deref(),
         Some("Telegram/10-Panda-Eyes-Ily.flac"),

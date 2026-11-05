@@ -1495,6 +1495,7 @@ button:focus-visible {
   color: #aab6c9;
 }
 
+.ws-row-kind.is-renamed,
 .ws-row-kind.is-moved {
   color: #d7c08d;
 }

@@ -147,6 +147,52 @@ fn deleted_addition_is_removed_on_both_sides_and_kept_in_vault() {
 }
 
 #[test]
+fn deleting_a_file_changed_after_the_plan_keeps_a_conflict_copy() {
+    let Pair {
+        tmp,
+        root_a,
+        root_b: _,
+        mut a,
+        b,
+        token,
+    } = setup();
+    let _keep_tmp = &tmp;
+
+    let b = commit_with_b(&mut a, b, &token, |session, _| {
+        assert_eq!(session.plan.path_count(), 0);
+    });
+
+    fs::write(root_a.join("new.txt"), b"before plan").unwrap();
+    scan::scan(&root_a, &mut a).unwrap();
+
+    let _b = commit_with_b(&mut a, b, &token, |session, replica| {
+        assert_eq!(session.plan.local.len(), 1);
+        let path = session.plan.local[0].path.clone();
+        // Файл изменили уже после построения плана: удалять его нельзя.
+        fs::write(root_a.join("new.txt"), b"changed after plan").unwrap();
+        session
+            .record_decision(replica, &path, Decision::DeleteEverywhere)
+            .unwrap();
+        session.poll(replica).unwrap();
+    });
+
+    assert!(!root_a.join("new.txt").exists());
+    let conflicts: Vec<_> = fs::read_dir(&root_a)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".sync-conflict-")
+        })
+        .collect();
+    assert_eq!(conflicts.len(), 1, "изменённая версия должна остаться");
+    assert_eq!(fs::read(conflicts[0].path()).unwrap(), b"changed after plan");
+    assert!(a.vault_rows().unwrap().is_empty());
+}
+
+#[test]
 fn remote_addition_can_be_deleted_everywhere_without_downloading_it() {
     let Pair {
         tmp,

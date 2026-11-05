@@ -74,12 +74,14 @@ function adbLabel(device) {
               </button>
             </DeviceRow>
           </template>
-          <p v-else class="group-empty">
-            {{ state.discovering ? t('setup.searching') : t('setup.empty_lan') }}
+          <div v-else>
+            <p class="group-empty">
+              {{ state.discovering ? t('setup.searching') : t('setup.empty_lan') }}
+            </p>
             <span v-if="!state.discovering && state.discovered" class="group-hint">
               {{ t('setup.lan_hint') }}
             </span>
-          </p>
+          </div>
         </div>
       </section>
 
