@@ -1647,6 +1647,10 @@ fn api_status(ctx: &UiCtx) -> Value {
         "ops": r.op_count().unwrap_or(0),
         "files": r.live_entries().map(|v| v.len()).unwrap_or(0),
         "local": r.local_entries().map(|v| v.len()).unwrap_or(0),
+        "local_size": r
+            .local_entries()
+            .map(|v| v.iter().map(|e| e.size).sum::<u64>())
+            .unwrap_or(0),
         "size": r.total_live_bytes().unwrap_or(0),
         "pending": pending,
         "ignored": ignored,

@@ -66,8 +66,8 @@ function attentionMeta(item) {
   <div class="ws-stats">
     <div class="ws-stat">
       <span class="ws-stat-k">{{ t('workspace.stats.pc') }}</span>
-      <div class="ws-stat-v">{{ number(pc.files || 0) }}</div>
-      <span class="ws-stat-n">{{ t('workspace.stats.pc_note', { count: number(pc.local || 0) }) }}</span>
+      <div class="ws-stat-v">{{ number(pc.local || 0) }}</div>
+      <span class="ws-stat-n">{{ formatSize(pc.local_size || 0) }} · {{ t('workspace.stats.pc_note') }}</span>
     </div>
     <div class="ws-stat">
       <span class="ws-stat-k">{{ t('workspace.stats.phone') }}</span>

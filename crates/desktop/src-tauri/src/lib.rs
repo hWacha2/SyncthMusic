@@ -1195,7 +1195,9 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
     let live = replica.live_entries().unwrap_or_default();
     let files = live.len();
     let total = live.iter().map(|entry| entry.size).sum::<u64>();
-    let local = replica.local_entries().map(|rows| rows.len()).unwrap_or(0);
+    let local_rows = replica.local_entries().unwrap_or_default();
+    let local = local_rows.len();
+    let local_total = local_rows.iter().map(|entry| entry.size).sum::<u64>();
     let vault_rows = replica.vault_rows().unwrap_or_default();
     let vault_size = vault_rows.iter().map(|row| row.size).sum::<u64>();
     let exclusions = replica
@@ -1254,6 +1256,7 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
             "name": replica.device_name(),
             "files": files,
             "local": local,
+            "local_size": local_total,
             "total": total,
             "vault_files": vault_rows.len(),
             "vault_size": vault_size,
