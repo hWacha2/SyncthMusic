@@ -33,6 +33,13 @@ pub use resolve::{resolve, Action, Outcome};
 pub use scan::{scan, ScanReport};
 pub use store::{EntryRow, Peer, PendingDelete, PlanRow, Replica, VaultRow};
 
+/// Отображаемое имя продукта для нативных окон, трея и уведомлений.
+///
+/// Интерфейс берёт название из ключа `app.name` в словарях i18n, а упаковка
+/// (имя установщика и папок) — из `productName` в `tauri.conf.json`. Меняя
+/// название продукта, обновите эти три места; пути данных остаются прежними.
+pub const APP_NAME: &str = "SynctMusic";
+
 /// Понятное человеку имя устройства. Не заменяет `device_id`: тот остаётся
 /// стабильным, а имя можно менять (переименование ПК, `SYNCTH_DEVICE_NAME`).
 /// Символы, ломающие строку сопряжения, вычищаются.

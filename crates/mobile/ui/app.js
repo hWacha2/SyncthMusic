@@ -71,7 +71,7 @@ function iconClose() {
 function topbar() {
   return `<header class="topbar">
     <span class="brand-mark" aria-hidden="true"></span>
-    <span class="brand-name">SynctMusic</span>
+    <span class="brand-name">${esc(t('app.name'))}</span>
   </header>`;
 }
 
@@ -80,7 +80,7 @@ function languageView() {
     ${topbar()}
     <div class="wait-center">
       <div class="wait-copy">
-        <h1 class="wait-title">SynctMusic</h1>
+        <h1 class="wait-title">${esc(t('app.name'))}</h1>
         <p class="wait-hint">Выберите язык · Choose your language</p>
       </div>
       <div class="language-choices">

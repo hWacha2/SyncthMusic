@@ -7,7 +7,7 @@ import { windowAction } from '../bridge.js';
   <header class="titlebar" data-tauri-drag-region>
     <div class="brand" data-tauri-drag-region>
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">SynctMusic</span>
+      <span class="brand-name">{{ t('app.name') }}</span>
     </div>
     <div class="window-controls">
       <button

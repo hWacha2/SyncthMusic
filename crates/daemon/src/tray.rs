@@ -24,7 +24,7 @@ pub fn spawn(commands: Sender<Cmd>, runtime: Arc<Mutex<Runtime>>, ui_url: String
 
 fn run(commands: Sender<Cmd>, runtime: Arc<Mutex<Runtime>>, ui_url: String) -> anyhow::Result<()> {
     let menu = Menu::new();
-    let open = MenuItem::new("Открыть SynctMusic", true, None);
+    let open = MenuItem::new(format!("Открыть {}", syncth_core::APP_NAME), true, None);
     let sync = MenuItem::new("Синхронизировать сейчас", true, None);
     let pause = MenuItem::new("Пауза / продолжить", true, None);
     let check = MenuItem::new("Проверить место на диске", true, None);
@@ -40,7 +40,7 @@ fn run(commands: Sender<Cmd>, runtime: Arc<Mutex<Runtime>>, ui_url: String) -> a
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("SynctMusic")
+        .with_tooltip(syncth_core::APP_NAME)
         .with_icon(make_icon()?)
         .build()?;
 
@@ -84,20 +84,21 @@ fn run(commands: Sender<Cmd>, runtime: Arc<Mutex<Runtime>>, ui_url: String) -> a
 }
 
 fn tooltip(runtime: &Arc<Mutex<Runtime>>) -> String {
+    let name = syncth_core::APP_NAME;
     let rt = runtime.lock().unwrap();
     if rt.disk_low {
-        return "SynctMusic — мало места, синхронизация на паузе".into();
+        return format!("{name} — мало места, синхронизация на паузе");
     }
     if rt.paused {
-        return "SynctMusic — автосинк на паузе".into();
+        return format!("{name} — автосинк на паузе");
     }
     if rt.syncing {
-        return "SynctMusic — синхронизация…".into();
+        return format!("{name} — синхронизация…");
     }
     if rt.last_error.is_some() {
-        return "SynctMusic — есть ошибка, откройте UI".into();
+        return format!("{name} — есть ошибка, откройте UI");
     }
-    "SynctMusic — работает".into()
+    format!("{name} — работает")
 }
 
 fn fire(commands: &Sender<Cmd>, make: impl FnOnce(Reply) -> Cmd + Send + 'static) {

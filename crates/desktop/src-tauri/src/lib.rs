@@ -2244,7 +2244,10 @@ fn pick_folder(title: Option<String>) -> Option<String> {
 #[tauri::command]
 fn pick_data_folder() -> Option<String> {
     rfd::FileDialog::new()
-        .set_title("Куда складывать служебные данные SynctMusic")
+        .set_title(format!(
+            "Куда складывать служебные данные {}",
+            syncth_core::APP_NAME
+        ))
         .pick_folder()
         .map(|p| p.to_string_lossy().to_string())
 }
@@ -2351,6 +2354,11 @@ pub fn run() {
         })
         .setup(|app| {
             start_heartbeat(app.handle().clone());
+            // Название окна берём из одного Rust-константы, чтобы смена
+            // продукта не требовала правок в разных местах.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(syncth_core::APP_NAME);
+            }
             let _ = app;
             Ok(())
         })
@@ -2402,5 +2410,5 @@ pub fn run() {
             window_close,
         ])
         .run(tauri::generate_context!())
-        .expect("не удалось запустить SynctMusic");
+        .expect("не удалось запустить приложение");
 }

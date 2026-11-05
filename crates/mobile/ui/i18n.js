@@ -1,7 +1,8 @@
 const I18N = (() => {
   const ru = {
+    'app.name': 'SynctMusic',
     'wait.title': 'Ожидание подключения',
-    'wait.hint': 'Откройте SynctMusic на компьютере.',
+    'wait.hint': 'Откройте {app} на компьютере.',
     'ready.title': 'Подключено',
     'agent.folder': 'Папка',
     'agent.change': 'Сменить папку',
@@ -25,8 +26,9 @@ const I18N = (() => {
   };
 
   const en = {
+    'app.name': 'SynctMusic',
     'wait.title': 'Waiting for connection',
-    'wait.hint': 'Open SynctMusic on the computer.',
+    'wait.hint': 'Open {app} on the computer.',
     'ready.title': 'Connected',
     'agent.folder': 'Folder',
     'agent.change': 'Change folder',
@@ -56,7 +58,8 @@ const I18N = (() => {
 
   function t(key, vars = {}) {
     const text = dict[key] ?? key;
-    return text.replace(/\{(\w+)\}/g, (_, name) => (vars[name] ?? ''));
+    const values = { app: dict['app.name'] ?? 'SynctMusic', ...vars };
+    return text.replace(/\{(\w+)\}/g, (_, name) => (values[name] ?? ''));
   }
 
   function setLang(next) {
@@ -73,6 +76,7 @@ const I18N = (() => {
 
   function apply() {
     document.documentElement.lang = lang;
+    document.title = t('app.name');
     document.querySelectorAll('[data-i18n]').forEach((node) => {
       node.textContent = t(node.dataset.i18n);
     });

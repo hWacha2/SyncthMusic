@@ -138,7 +138,7 @@ class KeepaliveService : Service() {
         }
         builder
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("SynctMusic · приём включён")
+            .setContentTitle("${appLabel()} · приём включён")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -153,6 +153,9 @@ class KeepaliveService : Service() {
 
         return builder.build()
     }
+
+    private fun appLabel(): String =
+        applicationInfo.loadLabel(packageManager).toString()
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT < 26) return

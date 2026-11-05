@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { LANGUAGES, lang } from '../i18n/index.js';
+import { LANGUAGES, lang, t } from '../i18n/index.js';
 import { chooseLanguage, closeLanguage, state } from '../store.js';
 
 const open = ref(false);
@@ -43,7 +43,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="setup setup--center">
     <div class="library-card language-card">
-      <h1 class="setup-title">SynctMusic</h1>
+      <h1 class="setup-title">{{ t('app.name') }}</h1>
       <p class="setup-hint">Выберите язык · Choose your language</p>
 
       <div ref="root" class="lang-select" :class="{ 'is-open': open }">

@@ -926,9 +926,12 @@ fn notify_deletions(missing: &[String]) {
         if count > 1 {
             body.push_str(&format!("\nи ещё {} файл(ов)", count - 1));
         }
-        body.push_str("\nОткройте SynctMusic: удалить везде или оставить только здесь.");
+        body.push_str(&format!(
+            "\nОткройте {}: удалить везде или оставить только здесь.",
+            syncth_core::APP_NAME
+        ));
         let result = notify_rust::Notification::new()
-            .appname("SynctMusic")
+            .appname(syncth_core::APP_NAME)
             .summary(&format!("Пропало файлов: {count}"))
             .body(&body)
             .timeout(notify_rust::Timeout::Milliseconds(10_000))
@@ -1335,9 +1338,11 @@ fn handle_request(mut request: tiny_http::Request, ctx: &UiCtx) {
     let path = url.split('?').next().unwrap_or("/");
 
     let (code, mime, body) = match (&method, path) {
-        (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/index.html") => {
-            (200, "text/html; charset=utf-8", UI.to_string())
-        }
+        (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/index.html") => (
+            200,
+            "text/html; charset=utf-8",
+            UI.replace("{{APP_NAME}}", syncth_core::APP_NAME),
+        ),
         (tiny_http::Method::Get, "/api/status") => (
             200,
             "application/json; charset=utf-8",
@@ -1709,7 +1714,8 @@ fn install_autostart(data_dir: &Path, root: Option<&Path>) -> Result<()> {
     }
     // Скрытое окно: демон не должен висеть консолью поверх плеера.
     let script = format!(
-        "' SynctMusic: автозапуск syncthd\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"{}\", 0, False\r\n",
+        "' {}: автозапуск syncthd\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"{}\", 0, False\r\n",
+        syncth_core::APP_NAME,
         cmd.replace('"', "\"\"")
     );
     std::fs::write(&path, script).with_context(|| format!("запись {}", path.display()))?;

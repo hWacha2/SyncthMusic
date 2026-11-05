@@ -43,7 +43,12 @@ const dict = computed(() => dicts[lang.value] || en);
 
 export function t(key, vars = {}) {
   const text = dict.value[key] ?? key;
-  return text.replace(/\{(\w+)\}/g, (_, name) => vars[name] ?? '');
+  const values = { app: dict.value['app.name'] ?? 'SynctMusic', ...vars };
+  return text.replace(/\{(\w+)\}/g, (_, name) => values[name] ?? '');
+}
+
+function applyTitle() {
+  document.title = t('app.name');
 }
 
 export function setLang(next) {
@@ -55,6 +60,8 @@ export function setLang(next) {
     // Выбор всё равно остаётся в памяти до перезапуска.
   }
   document.documentElement.lang = lang.value;
+  applyTitle();
 }
 
 document.documentElement.lang = lang.value;
+applyTitle();
