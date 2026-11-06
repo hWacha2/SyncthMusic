@@ -150,6 +150,10 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
     replica.set_ignored(path, false)?;
     replica.mark_present(path)?;
     replica.clear_pending_delete(path)?;
+    // Удаление уже согласовано с пиром, так что старой общей базы у пути
+    // больше нет: возвращённый файл должен снова попасть в очередь как
+    // локальное добавление, а не считаться неизменившимся.
+    replica.forget_synced_base(path)?;
     replica.remove_vault_row(&row.blob, &row.path)?;
     Ok(())
 }

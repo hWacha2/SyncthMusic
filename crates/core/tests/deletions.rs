@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use syncth_core::{pipe, resolve, scan, Action, Replica};
+use syncth_core::{pipe, plan, resolve, scan, vault, Action, Hlc, Replica};
 use tempfile::TempDir;
 
 struct Ctx {
@@ -195,6 +195,46 @@ fn restore_refuses_to_resurrect_a_deleted_track() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("корзине"), "{err}");
+}
+
+/// Регрессия: после «удалить везде» файл вернули из корзины. Удаление уже
+/// согласовано с телефоном, поэтому у пути нет общей базы — восстановление
+/// обязано снова попасть в очередь как локальное добавление.
+#[test]
+fn restored_track_returns_to_the_change_queue() {
+    let (ctx, mut a, mut b) = pair();
+
+    let blob = a.entry("Album/01.flac").unwrap().unwrap().blob;
+    a.record_pending_delete("Album/01.flac", &blob, Hlc::new(1, 0))
+        .unwrap();
+    resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
+    // Файл лёг в корзину A, телефон получил удаление.
+    assert!(!ctx.root_a.join("Album/01.flac").exists());
+    sync(&mut a, &mut b, &ctx.pipe);
+    resolve::prune_deleted_files(&mut b, &ctx.root_b).unwrap();
+
+    // Обе стороны согласны: удаление не висит в плане.
+    let peer_have = b.watermarks().unwrap();
+    let plan_before =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    assert!(!plan_before.local.iter().any(|c| c.path == "Album/01.flac"));
+
+    vault::restore(&mut a, "Album/01.flac").unwrap();
+    assert!(ctx.root_a.join("Album/01.flac").is_file());
+
+    let restored =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    let change = restored
+        .local
+        .iter()
+        .find(|c| c.path == "Album/01.flac")
+        .expect("восстановленный трек должен вернуться в очередь изменений");
+    assert_eq!(change.kind, plan::ChangeKind::Added);
+    assert!(change.base_blob.is_empty());
+
+    // Решение «принять» снова отправляет трек на телефон.
+    sync(&mut a, &mut b, &ctx.pipe);
+    assert!(!b.entry("Album/01.flac").unwrap().unwrap().deleted);
 }
 
 #[test]
