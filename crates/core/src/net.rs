@@ -2166,6 +2166,33 @@ mod tests {
     }
 
     #[test]
+    fn restoring_an_ignored_track_makes_its_blob_wanted_again() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("music");
+        std::fs::create_dir_all(root.join("Album")).unwrap();
+        std::fs::write(root.join("Album/01.flac"), b"one").unwrap();
+        let mut replica = Replica::open(&tmp.path().join("state"), "dev-a").unwrap();
+        replica.set_root(&root).unwrap();
+        scan::scan(&root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+        let blob = replica.entry("Album/01.flac").unwrap().unwrap().blob;
+        assert!(missing_blobs(&replica).unwrap().is_empty());
+
+        // «Только здесь»: путь исключён и файла больше нет.
+        replica.set_ignored("Album/01.flac", true).unwrap();
+        replica.mark_absent("Album/01.flac").unwrap();
+        std::fs::remove_file(root.join("Album/01.flac")).unwrap();
+        assert!(missing_blobs(&replica).unwrap().is_empty());
+
+        // Передумал: путь снова в синхронизации, файла нет — блоб нужно
+        // запросить у пира, иначе трек останется только на других устройствах.
+        resolve::restore(&mut replica, "Album/01.flac").unwrap();
+        assert!(!replica.is_ignored("Album/01.flac").unwrap());
+        assert!(!replica.is_present("Album/01.flac").unwrap());
+        assert_eq!(missing_blobs(&replica).unwrap(), vec![blob]);
+    }
+
+    #[test]
     fn applying_a_move_renames_the_local_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root_a = tmp.path().join("a");

@@ -578,3 +578,92 @@ fn deleted_track_disappears_on_the_peer_after_resolution() {
     assert!(ctx.root_a.join("Album/01.flac").is_file());
     assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
 }
+
+/// Регрессия ровно по пользовательскому сценарию: файл удалили на телефоне,
+/// на ПК подтвердили «удалить везде», а потом вернули его из корзины ПК.
+/// Телефон исполняет входящий сеанс и строит свой план сам. Его томбстоун
+/// хранит прежнюю базу, но файла у него нет — восстановление обязано приехать
+/// как чужое добавление, иначе блоб никто не запросит.
+#[test]
+fn track_restored_from_the_vault_reaches_the_phone_again() {
+    use syncth_core::plan::{ChangeKind, Decision};
+
+    let ctx = setup();
+    session(&ctx);
+
+    let path = "Album/01.flac";
+    // Пользователь удалил файл на телефоне.
+    fs::remove_file(ctx.root_b.join(path)).unwrap();
+    {
+        let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+        scan::scan(&ctx.root_b, &mut b).unwrap();
+        assert!(!b.pending_deletes().unwrap().is_empty());
+    }
+
+    // Телефон — исполнитель: план строит он, решение «удалить везде» принято
+    // на ПК и доехало до него.
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    let local = session
+        .plan
+        .local
+        .iter()
+        .find(|change| change.path == path)
+        .expect("телефон должен видеть своё удаление");
+    assert_eq!(local.kind, ChangeKind::Deleted);
+    session
+        .record_decision(&mut b, path, Decision::DeleteEverywhere)
+        .unwrap();
+    session.poll(&mut b).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.poll(&mut b).unwrap();
+    session.commit(&mut b).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    // На ПК файл лёг в корзину, запись стала томбстоуном.
+    {
+        let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+        assert!(a.entry(path).unwrap().unwrap().deleted);
+        assert!(a.vault_for_path(path).unwrap().is_some());
+    }
+
+    // ПК восстановил трек из корзины: локальное добавление с новой базой.
+    {
+        let mut a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+        syncth_core::vault::restore(&mut a, path).unwrap();
+    }
+    assert!(ctx.root_a.join(path).is_file());
+
+    // Следующий сеанс: телефон обязан увидеть добавление и попросить блоб.
+    let a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
+    let remote = session
+        .plan
+        .remote
+        .iter()
+        .find(|change| change.path == path)
+        .expect("восстановление должно вернуться в план телефона");
+    assert_eq!(remote.kind, ChangeKind::Added);
+    assert!(remote.base_blob.is_empty());
+    session.commit(&mut b).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    assert_eq!(
+        fs::read(ctx.root_b.join(path)).unwrap(),
+        b"alpha-bytes",
+        "файл должен снова приехать на телефон"
+    );
+    assert!(!Replica::open(&ctx.data_b, "dev-b")
+        .unwrap()
+        .entry(path)
+        .unwrap()
+        .unwrap()
+        .deleted);
+    assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
+}

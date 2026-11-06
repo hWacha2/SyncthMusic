@@ -723,7 +723,7 @@ pub fn build_with_peer_have(
     // «оставить удаление» противоречили бы друг другу. Если после переноса
     // содержимое изменилось, это уже не перенос, и старый путь должен
     // остаться в плане обычным удалением — иначе на телефоне будет дубль.
-    let mut move_sources: HashSet<&str> = HashSet::new();
+    let mut local_move_sources: HashSet<&str> = HashSet::new();
     for mv in &local_moves {
         let Some(target) = by_path.get(mv.to.as_str()) else {
             continue;
@@ -740,7 +740,7 @@ pub fn build_with_peer_have(
         // a. Пока блоб тот же, все промежуточные источники — часть переноса.
         let mut current = mv;
         loop {
-            move_sources.insert(current.from.as_str());
+            local_move_sources.insert(current.from.as_str());
             let Some(previous) = move_to.get(current.from.as_str()).copied() else {
                 break;
             };
@@ -762,7 +762,7 @@ pub fn build_with_peer_have(
             // ни с одной стороны, пока человек не вернёт его в синхронизацию.
             continue;
         }
-        if row.deleted && move_sources.contains(row.path.as_str()) {
+        if row.deleted && local_move_sources.contains(row.path.as_str()) {
             // Старый путь уже описан строкой переноса — отдельное удаление
             // заставило бы выбирать между двумя решениями по одному событию.
             continue;
@@ -906,11 +906,28 @@ pub fn build_with_peer_have(
         }
 
         if state.present {
+            // У удалённой строки общая база есть только до тех пор, пока пир
+            // не прислал факт новее самого удаления. Если прислал — это
+            // восстановление: прежней базы у пути больше нет, и файл должен
+            // вернуться в очередь как добавление, а не потеряться в проверке
+            // «у пира лежит та же база». Источник нашего переноса — исключение:
+            // пир мог просто ещё не увидеть перенос и присылать старый путь.
+            let base_blob = match &row {
+                Some(row)
+                    if row.deleted
+                        && state.hlc > row.hlc
+                        && !local_move_sources.contains(row.path.as_str()) =>
+                {
+                    String::new()
+                }
+                Some(row) => row.synced_blob.clone(),
+                None => String::new(),
+            };
             let local_changed = match row {
                 Some(row) if !row.deleted => {
                     row.blob != row.synced_blob || pending.contains_key(&row.path)
                 }
-                Some(row) if row.deleted => !row.synced_blob.is_empty(),
+                Some(row) if row.deleted => !base_blob.is_empty(),
                 _ => false,
             };
             let local_blob = row
@@ -919,7 +936,7 @@ pub fn build_with_peer_have(
                 .unwrap_or_default();
             let same_content = row
                 .filter(|row| !row.deleted)
-                .is_some_and(|row| row.blob == state.blob);
+                .is_some_and(|row| row.present && row.blob == state.blob);
             let move_changes_old_path = state.moved_from.as_ref().is_some_and(|from| {
                 by_path
                     .get(from.as_str())
@@ -937,8 +954,7 @@ pub fn build_with_peer_have(
                 continue;
             }
 
-            if row.is_some_and(|row| row.deleted) && row.is_some_and(|row| row.synced_blob == state.blob)
-            {
+            if row.is_some_and(|row| row.deleted) && base_blob == state.blob {
                 // Мы удалили, а у пира лежит та же база: наше удаление —
                 // единственное изменение, его и отправим.
                 continue;
@@ -1011,14 +1027,14 @@ pub fn build_with_peer_have(
                 from: state.moved_from.clone(),
                 kind: if let Some(from) = &state.moved_from {
                     ChangeKind::for_move(from, path)
-                } else if row.is_none() || row.is_some_and(|row| row.synced_blob.is_empty()) {
+                } else if base_blob.is_empty() {
                     ChangeKind::Added
                 } else {
                     ChangeKind::Updated
                 },
                 side: Side::Remote,
                 blob: state.blob.clone(),
-                base_blob: row.map(|row| row.synced_blob.clone()).unwrap_or_default(),
+                base_blob: base_blob.clone(),
                 size: state.size,
                 mtime_ns: state.mtime_ns,
                 present: row.is_some_and(|row| row.present),

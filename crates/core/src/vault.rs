@@ -105,6 +105,10 @@ pub fn preserve_file(replica: &Replica, root: &Path, rel: &str) -> Result<Option
 /// Новая `entry_put` уедет к пирам: удаление было таким же обычным LWW-фактом,
 /// значит восстановление — законная победа более новой операции.
 pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
+    // Восстановление пишет файл и журнал; скан или commit в другом соединении
+    // не должны увидеть библиотеку посередине.
+    let lock = replica.library_lock();
+    let _guard = lock.lock();
     let data_dir = replica
         .data_dir()
         .map(Path::to_path_buf)

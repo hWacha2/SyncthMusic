@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use syncth_core::{pipe, plan, resolve, scan, vault, Action, Hlc, Replica};
+use syncth_core::{commit, pipe, plan, resolve, scan, vault, Action, Hlc, Replica};
 use tempfile::TempDir;
 
 struct Ctx {
@@ -197,21 +197,27 @@ fn restore_refuses_to_resurrect_a_deleted_track() {
     assert!(err.contains("корзине"), "{err}");
 }
 
-/// Регрессия: после «удалить везде» файл вернули из корзины. Удаление уже
-/// согласовано с телефоном, поэтому у пути нет общей базы — восстановление
-/// обязано снова попасть в очередь как локальное добавление.
+/// Регрессия: файл удалили на телефоне, затем «удалить везде» на ПК, а потом
+/// вернули из корзины. У телефона остаётся томбстоун с прежней базой, хотя
+/// самого файла у него уже нет. Восстановление на ПК обязано снова попасть в
+/// план телефона как удалённое добавление, иначе блоб никто не запросит.
 #[test]
 fn restored_track_returns_to_the_change_queue() {
     let (ctx, mut a, mut b) = pair();
 
     let blob = a.entry("Album/01.flac").unwrap().unwrap().blob;
+    // Пользователь удалил файл на телефоне; копии в корзине B нет.
+    fs::remove_file(ctx.root_b.join("Album/01.flac")).unwrap();
+    // ПК видит это удаление в очереди и решает удалить трек везде.
     a.record_pending_delete("Album/01.flac", &blob, Hlc::new(1, 0))
         .unwrap();
+
     resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
     // Файл лёг в корзину A, телефон получил удаление.
     assert!(!ctx.root_a.join("Album/01.flac").exists());
     sync(&mut a, &mut b, &ctx.pipe);
     resolve::prune_deleted_files(&mut b, &ctx.root_b).unwrap();
+    assert!(b.entry("Album/01.flac").unwrap().unwrap().deleted);
 
     // Обе стороны согласны: удаление не висит в плане.
     let peer_have = b.watermarks().unwrap();
@@ -232,9 +238,25 @@ fn restored_track_returns_to_the_change_queue() {
     assert_eq!(change.kind, plan::ChangeKind::Added);
     assert!(change.base_blob.is_empty());
 
-    // Решение «принять» снова отправляет трек на телефон.
-    sync(&mut a, &mut b, &ctx.pipe);
-    assert!(!b.entry("Album/01.flac").unwrap().unwrap().deleted);
+    // Телефон видит восстановление как чужое добавление: у его томбстоуна нет
+    // общей базы, поэтому простое «та же база» больше не глотает изменение.
+    let remote_ops = a.ops_since(&peer_have).unwrap();
+    let phone_plan = plan::build(&b, &a.device_id(), "PC", &remote_ops).unwrap();
+    let remote = phone_plan
+        .remote
+        .iter()
+        .find(|c| c.path == "Album/01.flac")
+        .expect("телефон должен увидеть восстановление в своём плане");
+    assert_eq!(remote.kind, plan::ChangeKind::Added);
+    assert!(remote.base_blob.is_empty());
+
+    // Файла у телефона нет ни в библиотеке, ни в корзине — блоб надо запросить.
+    let resolution = plan::Resolution::new(&phone_plan);
+    let prepared = commit::prepare(&mut b, &phone_plan, &resolution).unwrap();
+    assert!(
+        prepared.needs.contains(&blob),
+        "телефон должен попросить блоб восстановленного трека"
+    );
 }
 
 #[test]

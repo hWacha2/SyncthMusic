@@ -379,9 +379,8 @@ impl Replica {
             "CREATE INDEX IF NOT EXISTS ops_by_path ON ops(dev, path)",
             [],
         )?;
-        if self.get_meta("schema_version")?.as_deref() != Some("7") {
-            self.repair_revived_synced_blob()?;
-            self.set_meta("schema_version", "7")?;
+        if self.get_meta("schema_version")?.as_deref() != Some("6") {
+            self.set_meta("schema_version", "6")?;
         }
         match self.get_meta("device_id")? {
             Some(stored) => {
@@ -405,36 +404,6 @@ impl Replica {
 
     pub fn device_id(&self) -> &str {
         &self.dev
-    }
-
-    /// Одноразовый ремонт баз, созданных до исправления восстановления из
-    /// корзины: `vault::restore` оставлял `synced_blob` прежним, и вернувшийся
-    /// трек выпадал из очереди изменений.
-    ///
-    /// Признак восстановления — последняя операция пути `entry_put` этого
-    /// устройства, а до неё тот же путь удалялся. База у такого пути пустая:
-    /// удаление уже стало общим фактом, восстановление — новое добавление.
-    fn repair_revived_synced_blob(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE entries SET synced_blob = ''
-             WHERE deleted = 0 AND synced_blob <> ''
-               AND EXISTS (
-                   SELECT 1 FROM ops p
-                   WHERE p.dev = entries.dev AND p.path = entries.path
-                     AND p.kind = 'entry_put'
-                     AND p.hlc_ms = entries.hlc_ms
-                     AND p.hlc_counter = entries.hlc_counter
-               )
-               AND EXISTS (
-                   SELECT 1 FROM ops d
-                   WHERE d.path = entries.path AND d.kind = 'entry_del'
-                     AND (d.hlc_ms < entries.hlc_ms
-                          OR (d.hlc_ms = entries.hlc_ms
-                              AND d.hlc_counter < entries.hlc_counter))
-               )",
-            [],
-        )?;
-        Ok(())
     }
 
     /// Блокировка библиотеки, общая для всех соединений к тому же каталогу.
@@ -2212,52 +2181,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index, 1);
-    }
-
-    #[test]
-    fn repairs_a_track_restored_before_the_fix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("music");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.mp3"), b"a").unwrap();
-        let data = tmp.path().join("data");
-        let blob;
-        {
-            let mut replica = Replica::open(&data, "dev-a").unwrap();
-            replica.set_root(&root).unwrap();
-            crate::scan::scan(&root, &mut replica).unwrap();
-            let row = replica.entry("a.mp3").unwrap().unwrap();
-            blob = row.blob.clone();
-
-            // Удаление и восстановление тем же блобом: так это и выглядело
-            // до исправления, `synced_blob` оставался непустым.
-            let del = replica
-                .make_op(OpKind::EntryDel {
-                    path: "a.mp3".into(),
-                })
-                .unwrap();
-            replica.apply(&del).unwrap();
-            let put = replica
-                .make_op(OpKind::EntryPut {
-                    path: "a.mp3".into(),
-                    blob: blob.clone(),
-                    size: row.size,
-                    mtime_ns: row.mtime_ns,
-                    added_at: row.added_at,
-                })
-                .unwrap();
-            replica.apply(&put).unwrap();
-            replica.mark_present("a.mp3").unwrap();
-            replica.confirm_synced().unwrap();
-            assert_eq!(replica.synced_blob("a.mp3").unwrap(), blob);
-            replica.set_meta("schema_version", "6").unwrap();
-        }
-
-        let replica = Replica::open(&data, "dev-a").unwrap();
-        assert!(
-            replica.synced_blob("a.mp3").unwrap().is_empty(),
-            "вернувшийся из корзины путь не должен иметь общую базу"
-        );
     }
 
     #[test]
