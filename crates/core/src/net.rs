@@ -89,6 +89,10 @@ enum Msg {
         ops: Vec<Op>,
         #[serde(default)]
         decisions: DecisionSet,
+        /// Инициатор сеанса задаёт политику для обеих сторон: в ручном режиме
+        /// правки, переименования и переносы ждут явного решения.
+        #[serde(default)]
+        manual_changes: bool,
     },
     PreviewAck {
         ops: Vec<Op>,
@@ -970,9 +974,21 @@ fn serve_one(
     let next = recv_msg(&mut r)?;
     match next {
         // Новый режим: сначала манифест и план, ничего не применяем.
-        Msg::Preview { ops, decisions } => {
+        Msg::Preview {
+            ops,
+            decisions,
+            manual_changes,
+        } => {
             let mut server = PreviewSession::accept(
-                r, w, replica, &peer_dev, &peer_name, &ops, decisions, &peer_have,
+                r,
+                w,
+                replica,
+                &peer_dev,
+                &peer_name,
+                &ops,
+                decisions,
+                &peer_have,
+                manual_changes,
             )?;
             on_session(&mut server, replica);
             server.run_with(replica, on_session)
@@ -1025,6 +1041,17 @@ pub struct PreviewSession {
 impl PreviewSession {
     /// Клиентская сторона: рукопожатие, обмен манифестами и первый план.
     pub fn open(replica: &mut Replica, addr: &str, token: &str) -> Result<Self> {
+        Self::open_with_policy(replica, addr, token, false)
+    }
+
+    /// То же, но с включённым ручным режимом изменений. Политика уезжает
+    /// серверу в первом `Preview`, чтобы обе стороны строили одинаковый план.
+    pub fn open_with_policy(
+        replica: &mut Replica,
+        addr: &str,
+        token: &str,
+        manual_changes: bool,
+    ) -> Result<Self> {
         let stream = TcpStream::connect(addr).with_context(|| format!("подключение к {addr}"))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -1064,6 +1091,7 @@ impl PreviewSession {
             &Msg::Preview {
                 ops: local_ops,
                 decisions: local_decisions.clone(),
+                manual_changes,
             },
         )?;
         let (remote_ops, peer_decisions, version) = match recv_msg(&mut r)? {
@@ -1083,12 +1111,13 @@ impl PreviewSession {
         let mut plan = {
             let lock = replica.library_lock();
             let _guard = lock.lock();
-            plan::build_with_peer_have(
+            plan::build_with_policy(
                 replica,
                 &peer_dev,
                 &peer_name,
                 &remote_ops,
                 Some(&peer_have),
+                manual_changes,
             )?
         };
         if version > plan.version {
@@ -1115,6 +1144,7 @@ impl PreviewSession {
         remote_ops: &[Op],
         peer_decisions: DecisionSet,
         peer_have: &HashMap<String, (i64, i64)>,
+        manual_changes: bool,
     ) -> Result<Self> {
         let mut merged = replica.load_decisions(peer_dev)?;
         merged.merge(&peer_decisions);
@@ -1122,12 +1152,13 @@ impl PreviewSession {
         let mut plan = {
             let lock = replica.library_lock();
             let _guard = lock.lock();
-            plan::build_with_peer_have(
+            plan::build_with_policy(
                 replica,
                 peer_dev,
                 peer_name,
                 remote_ops,
                 Some(peer_have),
+                manual_changes,
             )?
         };
         merged.retain_valid(&plan);

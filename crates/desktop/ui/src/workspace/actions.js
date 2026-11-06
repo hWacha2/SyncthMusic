@@ -318,6 +318,35 @@ export async function toggleManual() {
   }
 }
 
+export async function toggleManualChanges() {
+  if (!hasBridge || state.workspace.action || state.workspace.refreshing) return;
+  const enabled = !(state.workspace.data && state.workspace.data.manual_changes);
+  const gen = nextWorkspaceGeneration();
+  state.workspace.action = 'manual-changes';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  try {
+    // Бэкенд переоткрывает сеанс с новой политикой и сразу возвращает
+    // готовый план. Полный скан папок здесь не нужен: файлы не менялись,
+    // а «Проверяю папки» на секунду сбивало бы с толку.
+    const data = await invoke('workspace_set_manual_changes', { enabled });
+    if (!isWorkspaceGeneration(gen)) return;
+    if (data) {
+      state.workspace.data = data;
+      state.workspace.stale = false;
+      state.workspace.error = '';
+    }
+    state.workspace.note = t(
+      enabled ? 'workspace.manual_changes.on' : 'workspace.manual_changes.off',
+    );
+  } catch (error) {
+    state.workspace.note = t('workspace.error.manual', { error: errorMessage(error) });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+}
+
 export async function forgetPhone() {
   if (state.phoneBusy || !hasBridge) return;
   state.phoneBusy = 'forget';

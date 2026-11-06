@@ -93,6 +93,23 @@ function conflictReason() {
     </button>
   </template>
 
+  <template v-else-if="item.type === 'change'">
+    <button
+      class="btn btn--quiet btn--small"
+      :disabled="busy()"
+      @click="decide(item.path, 'accept')"
+    >
+      <Spinner v-if="decisionBusy('accept')" />{{ t('workspace.attention.accept_change') }}
+    </button>
+    <button
+      class="btn btn--quiet btn--small"
+      :disabled="busy()"
+      @click="decide(item.path, 'revert')"
+    >
+      <Spinner v-if="decisionBusy('revert')" />{{ t('workspace.attention.reject_change') }}
+    </button>
+  </template>
+
   <template v-else>
     <span class="ws-decision-reason">{{ conflictReason() }}</span>
     <button

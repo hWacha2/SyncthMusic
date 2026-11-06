@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
@@ -45,14 +45,30 @@ pub enum ChangeKind {
 impl ChangeKind {
     /// Действие по умолчанию. Удаления никогда не включаются сами: снятая
     /// галочка — это осознанное «Остаётся», а не «ещё не решил».
-    pub fn default_decision(self) -> Decision {
+    ///
+    /// В ручном режиме правки, переименования и переносы тоже ждут человека:
+    /// `None` означает «решения ещё нет», а не «оставить как есть».
+    pub fn default_decision(self, manual_changes: bool) -> Option<Decision> {
         match self {
-            ChangeKind::Added
-            | ChangeKind::Updated
-            | ChangeKind::Renamed
-            | ChangeKind::Moved => Decision::Accept,
-            ChangeKind::Deleted => Decision::Keep,
+            ChangeKind::Added => Some(Decision::Accept),
+            ChangeKind::Updated | ChangeKind::Renamed | ChangeKind::Moved => {
+                if manual_changes {
+                    None
+                } else {
+                    Some(Decision::Accept)
+                }
+            }
+            ChangeKind::Deleted => Some(Decision::Keep),
         }
+    }
+
+    /// Изменение содержимого или пути, которое можно принять или отклонить
+    /// вручную. Добавления и удаления решаются отдельно.
+    pub fn is_manual_change(self) -> bool {
+        matches!(
+            self,
+            ChangeKind::Updated | ChangeKind::Renamed | ChangeKind::Moved
+        )
     }
 
     /// Отличить переименование от переноса по родительским папкам. Регистр и
@@ -298,6 +314,11 @@ pub struct Plan {
     pub conflicts: Vec<Conflict>,
     #[serde(default)]
     pub decisions: DecisionSet,
+    /// Правки, переименования и переносы требуют явного решения. Политика
+    /// приходит от инициатора сеанса и должна быть одинаковой у обеих сторон:
+    /// иначе карты итоговых действий разойдутся ещё до commit.
+    #[serde(default)]
+    pub manual_changes: bool,
     pub version: Hlc,
 }
 
@@ -367,8 +388,13 @@ impl Plan {
         self.change(path).and_then(|change| {
             if change.ignored {
                 Some(Decision::Keep)
+            } else if change.aligned {
+                // Содержимое уже совпало с пиром. Такие строки не показываются
+                // в интерфейсе, поэтому в ручном режиме их нельзя оставлять
+                // без решения: иначе база никогда не зафиксируется.
+                Some(Decision::Accept)
             } else {
-                Some(change.kind.default_decision())
+                change.kind.default_decision(self.manual_changes)
             }
         })
     }
@@ -392,13 +418,26 @@ impl Plan {
             .or_else(|| self.default_decision(path))
     }
 
-    /// Конфликты без явного решения. Commit не разрешён, пока список не пуст.
+    /// Пути без явного решения. Commit не разрешён, пока список не пуст:
+    /// конфликты решаются всегда, а правки/переносы — только в ручном режиме.
     pub fn unresolved(&self) -> Vec<String> {
-        self.conflicts
-            .iter()
-            .filter(|conflict| self.explicit_entry(&conflict.path).is_none())
-            .map(|conflict| conflict.path.clone())
-            .collect()
+        let mut paths = BTreeSet::new();
+        for conflict in &self.conflicts {
+            if self.explicit_entry(&conflict.path).is_none() {
+                paths.insert(conflict.path.as_str());
+            }
+        }
+        if self.manual_changes {
+            for change in self.local.iter().chain(self.remote.iter()) {
+                if change.aligned || change.ignored || !change.kind.is_manual_change() {
+                    continue;
+                }
+                if self.explicit_entry(&change.path).is_none() {
+                    paths.insert(change.path.as_str());
+                }
+            }
+        }
+        paths.into_iter().map(str::to_string).collect()
     }
 
     /// Отпечаток набора решений для статуса сеанса. Для сверки сторон он не
@@ -458,6 +497,7 @@ impl Plan {
     /// план от перестроенного при том же наборе решений.
     pub fn fingerprint(&self) -> String {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&[u8::from(self.manual_changes)]);
         hasher.update(self.peer_dev.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.created_at.to_string().as_bytes());
@@ -467,7 +507,14 @@ impl Plan {
             hasher.update(b"\0");
             hasher.update(change.blob.as_bytes());
             hasher.update(b"\0");
-            hasher.update(change.kind.default_decision().as_str().as_bytes());
+            hasher.update(
+                change
+                    .kind
+                    .default_decision(self.manual_changes)
+                    .map(Decision::as_str)
+                    .unwrap_or("unresolved")
+                    .as_bytes(),
+            );
             hasher.update(b"\0");
             hasher.update(change.base_blob.as_bytes());
         }
@@ -640,6 +687,27 @@ pub fn build_with_peer_have(
     peer_name: &str,
     remote_ops: &[Op],
     peer_have: Option<&HashMap<String, (i64, i64)>>,
+) -> Result<Plan> {
+    build_with_policy(
+        replica,
+        peer_dev,
+        peer_name,
+        remote_ops,
+        peer_have,
+        false,
+    )
+}
+
+/// То же, но с политикой ручных изменений. Политика должна быть одинаковой
+/// у обеих сторон сеанса: иначе одна сторона считает правку принятой, а
+/// вторая — нерешённой, и `states_disagree` остановит commit.
+pub fn build_with_policy(
+    replica: &Replica,
+    peer_dev: &str,
+    peer_name: &str,
+    remote_ops: &[Op],
+    peer_have: Option<&HashMap<String, (i64, i64)>>,
+    manual_changes: bool,
 ) -> Result<Plan> {
     let created_at = Hlc::wall_ms();
     let mut version = Hlc::new(created_at, 0);
@@ -1050,6 +1118,7 @@ pub fn build_with_peer_have(
         remote: remote_changes,
         conflicts,
         decisions: DecisionSet::default(),
+        manual_changes,
         version,
     })
 }

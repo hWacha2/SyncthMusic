@@ -688,6 +688,10 @@ button:focus-visible {
   background: rgba(255, 255, 255, 0.035);
 }
 
+.ws-setting-row + .ws-setting-row {
+  margin-top: 10px;
+}
+
 .ws-setting-row:disabled {
   opacity: 0.55;
   cursor: default;
@@ -1332,6 +1336,11 @@ button:focus-visible {
 .ws-kind.is-add {
   background: rgba(169, 201, 175, 0.11);
   color: #a9c9af;
+}
+
+.ws-kind.is-change {
+  background: rgba(170, 182, 201, 0.11);
+  color: #aab6c9;
 }
 
 .ws-decision-path {

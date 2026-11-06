@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -150,6 +151,9 @@ struct Config {
     /// Новые файлы не переносятся автоматически: человек выбирает
     /// «перенести» или «оставить только на другой стороне».
     manual_additions: bool,
+    /// Правки, переименования и переносы ждут решения человека. Политика
+    /// передаётся телефону при открытии сеанса, чтобы планы совпадали.
+    manual_changes: bool,
 }
 
 // ------------------------------------------------------------------ paths
@@ -1131,6 +1135,7 @@ fn parse_decision(action: &str) -> Result<Decision, String> {
 }
 
 fn plan_payload(plan: &Plan) -> Value {
+    let unresolved: HashSet<String> = plan.unresolved().into_iter().collect();
     let changes = plan
         .local
         .iter()
@@ -1151,8 +1156,7 @@ fn plan_payload(plan: &Plan) -> Value {
                 // Совпавшие файлы нужны коммиту для фиксации базы, но в
                 // списке изменений и в счётчике их быть не должно.
                 "aligned": change.aligned,
-                "unresolved": plan.conflict(&change.path).is_some()
-                    && plan.explicit_entry(&change.path).is_none(),
+                "unresolved": unresolved.contains(&change.path),
             })
         })
         .collect::<Vec<_>>();
@@ -1171,7 +1175,7 @@ fn plan_payload(plan: &Plan) -> Value {
                 "local_blob": &conflict.local_blob,
                 "remote_blob": &conflict.remote_blob,
                 "decision": plan.effective_decision(&conflict.path).map(Decision::as_str),
-                "unresolved": plan.explicit_entry(&conflict.path).is_none(),
+                "unresolved": unresolved.contains(&conflict.path),
             })
         })
         .collect::<Vec<_>>();
@@ -1184,6 +1188,7 @@ fn plan_payload(plan: &Plan) -> Value {
         "paths": plan.path_count(),
         "aligned": plan.aligned_count(),
         "unresolved": plan.unresolved(),
+        "manual_changes": plan.manual_changes,
         "changes": changes,
         "conflicts": conflicts,
     })
@@ -1264,6 +1269,7 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
             "peers": peers,
         },
         "manual_additions": config.manual_additions,
+        "manual_changes": config.manual_changes,
         "phone": link.map(|link| json!({
             "linked": true,
             "connected": agent_connected,
@@ -1364,8 +1370,10 @@ fn ensure_preview(
     ws: &mut WorkspaceState,
     replica: &mut Replica,
 ) -> Result<(), String> {
-    let link = load_config()
+    let config = load_config();
+    let link = config
         .agent
+        .clone()
         .ok_or_else(|| "Телефон не подключён".to_string())?;
 
     if let Some(session) = ws.session.as_mut() {
@@ -1390,7 +1398,12 @@ fn ensure_preview(
     let addr = phone_sync_addr(ws)?;
     let mut last = String::new();
     for attempt in 0..4 {
-        match PreviewSession::open(replica, &addr, &link.token) {
+        match PreviewSession::open_with_policy(
+            replica,
+            &addr,
+            &link.token,
+            config.manual_changes,
+        ) {
             Ok(mut session) => {
                 let _ = session.poll(replica);
                 ws.session = Some(session);
@@ -1719,6 +1732,32 @@ fn workspace_set_manual(enabled: bool) -> Result<Value, String> {
     config.manual_additions = enabled;
     save_config(&config)?;
     Ok(json!({ "enabled": enabled }))
+}
+
+/// Ручной режим изменений. В отличие от добавлений, политика входит в сам
+/// план, поэтому открытый сеанс нужно пересобрать. Скан папок для этого не
+/// нужен: содержимое не менялось, достаточно заново открыть preview и
+/// отправить телефону новую политику.
+#[tauri::command]
+async fn workspace_set_manual_changes(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<Value, String> {
+    blocking(move || {
+        let mut config = load_config();
+        config.manual_changes = enabled;
+        save_config(&config)?;
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        ws.close();
+        ws.session_error = ensure_preview(&app, &mut ws, &mut replica).err();
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2386,6 +2425,7 @@ pub fn run() {
             workspace_decide_many,
             workspace_undecide,
             workspace_set_manual,
+            workspace_set_manual_changes,
             workspace_clear_history,
             workspace_progress,
             workspace_commit,

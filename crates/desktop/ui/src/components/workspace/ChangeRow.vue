@@ -32,7 +32,9 @@ const title = computed(() => {
 const item = computed(() => ({
   type: props.entry.type === 'conflict'
     ? 'conflict'
-    : props.entry.type === 'addition' ? 'addition' : 'deletion',
+    : props.entry.type === 'addition'
+      ? 'addition'
+      : props.entry.type === 'change' ? 'change' : 'deletion',
   path: props.entry.path,
   change: props.entry.change,
   conflict: props.entry.conflict,
@@ -45,7 +47,7 @@ const meta = computed(() => {
       ? t('workspace.changes.undecided')
       : decisionLabel(props.entry.conflict?.decision);
   }
-  return changeMeta(props.entry.change, props.manual, props.showFolder);
+  return changeMeta(props.entry.change, props.manual, props.showFolder, props.entry.pending);
 });
 
 // Клик по строке включает/выключает её в выделении. Кнопки решений и чекбокс

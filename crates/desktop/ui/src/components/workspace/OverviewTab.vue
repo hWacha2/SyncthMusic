@@ -200,7 +200,7 @@ function attentionMeta(item) {
         <span class="ws-calm-icon"><IconCheck /></span>
         <div>
           <b>{{ t('workspace.attention.empty_title') }}</b>
-          <p>{{ data?.manual_additions
+          <p>{{ data?.manual_additions || data?.manual_changes
             ? t('workspace.attention.empty_manual')
             : t('workspace.attention.empty_text') }}</p>
         </div>

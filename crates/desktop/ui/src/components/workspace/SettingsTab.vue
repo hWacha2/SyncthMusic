@@ -3,7 +3,7 @@ import Spinner from '../Spinner.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
 import { setToastSeconds, state } from '../../store.js';
-import { askClearHistory, toggleManual } from '../../workspace/actions.js';
+import { askClearHistory, toggleManual, toggleManualChanges } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
@@ -12,6 +12,7 @@ const props = defineProps({
 const toastChoices = [3, 5, 8, 12, 20];
 
 const manual = computed(() => Boolean(props.data?.manual_additions));
+const manualChanges = computed(() => Boolean(props.data?.manual_changes));
 const busy = computed(() => Boolean(state.workspace.action || state.workspace.refreshing));
 const clearing = computed(() => state.workspace.action === 'clear-history');
 </script>
@@ -35,6 +36,22 @@ const clearing = computed(() => state.workspace.action === 'clear-history');
           <span class="ws-setting-hint">{{ t('workspace.manual.hint') }}</span>
         </span>
         <span class="ws-switch" :class="{ 'is-on': manual }" aria-hidden="true">
+          <span class="ws-switch-dot"></span>
+        </span>
+      </button>
+      <button
+        type="button"
+        class="ws-setting-row"
+        role="switch"
+        :aria-checked="manualChanges ? 'true' : 'false'"
+        :disabled="busy"
+        @click="toggleManualChanges"
+      >
+        <span class="ws-setting-copy">
+          <span class="ws-setting-title">{{ t('workspace.manual_changes.label') }}</span>
+          <span class="ws-setting-hint">{{ t('workspace.manual_changes.hint') }}</span>
+        </span>
+        <span class="ws-switch" :class="{ 'is-on': manualChanges }" aria-hidden="true">
           <span class="ws-switch-dot"></span>
         </span>
       </button>

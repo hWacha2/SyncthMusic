@@ -31,16 +31,19 @@ export function decisionItems(data = workspaceData()) {
     });
   }
 
-  const manual = Boolean(data && data.manual_additions);
+  const manualAdditions = Boolean(data && data.manual_additions);
+  const manualChanges = Boolean(data && data.manual_changes);
   for (const change of plan.changes || []) {
     if (change.aligned) continue;
-    const addition = manual && change.kind === 'added';
+    const addition = manualAdditions && change.kind === 'added';
     const deletion = change.kind === 'deleted';
-    if (!addition && !deletion) continue;
+    const changed = manualChanges
+      && (change.kind === 'updated' || change.kind === 'renamed' || change.kind === 'moved');
+    if (!addition && !deletion && !changed) continue;
     if (paths.has(change.path)) continue;
     paths.add(change.path);
     items.push({
-      type: addition ? 'addition' : 'deletion',
+      type: addition ? 'addition' : deletion ? 'deletion' : 'change',
       path: change.path,
       change,
       decided: Boolean(change.decided),
@@ -65,7 +68,8 @@ export function pendingCount(data = workspaceData()) {
 export function changeEntries(data = workspaceData()) {
   const plan = planData(data);
   if (!plan) return [];
-  const manual = Boolean(data && data.manual_additions);
+  const manualAdditions = Boolean(data && data.manual_additions);
+  const manualChanges = Boolean(data && data.manual_changes);
   const entries = [];
   const seen = new Set();
 
@@ -87,8 +91,10 @@ export function changeEntries(data = workspaceData()) {
   for (const change of plan.changes || []) {
     if (change.aligned || seen.has(change.path)) continue;
     seen.add(change.path);
-    const addition = manual && change.kind === 'added';
+    const addition = manualAdditions && change.kind === 'added';
     const deletion = change.kind === 'deleted';
+    const changed = manualChanges
+      && (change.kind === 'updated' || change.kind === 'renamed' || change.kind === 'moved');
     entries.push({
       type: addition ? 'addition' : deletion ? 'deletion' : 'change',
       path: change.path,
@@ -97,7 +103,7 @@ export function changeEntries(data = workspaceData()) {
       side: change.side,
       folder: dirname(change.path),
       decided: Boolean(change.decided),
-      pending: Boolean(!change.decided && (addition || deletion)),
+      pending: Boolean(!change.decided && (addition || deletion || changed)),
       size: change.size,
     });
   }
@@ -266,6 +272,11 @@ export function decisionMeta(item) {
       ? t('workspace.attention.added_on_phone')
       : t('workspace.attention.added_on_pc'));
     if (item.size) parts.push(formatSize(item.size));
+  } else if (item.type === 'change') {
+    parts.push(item.change?.side === 'remote'
+      ? t('workspace.attention.changed_on_phone')
+      : t('workspace.attention.changed_on_pc'));
+    if (item.size) parts.push(formatSize(item.size));
   } else {
     parts.push(item.change?.side === 'remote'
       ? t('workspace.attention.deleted_on_phone')
@@ -278,10 +289,11 @@ export function decisionMeta(item) {
 export function attentionKind(item) {
   if (item.type === 'conflict') return { css: 'is-conflict', label: t('workspace.attention.conflict') };
   if (item.type === 'addition') return { css: 'is-add', label: t('workspace.attention.addition') };
+  if (item.type === 'change') return { css: 'is-change', label: kindLabel(item.change?.kind) };
   return { css: 'is-delete', label: t('workspace.attention.deletion') };
 }
 
-export function changeMeta(change, manual = false, showFolder = false) {
+export function changeMeta(change, manual = false, showFolder = false, pending = false) {
   const parts = [];
   if (showFolder) {
     parts.push(dirname(change.path) || t('workspace.changes.root'));
@@ -301,7 +313,7 @@ export function changeMeta(change, manual = false, showFolder = false) {
     parts.push(change.decided ? decisionLabel(change.decision) : t('workspace.changes.undecided'));
   } else if (change.decided) {
     parts.push(decisionLabel(change.decision));
-  } else if (manual && change.kind === 'added') {
+  } else if (pending || (manual && change.kind === 'added')) {
     parts.push(t('workspace.changes.undecided'));
   } else {
     parts.push(t('workspace.changes.auto'));

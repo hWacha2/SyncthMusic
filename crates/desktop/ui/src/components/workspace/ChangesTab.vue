@@ -160,6 +160,7 @@ watch(activeEntries, (list) => {
 const ACTION_SETS = {
   deletion: ['keep_in_library', 'only_here', 'delete_everywhere'],
   addition: ['accept', 'only_here', 'delete_everywhere'],
+  change: ['accept', 'revert'],
   conflict: ['keep', 'accept', 'keep_both'],
 };
 
@@ -175,11 +176,15 @@ function bulkLabel(action) {
     if (selectedEntries.value.some((entry) => entry.type === 'conflict')) {
       return t('workspace.attention.keep_phone');
     }
+    const kinds = new Set(selectedEntries.value.map((entry) => entry.type));
+    if (kinds.size === 1 && kinds.has('change')) return t('workspace.attention.accept_change');
+    if (kinds.size > 1) return t('decision.accept');
     const sides = new Set(selectedEntries.value.map((entry) => entry.change?.side));
     if (sides.size === 1 && sides.has('remote')) return t('workspace.attention.copy_to_pc');
     if (sides.size === 1 && sides.has('local')) return t('workspace.attention.copy_to_phone');
     return t('workspace.attention.copy_to_phone');
   }
+  if (action === 'revert') return t('workspace.attention.reject_change');
   if (action === 'only_here') {
     const kinds = new Set(selectedEntries.value.map((entry) => entry.type));
     if (kinds.size > 1) return t('workspace.attention.only_one_side');
