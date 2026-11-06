@@ -61,20 +61,6 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
-    /// Слушать LAN и обслуживать подключения.
-    Serve {
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        token: Option<String>,
-    },
-    /// Синхронизироваться с устройством по адресу.
-    Sync {
-        #[arg(long)]
-        addr: String,
-        #[arg(long)]
-        token: Option<String>,
-    },
     /// Найти устройства в локальной сети.
     Discover {
         #[arg(long, default_value_t = 2)]
@@ -390,41 +376,6 @@ fn run() -> Result<()> {
                 replica.ensure_token()?
             };
             println!("{token}");
-        }
-
-        Command::Serve { bind, token } => {
-            let token = match token {
-                Some(t) => t,
-                None => replica.ensure_token()?,
-            };
-            println!("токен: syncth token");
-            net::serve(&mut replica, &bind, &token, |_stats| {})?;
-        }
-
-        Command::Sync { addr, token } => {
-            let token = token.or_else(|| std::env::var("SYNCTH_TOKEN").ok());
-            let token = match token {
-                Some(t) => t,
-                None => replica.ensure_token()?,
-            };
-            // Свежий скан перед обменом: без него телефон отправит устаревший манифест.
-            if let Some(root) = replica.root()? {
-                let report = scan::scan(&root, &mut replica)?;
-                if report.ops_emitted > 0 {
-                    println!("перед синхронизацией: +{} изменений", report.ops_emitted);
-                }
-            }
-            let stats = net::sync_with_peer(&mut replica, &addr, &token)?;
-            println!("синхронизировано с {addr}");
-            println!("  {}", stats.summary());
-            println!("  state: {}", replica.state_hash()?);
-            if !replica.pending_deletes()?.is_empty() {
-                println!();
-                println!(
-                    "ожидает решения об удалении: {} — syncth pending list",
-                    replica.pending_deletes()?.len()
-                );
-            }
         }
 
         Command::Discover { seconds } => {

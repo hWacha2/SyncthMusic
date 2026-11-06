@@ -89,10 +89,6 @@ enum Msg {
         ops: Vec<Op>,
         #[serde(default)]
         decisions: DecisionSet,
-        /// Инициатор сеанса задаёт политику для обеих сторон: в ручном режиме
-        /// правки, переименования и переносы ждут явного решения.
-        #[serde(default)]
-        manual_changes: bool,
     },
     PreviewAck {
         ops: Vec<Op>,
@@ -974,11 +970,7 @@ fn serve_one(
     let next = recv_msg(&mut r)?;
     match next {
         // Новый режим: сначала манифест и план, ничего не применяем.
-        Msg::Preview {
-            ops,
-            decisions,
-            manual_changes,
-        } => {
+        Msg::Preview { ops, decisions } => {
             let mut server = PreviewSession::accept(
                 r,
                 w,
@@ -988,7 +980,6 @@ fn serve_one(
                 &ops,
                 decisions,
                 &peer_have,
-                manual_changes,
             )?;
             on_session(&mut server, replica);
             server.run_with(replica, on_session)
@@ -1041,17 +1032,6 @@ pub struct PreviewSession {
 impl PreviewSession {
     /// Клиентская сторона: рукопожатие, обмен манифестами и первый план.
     pub fn open(replica: &mut Replica, addr: &str, token: &str) -> Result<Self> {
-        Self::open_with_policy(replica, addr, token, false)
-    }
-
-    /// То же, но с включённым ручным режимом изменений. Политика уезжает
-    /// серверу в первом `Preview`, чтобы обе стороны строили одинаковый план.
-    pub fn open_with_policy(
-        replica: &mut Replica,
-        addr: &str,
-        token: &str,
-        manual_changes: bool,
-    ) -> Result<Self> {
         let stream = TcpStream::connect(addr).with_context(|| format!("подключение к {addr}"))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -1091,7 +1071,6 @@ impl PreviewSession {
             &Msg::Preview {
                 ops: local_ops,
                 decisions: local_decisions.clone(),
-                manual_changes,
             },
         )?;
         let (remote_ops, peer_decisions, version) = match recv_msg(&mut r)? {
@@ -1111,13 +1090,12 @@ impl PreviewSession {
         let mut plan = {
             let lock = replica.library_lock();
             let _guard = lock.lock();
-            plan::build_with_policy(
+            plan::build_with_peer_have(
                 replica,
                 &peer_dev,
                 &peer_name,
                 &remote_ops,
                 Some(&peer_have),
-                manual_changes,
             )?
         };
         if version > plan.version {
@@ -1144,7 +1122,6 @@ impl PreviewSession {
         remote_ops: &[Op],
         peer_decisions: DecisionSet,
         peer_have: &HashMap<String, (i64, i64)>,
-        manual_changes: bool,
     ) -> Result<Self> {
         let mut merged = replica.load_decisions(peer_dev)?;
         merged.merge(&peer_decisions);
@@ -1152,13 +1129,12 @@ impl PreviewSession {
         let mut plan = {
             let lock = replica.library_lock();
             let _guard = lock.lock();
-            plan::build_with_policy(
+            plan::build_with_peer_have(
                 replica,
                 peer_dev,
                 peer_name,
                 remote_ops,
                 Some(peer_have),
-                manual_changes,
             )?
         };
         merged.retain_valid(&plan);
@@ -1219,7 +1195,7 @@ impl PreviewSession {
     }
 
     pub fn unresolved(&self) -> usize {
-        self.plan.unresolved().len()
+        self.plan.resolve().unresolved().len()
     }
 
     pub fn decisions_hash(&self) -> String {
@@ -1228,7 +1204,7 @@ impl PreviewSession {
 
     /// Итоговые действия по путям — то, что стороны сверяют между собой.
     pub fn state(&self) -> BTreeMap<String, String> {
-        self.plan.effective_state()
+        self.plan.resolve().state()
     }
 
     /// Записать решение в БД. Отправка пиру произойдёт на ближайшем `poll`.
@@ -1314,7 +1290,7 @@ impl PreviewSession {
         // кнопка могла бы уйти раньше, чем пир забудет старое решение.
         self.send(&Msg::Decision(decision))?;
         self.send(&Msg::DecisionState {
-            state: self.plan.effective_state(),
+            state: self.plan.resolve().state(),
             version: self.plan.version,
         })?;
         Ok(())
@@ -1345,12 +1321,12 @@ impl PreviewSession {
                     self.announced.insert(decision.path.clone(), decision);
                     replica.save_plan(&self.plan)?;
                     self.send(&Msg::DecisionState {
-                        state: self.plan.effective_state(),
+                        state: self.plan.resolve().state(),
                         version: self.plan.version,
                     })?;
                 }
                 Msg::DecisionState { state, .. } => {
-                    self.diverged = plan::states_disagree(&self.plan.effective_state(), &state);
+                    self.diverged = plan::states_disagree(&self.plan.resolve().state(), &state);
                 }
                 Msg::Heartbeat => {}
                 Msg::Commit { state } => {
@@ -1407,7 +1383,7 @@ impl PreviewSession {
             self.send(&Msg::Decision(decision))?;
         }
         self.send(&Msg::DecisionState {
-            state: self.plan.effective_state(),
+            state: self.plan.resolve().state(),
             version: self.plan.version,
         })?;
         Ok(())
@@ -1470,10 +1446,13 @@ impl PreviewSession {
         // он увидел бы недописанные файлы и построил бы операции по ним.
         let lock = replica.library_lock();
         let _guard = lock.lock();
-        commit::validate(replica, &self.plan)?;
+        // Итог фиксируется один раз на весь commit: решения уже не меняются,
+        // а сверка и применение должны видеть одно и то же.
+        let resolution = self.plan.resolve();
+        commit::validate(replica, &self.plan, &resolution)?;
         self.read_only = true;
 
-        let state = self.plan.effective_state();
+        let state = resolution.state();
         self.commit_timeout()?;
         let result = (|| -> Result<commit::Outcome> {
             self.send(&Msg::Commit { state })?;
@@ -1483,7 +1462,7 @@ impl PreviewSession {
                 other => bail!("ожидали commit_go, получили {other:?}"),
             }
 
-            let prepared = commit::prepare(replica, &self.plan)?;
+            let prepared = commit::prepare(replica, &self.plan, &resolution)?;
             self.send(&Msg::CommitPlan {
                 ops: prepared.ops.clone(),
                 needs: prepared.needs.clone(),
@@ -1508,8 +1487,8 @@ impl PreviewSession {
                 other => bail!("ожидали commit_ready, получили {other:?}"),
             }
 
-            commit::apply_local(replica, &self.plan, &prepared)?;
-            let outcome = commit::finalize(replica, &self.plan, &peer_ops)?;
+            commit::apply_local(replica, &self.plan, &resolution, &prepared)?;
+            let outcome = commit::finalize(replica, &self.plan, &resolution, &peer_ops)?;
             self.send(&Msg::CommitDone {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,
@@ -1550,14 +1529,17 @@ impl PreviewSession {
         // commit полностью не разложит файлы и операции.
         let lock = replica.library_lock();
         let _guard = lock.lock();
-        if plan::states_disagree(&self.plan.effective_state(), &peer_state) {
+        // Сверяем итоговые действия, а не факты: решения обеих сторон уже
+        // слиты в план, и commit должен видеть одно и то же.
+        let resolution = self.plan.resolve();
+        if plan::states_disagree(&resolution.state(), &peer_state) {
             let message = "план разошёлся — обновите его".to_string();
             let _ = self.send(&Msg::Error {
                 message: message.clone(),
             });
             bail!("{message}");
         }
-        if let Err(e) = commit::validate(replica, &self.plan) {
+        if let Err(e) = commit::validate(replica, &self.plan, &resolution) {
             let message = format!("{e:#}");
             let _ = self.send(&Msg::Error {
                 message: message.clone(),
@@ -1569,7 +1551,7 @@ impl PreviewSession {
 
         let result = (|| -> Result<()> {
             self.send(&Msg::CommitGo)?;
-            let prepared = commit::prepare(replica, &self.plan)?;
+            let prepared = commit::prepare(replica, &self.plan, &resolution)?;
             self.send(&Msg::CommitPlan {
                 ops: prepared.ops.clone(),
                 needs: prepared.needs.clone(),
@@ -1594,8 +1576,8 @@ impl PreviewSession {
                 other => bail!("ожидали commit_ready, получили {other:?}"),
             }
 
-            commit::apply_local(replica, &self.plan, &prepared)?;
-            let outcome = commit::finalize(replica, &self.plan, &peer_ops)?;
+            commit::apply_local(replica, &self.plan, &resolution, &prepared)?;
+            let outcome = commit::finalize(replica, &self.plan, &resolution, &peer_ops)?;
             self.send(&Msg::CommitDone {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,

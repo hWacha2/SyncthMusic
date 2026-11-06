@@ -13,18 +13,19 @@ import {
   groupByFolder,
   groupByType,
   kindLabel,
+  manualOpenSet,
   planData,
   sortEntries,
 } from '../../workspace/model.js';
-import { askBulkDelete, decideMany } from '../../workspace/actions.js';
+import { askBulkDelete, decideMany, toggleManualOpen } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
 });
 
 const plan = computed(() => planData(props.data));
-const manual = computed(() => Boolean(props.data?.manual_additions));
 const entries = computed(() => changeEntries(props.data));
+const openSet = computed(() => manualOpenSet(props.data));
 const aligned = computed(() => Number(plan.value?.aligned) || 0);
 
 const remote = computed(() => entries.value.filter(
@@ -385,11 +386,12 @@ function typeTitle(type) {
             v-for="entry in alphaEntries"
             :key="entry.path"
             :entry="entry"
-            :manual="manual"
+            :open="openSet.has(entry.path)"
             :selection="selectionActive"
             :selected="selectedSet.has(entry.path)"
             :selectable="entry.pending"
             @toggle="toggleEntry(entry)"
+            @manual="toggleManualOpen(entry.path)"
           />
         </div>
       </section>
@@ -435,11 +437,12 @@ function typeTitle(type) {
               v-for="entry in folder.items"
               :key="entry.path"
               :entry="entry"
-              :manual="manual"
+              :open="openSet.has(entry.path)"
               :selection="selectionActive"
               :selected="selectedSet.has(entry.path)"
               :selectable="entry.pending"
               @toggle="toggleEntry(entry)"
+            @manual="toggleManualOpen(entry.path)"
             />
           </div>
         </div>
@@ -451,12 +454,13 @@ function typeTitle(type) {
             v-for="entry in alphaEntries"
             :key="entry.path"
             :entry="entry"
-            :manual="manual"
+            :open="openSet.has(entry.path)"
             :show-folder="true"
             :selection="selectionActive"
             :selected="selectedSet.has(entry.path)"
             :selectable="entry.pending"
             @toggle="toggleEntry(entry)"
+            @manual="toggleManualOpen(entry.path)"
           />
         </div>
       </section>
@@ -478,12 +482,13 @@ function typeTitle(type) {
               v-for="entry in group.items"
               :key="entry.path"
               :entry="entry"
-              :manual="manual"
+              :open="openSet.has(entry.path)"
               :show-folder="true"
               :selection="selectionActive"
               :selected="selectedSet.has(entry.path)"
               :selectable="entry.pending"
               @toggle="toggleEntry(entry)"
+            @manual="toggleManualOpen(entry.path)"
             />
           </div>
         </section>

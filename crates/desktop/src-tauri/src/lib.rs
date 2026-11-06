@@ -1,16 +1,12 @@
 //! Десктопный клиент SynctMusic.
 //!
-//! Приложение — тонкая оболочка над уже существующим демоном `syncthd`:
-//! состояние и действия берутся из его локального HTTP API (`127.0.0.1:47889`),
-//! а установка/запуск демона и выбор библиотеки выполняются здесь.
-//!
-//! Запросы к демону идут из Rust, а не из webview: у API нет CORS-заголовков,
-//! и так frontend не зависит от сетевых разрешений webview.
+//! Ядро (`syncth-core`) живёт прямо в приложении: сканирование, план и commit
+//! выполняются здесь, без отдельной службы и HTTP-прослойки. Телефон только
+//! принимает входящий сеанс и исполняет решения, принятые на ПК.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::collections::BTreeSet;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,7 +20,6 @@ use syncth_core::transport::Transport;
 use syncth_core::{scan, vault, Decision, Hlc, Replica};
 use tauri::Manager;
 
-const UI_ADDR: &str = "127.0.0.1:47889";
 const SYNC_BIND: &str = "0.0.0.0:47887";
 
 /// Как часто ПК проверяет живой сеанс и заодно забирает актуальную папку.
@@ -47,8 +42,6 @@ static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct Desktop {
-    /// Демон, запущенный именно этим окном. Нужен, чтобы не плодить процессы.
-    child: Mutex<Option<std::process::Child>>,
     agent: Mutex<AgentState>,
     workspace: Mutex<WorkspaceState>,
     /// Ход долгой проверки. Отдельный мьютекс: интерфейс опрашивает его,
@@ -71,8 +64,8 @@ struct AgentState {
     last_error: Option<String>,
 }
 
-/// Полный синк ПК↔телефон идёт поверх того же TCP-протокола, что у демона,
-/// но живёт прямо в приложении: отдельного процесса не нужно.
+/// Полный синк ПК↔телефон идёт поверх TCP-протокола `syncth-core`
+/// и живёт прямо в приложении: отдельного процесса не нужно.
 #[derive(Default)]
 struct WorkspaceState {
     session: Option<PreviewSession>,
@@ -145,14 +138,13 @@ struct AgentLink {
 struct Config {
     root: Option<String>,
     data_dir: Option<String>,
-    daemon_bin: Option<String>,
     /// Сопряжённый Android-агент. Путь к папке хранится здесь, на ПК.
     agent: Option<AgentLink>,
     /// Новые файлы не переносятся автоматически: человек выбирает
     /// «перенести» или «оставить только на другой стороне».
     manual_additions: bool,
     /// Правки, переименования и переносы ждут решения человека. Политика
-    /// передаётся телефону при открытии сеанса, чтобы планы совпадали.
+    /// живёт только здесь, в план она не входит: план описывает факты.
     manual_changes: bool,
 }
 
@@ -211,94 +203,6 @@ fn default_device_id(data_dir: &Path) -> String {
         acc = acc.wrapping_mul(1099511628211);
     }
     format!("dev-{:08x}", (acc >> 32) as u32)
-}
-
-fn daemon_name() -> &'static str {
-    if cfg!(windows) {
-        "syncthd.exe"
-    } else {
-        "syncthd"
-    }
-}
-
-fn resolve_daemon_bin(config: &Config) -> Option<PathBuf> {
-    if let Some(path) = &config.daemon_bin {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let mut candidates = vec![dir.join(daemon_name())];
-    if let Some(target) = dir.parent() {
-        candidates.push(target.join("release").join(daemon_name()));
-        candidates.push(target.join("debug").join(daemon_name()));
-    }
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(daemon_name()))
-        .find(|path| path.is_file())
-}
-
-// ------------------------------------------------------------------ http to daemon
-
-fn http(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
-    let addr: SocketAddr = UI_ADDR.parse().map_err(|e| format!("{e}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1200))
-        .map_err(|e| format!("Служба не отвечает: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(190)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-
-    let body = body.unwrap_or("");
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {UI_ADDR}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(head.as_bytes())
-        .and_then(|_| stream.write_all(body.as_bytes()))
-        .and_then(|_| stream.flush())
-        .map_err(|e| format!("Не удалось отправить запрос службе: {e}"))?;
-
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("Не удалось прочитать ответ службы: {e}"))?;
-
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "Служба вернула некорректный ответ".to_string())?;
-    let head = String::from_utf8_lossy(&raw[..split]);
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| "Служба вернула ответ без статуса".to_string())?;
-    let payload = String::from_utf8_lossy(&raw[split + 4..]);
-    let value: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({ "raw": payload }));
-
-    if !(200..300).contains(&status) {
-        let message = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Служба вернула ошибку");
-        return Err(message.to_string());
-    }
-    Ok(value)
-}
-
-fn daemon_running() -> bool {
-    http("GET", "/api/status", None).is_ok()
 }
 
 async fn blocking<T, F>(f: F) -> Result<T, String>
@@ -1134,8 +1038,50 @@ fn parse_decision(action: &str) -> Result<Decision, String> {
     })
 }
 
-fn plan_payload(plan: &Plan) -> Value {
-    let unresolved: HashSet<String> = plan.unresolved().into_iter().collect();
+/// Единый предикат «путь ждёт решения». Его используют и интерфейс, и guard
+/// перед commit: если список пуст, передавать можно. Ручная политика живёт
+/// только здесь, в настройке ПК: план описывает факты, а какие из них требуют
+/// человека, решает приложение.
+fn pending_paths(plan: &Plan, config: &Config) -> BTreeSet<String> {
+    let mut pending = BTreeSet::new();
+
+    for conflict in &plan.conflicts {
+        if plan.explicit_entry(&conflict.path).is_none() {
+            pending.insert(conflict.path.clone());
+        }
+    }
+
+    for change in plan.local.iter().chain(plan.remote.iter()) {
+        if change.aligned || change.ignored {
+            continue;
+        }
+        // Конфликт уже учтён выше и решается своим набором действий.
+        if plan.conflict(&change.path).is_some() {
+            continue;
+        }
+        let manual = match change.kind {
+            ChangeKind::Deleted => true,
+            ChangeKind::Added => config.manual_additions,
+            ChangeKind::Updated | ChangeKind::Renamed | ChangeKind::Moved => {
+                config.manual_changes
+            }
+        };
+        if manual && plan.explicit_entry(&change.path).is_none() {
+            pending.insert(change.path.clone());
+        }
+    }
+
+    pending
+}
+
+fn plan_payload(plan: &Plan, config: &Config) -> Value {
+    let resolution = plan.resolve();
+    let pending = pending_paths(plan, config);
+    let unresolved: BTreeSet<&str> = resolution
+        .unresolved()
+        .iter()
+        .map(String::as_str)
+        .collect();
     let changes = plan
         .local
         .iter()
@@ -1149,14 +1095,16 @@ fn plan_payload(plan: &Plan) -> Value {
                 "size": change.size,
                 "present": change.present,
                 "ignored": change.ignored,
-                "decision": plan.effective_decision(&change.path).map(Decision::as_str),
+                // Итог может быть базовым (авто) или явным решением человека.
+                "decision": resolution.action(&change.path).map(Decision::as_str),
                 // Удаление по умолчанию «оставить», поэтому одного decision
                 // мало: интерфейсу нужно знать, подтвердил ли это человек.
                 "decided": plan.explicit_entry(&change.path).is_some(),
                 // Совпавшие файлы нужны коммиту для фиксации базы, но в
                 // списке изменений и в счётчике их быть не должно.
                 "aligned": change.aligned,
-                "unresolved": unresolved.contains(&change.path),
+                "pending": pending.contains(&change.path),
+                "unresolved": unresolved.contains(change.path.as_str()),
             })
         })
         .collect::<Vec<_>>();
@@ -1174,8 +1122,10 @@ fn plan_payload(plan: &Plan) -> Value {
                 "remote_size": conflict.remote_size,
                 "local_blob": &conflict.local_blob,
                 "remote_blob": &conflict.remote_blob,
-                "decision": plan.effective_decision(&conflict.path).map(Decision::as_str),
-                "unresolved": unresolved.contains(&conflict.path),
+                "decision": resolution.action(&conflict.path).map(Decision::as_str),
+                "decided": plan.explicit_entry(&conflict.path).is_some(),
+                "pending": pending.contains(&conflict.path),
+                "unresolved": unresolved.contains(conflict.path.as_str()),
             })
         })
         .collect::<Vec<_>>();
@@ -1187,8 +1137,8 @@ fn plan_payload(plan: &Plan) -> Value {
         "version": plan.version,
         "paths": plan.path_count(),
         "aligned": plan.aligned_count(),
-        "unresolved": plan.unresolved(),
-        "manual_changes": plan.manual_changes,
+        "unresolved": resolution.unresolved(),
+        "pending": pending.into_iter().collect::<Vec<_>>(),
         "changes": changes,
         "conflicts": conflicts,
     })
@@ -1196,7 +1146,7 @@ fn plan_payload(plan: &Plan) -> Value {
 
 fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceState) -> Value {
     let config = load_config();
-    let link = config.agent;
+    let link = config.agent.clone();
     let live = replica.live_entries().unwrap_or_default();
     let files = live.len();
     let total = live.iter().map(|entry| entry.size).sum::<u64>();
@@ -1286,7 +1236,7 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
         "session_error": ws.session_error,
         "checked_at": ws.checked_at,
         "session": session,
-        "plan": ws.session.as_ref().map(|session| plan_payload(&session.plan)),
+        "plan": ws.session.as_ref().map(|session| plan_payload(&session.plan, &config)),
         "vault": vault_rows.into_iter().map(|row| json!({
             "path": row.path,
             "size": row.size,
@@ -1398,12 +1348,7 @@ fn ensure_preview(
     let addr = phone_sync_addr(ws)?;
     let mut last = String::new();
     for attempt in 0..4 {
-        match PreviewSession::open_with_policy(
-            replica,
-            &addr,
-            &link.token,
-            config.manual_changes,
-        ) {
+        match PreviewSession::open(replica, &addr, &link.token) {
             Ok(mut session) => {
                 let _ = session.poll(replica);
                 ws.session = Some(session);
@@ -1725,19 +1670,29 @@ async fn workspace_undecide(app: tauri::AppHandle, path: String) -> Result<Value
 }
 
 /// Ручной режим добавлений. Настройка общая для всех сеансов, поэтому живёт
-/// в конфиге, а не в состоянии окна.
+/// в конфиге, а не в состоянии окна. Возвращаем готовый payload: план не
+/// меняется, меняется только список путей, которым нужно решение, поэтому
+/// переоткрывать сеанс или сканировать папки не нужно.
 #[tauri::command]
-fn workspace_set_manual(enabled: bool) -> Result<Value, String> {
-    let mut config = load_config();
-    config.manual_additions = enabled;
-    save_config(&config)?;
-    Ok(json!({ "enabled": enabled }))
+async fn workspace_set_manual(app: tauri::AppHandle, enabled: bool) -> Result<Value, String> {
+    blocking(move || {
+        let mut config = load_config();
+        config.manual_additions = enabled;
+        save_config(&config)?;
+        let replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
 }
 
-/// Ручной режим изменений. В отличие от добавлений, политика входит в сам
-/// план, поэтому открытый сеанс нужно пересобрать. Скан папок для этого не
-/// нужен: содержимое не менялось, достаточно заново открыть preview и
-/// отправить телефону новую политику.
+/// Ручной режим изменений. Политика не входит в план: план остаётся набором
+/// фактов, а необходимость решения вычисляется при отображении и перед commit.
+/// Поэтому переключатель мгновенный — без переоткрытия сеанса.
 #[tauri::command]
 async fn workspace_set_manual_changes(
     app: tauri::AppHandle,
@@ -1747,14 +1702,12 @@ async fn workspace_set_manual_changes(
         let mut config = load_config();
         config.manual_changes = enabled;
         save_config(&config)?;
-        let mut replica = workspace_replica()?;
+        let replica = workspace_replica()?;
         let desktop = app.state::<Desktop>();
-        let mut ws = desktop
+        let ws = desktop
             .workspace
             .lock()
             .map_err(|_| "состояние синхронизации недоступно".to_string())?;
-        ws.close();
-        ws.session_error = ensure_preview(&app, &mut ws, &mut replica).err();
         Ok(workspace_payload(&app, &replica, &ws))
     })
     .await
@@ -1773,44 +1726,22 @@ async fn workspace_commit(app: tauri::AppHandle) -> Result<Value, String> {
             return Err("Сеанс ещё не открыт".to_string());
         };
 
-        // Удаление никогда не применяется по умолчанию: человек должен
-        // явно выбрать «удалить везде» или «оставить».
-        let undecided = session
-            .plan
-            .local
-            .iter()
-            .chain(session.plan.remote.iter())
-            .filter(|change| {
-                change.kind == ChangeKind::Deleted
-                    && session.plan.explicit_entry(&change.path).is_none()
-            })
-            .count();
-        if undecided > 0 {
-            return Err(format!(
-                "Удаления без решения: {undecided}. Подтвердите их в списке решений."
-            ));
-        }
-
-        // В ручном режиме новые файлы тоже ждут решения: иначе удалённый
-        // до первого скана файл молча вернулся бы с ПК на телефон.
-        if load_config().manual_additions {
-            let additions = session
-                .plan
-                .local
+        // Тот же предикат, что отдаёт интерфейс. Раскрытая строка в авто-режиме
+        // ещё не решение: интерфейс блокирует commit, пока она открыта.
+        let config = load_config();
+        let pending = pending_paths(&session.plan, &config);
+        if !pending.is_empty() {
+            let preview = pending
                 .iter()
-                .chain(session.plan.remote.iter())
-                .filter(|change| {
-                    change.kind == ChangeKind::Added
-                        && !change.aligned
-                        && session.plan.explicit_entry(&change.path).is_none()
-                })
-                .count();
-            if additions > 0 {
-                return Err(format!(
-                    "Новые файлы без решения: {additions}. Выберите «Перенести» \
-                     или «Оставить на другой стороне»."
-                ));
-            }
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = if pending.len() > 3 { "…" } else { "" };
+            return Err(format!(
+                "Без решения: {}. Подтвердите изменения в списке: {preview}{more}",
+                pending.len()
+            ));
         }
 
         let outcome = match session.commit(&mut replica) {
@@ -2002,14 +1933,12 @@ fn workspace_close(app: tauri::AppHandle) -> Value {
 fn app_info() -> Value {
     let config = load_config();
     let data_dir = effective_data_dir(&config);
-    let daemon = resolve_daemon_bin(&config);
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path().to_string_lossy(),
         "config": config,
         "data_dir": data_dir.to_string_lossy(),
         "device_name": syncth_core::device_name(),
-        "daemon_bin": daemon.map(|p| p.to_string_lossy().to_string()),
         "app_data_dir": app_data_dir().to_string_lossy(),
         "platform": if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" },
         "sync_addr": SYNC_BIND,
@@ -2017,199 +1946,8 @@ fn app_info() -> Value {
 }
 
 #[tauri::command]
-async fn daemon_status() -> Value {
-    match blocking(|| http("GET", "/api/status", None)).await {
-        Ok(status) => json!({ "running": true, "status": status }),
-        Err(error) => json!({ "running": false, "error": error }),
-    }
-}
-
-#[tauri::command]
-async fn daemon_pair_code() -> Result<Value, String> {
-    blocking(|| http("GET", "/api/pair-code", None)).await
-}
-
-#[tauri::command]
-async fn daemon_plan() -> Value {
-    match blocking(|| http("GET", "/api/plan", None)).await {
-        Ok(plan) => plan,
-        Err(error) => json!({
-            "connected": false,
-            "local_only": true,
-            "stale": false,
-            "plan": Value::Null,
-            "error": error,
-        }),
-    }
-}
-
-#[tauri::command]
-async fn daemon_action(name: String, payload: Option<Value>) -> Result<Value, String> {
-    let payload = payload.unwrap_or(Value::Null);
-    let field = |key: &str| -> Result<String, String> {
-        payload
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("не передано поле «{key}»"))
-    };
-
-    let (path, body) = match name.as_str() {
-        "scan" => ("/api/scan", None),
-        "sync" => ("/api/sync", None),
-        "gc" => ("/api/gc", None),
-        "disk_check" => ("/api/disk/check", None),
-        "pause" => (
-            "/api/pause",
-            Some(json!({
-                "paused": payload.get("paused").and_then(Value::as_bool).unwrap_or(false)
-            })),
-        ),
-        "pair" => ("/api/pair", Some(json!({ "code": field("code")? }))),
-        "connect" => ("/api/connect", Some(json!({ "dev": field("dev")? }))),
-        "disconnect" => ("/api/disconnect", None),
-        "peer_forget" => (
-            "/api/peers/forget",
-            Some(json!({ "dev": field("dev")? })),
-        ),
-        "pending_resolve" => (
-            "/api/pending/resolve",
-            Some(json!({ "path": field("path")?, "action": field("action")? })),
-        ),
-        "pending_forget" => (
-            "/api/pending/forget",
-            Some(json!({ "path": field("path")? })),
-        ),
-        "restore" => ("/api/restore", Some(json!({ "path": field("path")? }))),
-        "plan_refresh" => ("/api/plan/refresh", None),
-        "decision" => (
-            "/api/decision",
-            Some(json!({ "path": field("path")?, "action": field("action")? })),
-        ),
-        "commit" => ("/api/commit", None),
-        "ignore" => (
-            "/api/ignore",
-            Some(json!({
-                "path": field("path")?,
-                "ignored": payload.get("ignored").and_then(Value::as_bool).unwrap_or(true)
-            })),
-        ),
-        other => return Err(format!("неизвестное действие: {other}")),
-    };
-
-    let body = body.map(|value| value.to_string());
-    blocking(move || http("POST", path, body.as_deref())).await
-}
-
-#[tauri::command]
-fn start_daemon(state: tauri::State<'_, Desktop>) -> Result<Value, String> {
-    if daemon_running() {
-        return Ok(json!({ "started": false, "message": "Служба уже запущена" }));
-    }
-
-    let config = load_config();
-    let root =
-        effective_root(&config).ok_or_else(|| "сначала выберите папку с музыкой".to_string())?;
-    if !root.is_dir() {
-        return Err(format!("папка библиотеки не найдена: {}", root.display()));
-    }
-    let bin = resolve_daemon_bin(&config).ok_or_else(|| {
-        "не найден syncthd: соберите его командой `cargo build --release -p syncth-daemon`"
-            .to_string()
-    })?;
-    let data_dir = effective_data_dir(&config);
-    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(app_data_dir()).map_err(|e| e.to_string())?;
-
-    // Лог демона рядом с настройками — пригодится, если что-то не поднялось.
-    let log_path = app_data_dir().join("daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| e.to_string())?;
-    let log_err = log.try_clone().map_err(|e| e.to_string())?;
-
-    let mut command = Command::new(&bin);
-    command
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("--root")
-        .arg(&root)
-        .arg("--ui")
-        .arg(UI_ADDR)
-        .arg("--bind")
-        .arg(SYNC_BIND)
-        // У десктопного клиента свой интерфейс: второй значок в трее не нужен.
-        .arg("--no-tray")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let child = command
-        .spawn()
-        .map_err(|e| format!("не удалось запустить {}: {e}", bin.display()))?;
-    if let Ok(mut slot) = state.child.lock() {
-        *slot = Some(child);
-    }
-
-    Ok(json!({
-        "started": true,
-        "bin": bin.to_string_lossy(),
-        "data_dir": data_dir.to_string_lossy(),
-        "log": log_path.to_string_lossy(),
-    }))
-}
-
-#[tauri::command]
-async fn stop_daemon(app: tauri::AppHandle) -> Result<Value, String> {
-    use tauri::Manager;
-
-    blocking(move || {
-        let _ = http("POST", "/api/quit", None);
-        let mut stopped = false;
-        for _ in 0..30 {
-            if !daemon_running() {
-                stopped = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-
-        // Если демон не ответил на /api/quit, останавливаем тот процесс,
-        // который запустили сами.
-        if let Some(desktop) = app.try_state::<Desktop>() {
-            if let Ok(mut slot) = desktop.child.lock() {
-                if let Some(mut child) = slot.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    stopped = !daemon_running();
-                }
-            }
-        }
-
-        if stopped {
-            Ok(json!({ "stopped": true, "message": "Служба остановлена" }))
-        } else {
-            Err("Не удалось остановить службу: процесс не отвечает".to_string())
-        }
-    })
-    .await
-}
-
-#[tauri::command]
 async fn initialize_library(root: String, data_dir: Option<String>) -> Result<Value, String> {
     blocking(move || {
-        if daemon_running() {
-            return Err("Остановите службу перед созданием библиотеки".to_string());
-        }
         let root_path = PathBuf::from(&root);
         if !root_path.is_dir() {
             return Err(format!("папка не найдена: {}", root_path.display()));
@@ -2251,9 +1989,6 @@ async fn initialize_library(root: String, data_dir: Option<String>) -> Result<Va
 #[tauri::command]
 async fn change_library(folder: String) -> Result<Value, String> {
     blocking(move || {
-        if daemon_running() {
-            return Err("Сначала остановите службу (она держит библиотеку открытой)".to_string());
-        }
         let root = PathBuf::from(&folder);
         if !root.is_dir() {
             return Err(format!("папка не найдена: {}", root.display()));
@@ -2352,18 +2087,6 @@ fn open_target(target: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn daemon_log_tail(lines: Option<usize>) -> Value {
-    let path = app_data_dir().join("daemon.log");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let lines = lines.unwrap_or(60).clamp(10, 400);
-    let tail: Vec<&str> = text.lines().rev().take(lines).collect();
-    json!({
-        "path": path.to_string_lossy(),
-        "text": tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
-    })
-}
-
-#[tauri::command]
 fn window_minimize(window: tauri::WebviewWindow) {
     let _ = window.minimize();
 }
@@ -2434,12 +2157,6 @@ pub fn run() {
             workspace_gc,
             workspace_clear_vault,
             workspace_close,
-            daemon_status,
-            daemon_pair_code,
-            daemon_plan,
-            daemon_action,
-            start_daemon,
-            stop_daemon,
             initialize_library,
             change_library,
             pick_folder,
@@ -2447,11 +2164,159 @@ pub fn run() {
             probe_folder,
             open_path,
             open_url,
-            daemon_log_tail,
             window_minimize,
             window_toggle_maximize,
             window_close,
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить приложение");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syncth_core::plan::{
+        Change, Conflict, ConflictReason, DecisionSet, PathDecision, Side,
+    };
+
+    fn change(path: &str, kind: ChangeKind) -> Change {
+        Change {
+            path: path.to_string(),
+            from: None,
+            kind,
+            side: Side::Local,
+            blob: format!("blob:{path}"),
+            base_blob: String::new(),
+            size: 1,
+            mtime_ns: 0,
+            present: true,
+            ignored: false,
+            aligned: false,
+        }
+    }
+
+    fn conflict(path: &str) -> Conflict {
+        Conflict {
+            path: path.to_string(),
+            local_path: path.to_string(),
+            remote_path: path.to_string(),
+            local_blob: "blob:local".to_string(),
+            remote_blob: "blob:remote".to_string(),
+            local_size: 1,
+            remote_size: 1,
+            reason: ConflictReason::BothChanged,
+        }
+    }
+
+    fn plan(changes: Vec<Change>, conflicts: Vec<Conflict>) -> Plan {
+        Plan {
+            peer_dev: "peer".to_string(),
+            peer_name: "Peer".to_string(),
+            created_at: 0,
+            expires_at: u64::MAX,
+            local: changes,
+            remote: Vec::new(),
+            conflicts,
+            decisions: DecisionSet::default(),
+            version: Hlc::new(0, 0),
+        }
+    }
+
+    fn decide(plan: &mut Plan, path: &str, action: Decision) {
+        plan.decisions.entries.insert(
+            path.to_string(),
+            PathDecision {
+                path: path.to_string(),
+                action,
+                blob: plan.blob_for(path).unwrap_or_default(),
+                hlc: Hlc::new(1, 0),
+                dev: "dev-pc".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn auto_policy_asks_only_for_deletions_and_conflicts() {
+        let plan = plan(
+            vec![
+                change("added.flac", ChangeKind::Added),
+                change("updated.flac", ChangeKind::Updated),
+                change("deleted.flac", ChangeKind::Deleted),
+            ],
+            vec![conflict("conflict.flac")],
+        );
+        let pending = pending_paths(&plan, &Config::default());
+        assert_eq!(
+            pending,
+            BTreeSet::from([
+                "deleted.flac".to_string(),
+                "conflict.flac".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn manual_flags_ask_for_additions_and_changes() {
+        let config = Config {
+            manual_additions: true,
+            manual_changes: true,
+            ..Config::default()
+        };
+        let mut aligned = change("aligned.flac", ChangeKind::Updated);
+        aligned.aligned = true;
+        let mut ignored = change("ignored.flac", ChangeKind::Updated);
+        ignored.ignored = true;
+        let plan = plan(
+            vec![
+                change("added.flac", ChangeKind::Added),
+                change("updated.flac", ChangeKind::Updated),
+                change("renamed.flac", ChangeKind::Renamed),
+                change("moved.flac", ChangeKind::Moved),
+                change("deleted.flac", ChangeKind::Deleted),
+                aligned,
+                ignored,
+            ],
+            Vec::new(),
+        );
+
+        let pending = pending_paths(&plan, &config);
+        assert_eq!(
+            pending,
+            BTreeSet::from([
+                "added.flac".to_string(),
+                "updated.flac".to_string(),
+                "renamed.flac".to_string(),
+                "moved.flac".to_string(),
+                "deleted.flac".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn explicit_decisions_clear_pending_and_unset_restores_it() {
+        let mut plan = plan(
+            vec![
+                change("updated.flac", ChangeKind::Updated),
+                change("deleted.flac", ChangeKind::Deleted),
+            ],
+            vec![conflict("conflict.flac")],
+        );
+        let config = Config {
+            manual_changes: true,
+            ..Config::default()
+        };
+        assert_eq!(pending_paths(&plan, &config).len(), 3);
+
+        decide(&mut plan, "updated.flac", Decision::Revert);
+        decide(&mut plan, "deleted.flac", Decision::Keep);
+        decide(&mut plan, "conflict.flac", Decision::Accept);
+        assert!(pending_paths(&plan, &config).is_empty());
+
+        // Сброс решения — это `Unset`, то есть путь снова ждёт человека.
+        decide(&mut plan, "updated.flac", Decision::Unset);
+        assert_eq!(
+            pending_paths(&plan, &config),
+            BTreeSet::from(["updated.flac".to_string()])
+        );
+    }
 }

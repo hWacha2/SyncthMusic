@@ -1,9 +1,10 @@
-//! Ручной режим изменений: правки, переименования и переносы ждут решения.
+//! Явные решения человека поверх фактического плана.
 //!
-//! Политика задаётся инициатором сеанса и уезжает серверу в `Preview`, чтобы
-//! обе стороны строили одинаковый план. Проверяем не только решения, но и то,
-//! что до commit пути действительно не применяются, а после «Отклонить»
-//! восстанавливается исходная версия.
+//! `Plan` описывает только факты, а `Resolution` вычисляет итоговые действия
+//! из базовых правил и `DecisionSet`. Здесь проверяем, что решение принимается
+//! до commit, переживает обмен с пиром и меняет результат на обеих сторонах.
+//! Когда именно спрашивать человека, решает интерфейс ПК: в ядре такой
+//! политики нет.
 
 use std::fs;
 use std::net::TcpListener;
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use syncth_core::net::{serve_stream, PreviewSession, SyncStats};
 use syncth_core::plan::{ChangeKind, Decision};
-use syncth_core::{commit, scan, Hlc, Replica};
+use syncth_core::{scan, Replica};
 use tempfile::TempDir;
 
 const SONG: &str = "Album/01. Song.flac";
@@ -92,19 +93,26 @@ fn spawn_server(
 }
 
 /// Открыть сеанс, дать тесту посмотреть план и выполнить commit.
-fn commit_session<F>(pair: &Pair, mut client: Replica, manual: bool, check: F) -> Replica
+fn commit_session<F>(pair: &Pair, mut client: Replica, check: F) -> Replica
 where
     F: FnOnce(&mut PreviewSession, &mut Replica),
 {
     let server = open_a(pair);
     let (addr, handle) = spawn_server(server, pair.token.clone());
-    let mut session = PreviewSession::open_with_policy(&mut client, &addr, &pair.token, manual)
-        .expect("сеанс должен открыться");
+    let mut session =
+        PreviewSession::open(&mut client, &addr, &pair.token).expect("сеанс должен открыться");
     check(&mut session, &mut client);
     session.commit(&mut client).unwrap();
     let (result, server) = handle.join().unwrap();
     result.unwrap();
     server
+}
+
+/// Два шага poll с паузой: решение должно дойти до пира до commit.
+fn settle(session: &mut PreviewSession, client: &mut Replica) {
+    session.poll(client).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    session.poll(client).unwrap();
 }
 
 fn album_files(root: &Path) -> Vec<String> {
@@ -115,7 +123,10 @@ fn album_files(root: &Path) -> Vec<String> {
             continue;
         };
         for entry in entries {
-            names.push(format!("{folder}/{}", entry.unwrap().file_name().to_string_lossy()));
+            names.push(format!(
+                "{folder}/{}",
+                entry.unwrap().file_name().to_string_lossy()
+            ));
         }
     }
     names.sort();
@@ -127,7 +138,7 @@ fn state_hash(replica: &Replica) -> String {
 }
 
 #[test]
-fn default_mode_accepts_an_update_without_questions() {
+fn plan_describes_facts_and_accepts_an_update_by_default() {
     let pair = setup();
     fs::write(pair.root_a.join(SONG), b"changed-bytes").unwrap();
     let mut a = open_a(&pair);
@@ -135,8 +146,7 @@ fn default_mode_accepts_an_update_without_questions() {
     drop(a);
 
     let b = open_b(&pair);
-    let server = commit_session(&pair, b, false, |session, _| {
-        assert!(!session.plan.manual_changes);
+    let server = commit_session(&pair, b, |session, _| {
         let change = session
             .plan
             .remote
@@ -144,11 +154,15 @@ fn default_mode_accepts_an_update_without_questions() {
             .find(|change| change.path == SONG)
             .expect("правка должна быть в плане");
         assert_eq!(change.kind, ChangeKind::Updated);
-        assert_eq!(
-            session.plan.effective_decision(SONG),
-            Some(Decision::Accept)
-        );
-        assert!(session.plan.unresolved().is_empty());
+
+        // План — только факты: ни политики, ни решений в JSON.
+        let json = serde_json::to_value(&session.plan).unwrap();
+        assert!(json.get("manual_changes").is_none(), "{json}");
+        assert!(json.get("decisions").is_none(), "{json}");
+
+        let resolution = session.plan.resolve();
+        assert_eq!(resolution.action(SONG), Some(Decision::Accept));
+        assert!(resolution.unresolved().is_empty());
     });
     drop(server);
 
@@ -160,53 +174,30 @@ fn default_mode_accepts_an_update_without_questions() {
 }
 
 #[test]
-fn manual_mode_blocks_commit_until_the_change_is_accepted() {
+fn resetting_a_decision_returns_to_the_default_action() {
     let pair = setup();
     fs::write(pair.root_a.join(SONG), b"changed-bytes").unwrap();
     let mut a = open_a(&pair);
     scan::scan(&pair.root_a, &mut a).unwrap();
     drop(a);
 
-    let mut b = open_b(&pair);
-    let server = open_a(&pair);
-    let (addr, handle) = spawn_server(server, pair.token.clone());
-    let mut session = PreviewSession::open_with_policy(&mut b, &addr, &pair.token, true).unwrap();
+    let server = commit_session(&pair, open_b(&pair), |session, client| {
+        session
+            .record_decision(client, SONG, Decision::Revert)
+            .unwrap();
+        settle(session, client);
+        assert_eq!(session.plan.resolve().action(SONG), Some(Decision::Revert));
 
-    assert!(session.plan.manual_changes);
-    let change = session
-        .plan
-        .remote
-        .iter()
-        .find(|change| change.path == SONG)
-        .expect("правка должна быть в плане");
-    assert_eq!(change.kind, ChangeKind::Updated);
-    assert_eq!(session.plan.effective_decision(SONG), None);
-    assert!(session.plan.unresolved().contains(&SONG.to_string()));
+        // Сброс решения — это тоже решение (`Unset`), а не удаление записи:
+        // после обмена путь снова получает базовое действие.
+        session.forget_decision(client, SONG).unwrap();
+        settle(session, client);
+        let resolution = session.plan.resolve();
+        assert_eq!(resolution.action(SONG), Some(Decision::Accept));
+        assert!(resolution.unresolved().is_empty());
+    });
+    drop(server);
 
-    let blocked = commit::validate(&b, &session.plan).unwrap_err().to_string();
-    assert!(blocked.contains("требуют решения"), "{blocked}");
-
-    // Сервер получил ту же политику и тоже видит путь нерешённым.
-    let server_plan = open_a(&pair)
-        .load_plan("dev-phone", Hlc::wall_ms())
-        .unwrap()
-        .expect("сервер сохраняет план");
-    assert!(server_plan.manual_changes);
-    assert!(server_plan.unresolved().contains(&SONG.to_string()));
-    assert_eq!(server_plan.effective_decision(SONG), None);
-
-    session
-        .record_decision(&mut b, SONG, Decision::Accept)
-        .unwrap();
-    session.poll(&mut b).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    session.poll(&mut b).unwrap();
-    session.commit(&mut b).unwrap();
-
-    let (result, _server) = handle.join().unwrap();
-    result.unwrap();
-
-    assert!(!session.plan.unresolved().contains(&SONG.to_string()));
     assert_eq!(
         fs::read(pair.root_b.join(SONG)).unwrap(),
         b"changed-bytes"
@@ -221,7 +212,7 @@ fn rejecting_a_local_rename_restores_the_old_name() {
     let mut b = open_b(&pair);
     scan::scan(&pair.root_b, &mut b).unwrap();
 
-    let server = commit_session(&pair, b, true, |session, client| {
+    let server = commit_session(&pair, b, |session, client| {
         let change = session
             .plan
             .local
@@ -230,15 +221,15 @@ fn rejecting_a_local_rename_restores_the_old_name() {
             .expect("переименование должно быть в плане");
         assert_eq!(change.kind, ChangeKind::Renamed);
         assert_eq!(change.from.as_deref(), Some(SONG));
-        assert_eq!(session.plan.effective_decision(RENAMED), None);
-        assert!(session.plan.unresolved().contains(&RENAMED.to_string()));
 
         session
             .record_decision(client, RENAMED, Decision::Revert)
             .unwrap();
-        session.poll(client).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        session.poll(client).unwrap();
+        settle(session, client);
+        assert_eq!(
+            session.plan.resolve().action(RENAMED),
+            Some(Decision::Revert)
+        );
     });
     drop(server);
 
@@ -256,7 +247,7 @@ fn rejecting_a_remote_update_keeps_the_base_version_on_both_sides() {
     scan::scan(&pair.root_a, &mut a).unwrap();
     drop(a);
 
-    let server = commit_session(&pair, open_b(&pair), true, |session, client| {
+    let server = commit_session(&pair, open_b(&pair), |session, client| {
         let change = session
             .plan
             .remote
@@ -264,14 +255,12 @@ fn rejecting_a_remote_update_keeps_the_base_version_on_both_sides() {
             .find(|change| change.path == SONG)
             .expect("правка с ПК должна быть в плане");
         assert_eq!(change.kind, ChangeKind::Updated);
-        assert_eq!(session.plan.effective_decision(SONG), None);
 
         session
             .record_decision(client, SONG, Decision::Revert)
             .unwrap();
-        session.poll(client).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        session.poll(client).unwrap();
+        settle(session, client);
+        assert_eq!(session.plan.resolve().action(SONG), Some(Decision::Revert));
     });
     drop(server);
 
@@ -289,7 +278,7 @@ fn accepting_a_remote_move_moves_the_file_on_the_other_side() {
     scan::scan(&pair.root_a, &mut a).unwrap();
     drop(a);
 
-    let server = commit_session(&pair, open_b(&pair), true, |session, client| {
+    let server = commit_session(&pair, open_b(&pair), |session, client| {
         let change = session
             .plan
             .remote
@@ -298,14 +287,12 @@ fn accepting_a_remote_move_moves_the_file_on_the_other_side() {
             .expect("перенос с ПК должен быть в плане");
         assert_eq!(change.kind, ChangeKind::Moved);
         assert_eq!(change.from.as_deref(), Some(SONG));
-        assert_eq!(session.plan.effective_decision(MOVED), None);
 
         session
             .record_decision(client, MOVED, Decision::Accept)
             .unwrap();
-        session.poll(client).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        session.poll(client).unwrap();
+        settle(session, client);
+        assert_eq!(session.plan.resolve().action(MOVED), Some(Decision::Accept));
     });
     drop(server);
 

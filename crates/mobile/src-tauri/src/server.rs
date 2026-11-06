@@ -11,7 +11,7 @@
 use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use syncth_core::{net, Hlc};
 
@@ -33,7 +33,6 @@ struct SessionView {
 #[derive(Default)]
 struct State {
     session: Option<SessionView>,
-    commit: Option<mpsc::Sender<Result<(usize, usize), String>>>,
     disconnect: bool,
     error: Option<String>,
 }
@@ -101,9 +100,8 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
         .unwrap_or_default();
     let since = Hlc::wall_ms();
     let mut committed = false;
-    let mut failure: Option<String> = None;
 
-    let result = net::serve_stream_with(stream, &mut replica, &token, &mut |session, replica| {
+    let result = net::serve_stream_with(stream, &mut replica, &token, &mut |session, _replica| {
         let view = SessionView {
             dev: session.peer_dev.clone(),
             name: session.peer_name.clone(),
@@ -114,27 +112,14 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
             read_only: session.read_only,
             diverged: session.diverged,
         };
-        let (commit, disconnect) = {
+        let disconnect = {
             let mut st = state().lock().unwrap();
             st.session = Some(view);
-            (st.commit.take(), std::mem::take(&mut st.disconnect))
+            std::mem::take(&mut st.disconnect)
         };
 
         if disconnect {
             session.close();
-        }
-
-        if let Some(reply) = commit {
-            match session.commit(replica) {
-                Ok(outcome) => {
-                    committed = true;
-                    let _ = reply.send(Ok((outcome.accepted, outcome.rejected)));
-                }
-                Err(e) => {
-                    failure = Some(format!("{e:#}"));
-                    let _ = reply.send(Err(format!("{e:#}")));
-                }
-            }
         }
 
         if session.finished {
@@ -155,7 +140,7 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
             // Закрытый сокет — штатное завершение сеанса, а не ошибка.
             let benign =
                 message.contains("пир закрыл сеанс") || message.contains("соединение закрыто");
-            if !benign && failure.as_deref() != Some(message.as_str()) {
+            if !benign {
                 state().lock().unwrap().error = Some(message);
             }
         }
@@ -165,6 +150,7 @@ fn handle(stream: std::net::TcpStream, app: &tauri::AppHandle) {
     crate::background_touch(app, false);
 
     if committed {
+        let _ = replica.set_meta("last_sync", &Hlc::wall_ms().to_string());
         if let Ok(Some(root)) = replica.root() {
             let _ = crate::media::scan(&root);
         }
@@ -190,10 +176,6 @@ pub fn session_json() -> Option<Value> {
     })
 }
 
-pub fn has_session() -> bool {
-    state().lock().unwrap().session.is_some()
-}
-
 /// Слушатель и последняя ошибка — для диагностики в UI.
 pub fn info_json() -> Value {
     let st = state().lock().unwrap();
@@ -201,22 +183,6 @@ pub fn info_json() -> Value {
         "port": net::SYNC_PORT,
         "error": st.error,
     })
-}
-
-/// Попросить поток входящего сеанса выполнить commit. `None` — сеанса нет.
-pub fn request_commit() -> Option<Result<(usize, usize), String>> {
-    let (tx, rx) = mpsc::channel();
-    {
-        let mut st = state().lock().unwrap();
-        if st.session.is_none() {
-            return None;
-        }
-        st.commit = Some(tx);
-    }
-    Some(
-        rx.recv_timeout(Duration::from_secs(180))
-            .unwrap_or_else(|_| Err("Передача не завершилась за 3 минуты".into())),
-    )
 }
 
 /// Закрыть входящий сеанс, не забывая сопряжение.

@@ -36,6 +36,20 @@ const deletionDelete = computed(() => (
   side.value === 'local' ? t('workspace.attention.delete_from_phone') : t('workspace.attention.delete_from_pc')
 ));
 
+// У переименования и переноса «отклонить» означает вернуть прежнее имя или
+// место, а не просто «не принимать» — подпись должна говорить, что произойдёт.
+const changeKind = computed(() => props.item.change?.kind);
+const changeAccept = computed(() => {
+  if (changeKind.value === 'renamed') return t('workspace.attention.accept_rename');
+  if (changeKind.value === 'moved') return t('workspace.attention.accept_move');
+  return t('workspace.attention.accept_change');
+});
+const changeReject = computed(() => {
+  if (changeKind.value === 'renamed') return t('workspace.attention.reject_rename');
+  if (changeKind.value === 'moved') return t('workspace.attention.reject_move');
+  return t('workspace.attention.reject_change');
+});
+
 function conflictReason() {
   const reason = props.item.conflict?.reason;
   if (reason === 'changed_vs_deleted') return t('workspace.conflict.changed_deleted');
@@ -99,14 +113,14 @@ function conflictReason() {
       :disabled="busy()"
       @click="decide(item.path, 'accept')"
     >
-      <Spinner v-if="decisionBusy('accept')" />{{ t('workspace.attention.accept_change') }}
+      <Spinner v-if="decisionBusy('accept')" />{{ changeAccept }}
     </button>
     <button
       class="btn btn--quiet btn--small"
       :disabled="busy()"
       @click="decide(item.path, 'revert')"
     >
-      <Spinner v-if="decisionBusy('revert')" />{{ t('workspace.attention.reject_change') }}
+      <Spinner v-if="decisionBusy('revert')" />{{ changeReject }}
     </button>
   </template>
 

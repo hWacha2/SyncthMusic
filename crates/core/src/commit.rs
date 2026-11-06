@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::plan::{Change, ChangeKind, Decision, PathDecision, Plan, Side};
+use crate::plan::{Change, ChangeKind, Decision, PathDecision, Plan, Resolution, Side};
 use crate::resolve;
 use crate::scan;
 use crate::store::Replica;
@@ -38,7 +38,7 @@ pub struct Outcome {
 }
 
 /// Проверить, что план можно применять.
-pub fn validate(replica: &Replica, plan: &Plan) -> Result<()> {
+pub fn validate(replica: &Replica, plan: &Plan, resolution: &Resolution) -> Result<()> {
     anyhow::ensure!(
         !plan.is_expired(Hlc::wall_ms()),
         "план устарел — обновите его"
@@ -47,7 +47,7 @@ pub fn validate(replica: &Replica, plan: &Plan) -> Result<()> {
         plan.local_is_current(replica)?,
         "есть новые локальные изменения — обновите план"
     );
-    let unresolved = plan.unresolved();
+    let unresolved = resolution.unresolved();
     anyhow::ensure!(
         unresolved.is_empty(),
         "требуют решения: {}",
@@ -194,7 +194,7 @@ fn conflict_local_path(conflict: &crate::plan::Conflict) -> &str {
 }
 
 /// Построить исходящие операции и список блобов, которые надо докачать.
-pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
+pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> Result<Prepared> {
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
@@ -206,9 +206,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
     let mut seen = HashSet::new();
 
     for change in &plan.local {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         match change.kind {
             ChangeKind::Added => match decision {
                 Decision::Accept => {
@@ -322,11 +320,14 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
         let decision = plan
             .explicit_entry(&conflict.path)
             .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
+        let action = resolution
+            .action(&conflict.path)
+            .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
         let chooser = decision.dev == me;
-        match decision.action {
+        match action {
             Decision::Keep | Decision::Accept => {
-                let keep_local = (decision.action == Decision::Keep && chooser)
-                    || (decision.action == Decision::Accept && !chooser);
+                let keep_local = (action == Decision::Keep && chooser)
+                    || (action == Decision::Accept && !chooser);
                 if !keep_local && !has_blob(replica, &root, &conflict.remote_blob) {
                     need(&mut prepared, &mut seen, &conflict.remote_blob);
                 }
@@ -405,9 +406,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan) -> Result<Prepared> {
 
     // Блобы, которые нужны для принятых чужих изменений.
     for change in &plan.remote {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         let wanted = match change.kind {
             ChangeKind::Added
             | ChangeKind::Updated
@@ -582,14 +581,17 @@ fn op_hits_exclusion(kind: &OpKind, excluded: &HashSet<String>) -> bool {
 /// Выполнить локальную часть решений до применения чужих операций. Блобы уже
 /// должны быть скачаны. Здесь освобождаются пути, которые заменяются версией
 /// пира, отменяются изменения и раскладываются конфликтные копии.
-pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> Result<()> {
+pub fn apply_local(
+    replica: &mut Replica,
+    plan: &Plan,
+    resolution: &Resolution,
+    prepared: &Prepared,
+) -> Result<()> {
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
     for change in &plan.local {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         match change.kind {
             ChangeKind::Added => match decision {
                 Decision::Revert | Decision::DeleteEverywhere => {
@@ -660,11 +662,14 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
         let decision = plan
             .explicit_entry(&conflict.path)
             .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
+        let action = resolution
+            .action(&conflict.path)
+            .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
         let chooser = decision.dev == me;
-        match decision.action {
+        match action {
             Decision::Keep | Decision::Accept => {
-                let keep_local = (decision.action == Decision::Keep && chooser)
-                    || (decision.action == Decision::Accept && !chooser);
+                let keep_local = (action == Decision::Keep && chooser)
+                    || (action == Decision::Accept && !chooser);
                 if !keep_local {
                     // Чужую версию поставит операция автора решения.
                     let local = conflict_local_path(conflict);
@@ -701,9 +706,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
     }
 
     for change in &plan.remote {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         if decision != Decision::OnlyHere {
             continue;
         }
@@ -726,9 +729,7 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
 
     // Флаги присутствия после применения операций.
     for change in &plan.local {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         match (change.kind, decision) {
             (ChangeKind::Added, Decision::Revert) => {
                 replica.clear_pending_delete(&change.path)?;
@@ -777,7 +778,12 @@ pub fn apply_local(replica: &mut Replica, plan: &Plan, prepared: &Prepared) -> R
 
 /// Применить операции пира, разложить проверенные блобы и зафиксировать
 /// согласованную базу только для путей, которые действительно приняты.
-pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<Outcome> {
+pub fn finalize(
+    replica: &mut Replica,
+    plan: &Plan,
+    resolution: &Resolution,
+    peer_ops: &[Op],
+) -> Result<Outcome> {
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
@@ -800,9 +806,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     let mut outcome = Outcome::default();
 
     for change in &plan.local {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         match (change.kind, decision) {
             (ChangeKind::Added, Decision::Accept) => {
                 confirmed.insert(change.path.clone());
@@ -840,9 +844,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     }
 
     for change in &plan.remote {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         match (change.kind, decision) {
             (ChangeKind::Deleted, Decision::DeleteEverywhere | Decision::KeepInLibrary) => {
                 confirmed.insert(change.path.clone());
@@ -861,15 +863,18 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     }
 
     for conflict in &plan.conflicts {
-        let Some(decision) = plan.explicit_entry(&conflict.path) else {
-            bail!("конфликт без решения: {}", conflict.path);
-        };
-        match decision.action {
+        let action = resolution
+            .action(&conflict.path)
+            .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
+        match action {
             Decision::Keep | Decision::Accept => {
                 confirmed.insert(conflict.path.clone());
                 outcome.accepted += 1;
             }
             Decision::KeepBoth => {
+                let decision = plan
+                    .explicit_entry(&conflict.path)
+                    .with_context(|| format!("конфликт без решения: {}", conflict.path))?;
                 confirmed.insert(conflict.path.clone());
                 // Копия есть на обеих сторонах: у выбравшего это его версия,
                 // у второго — версия пира.
@@ -889,9 +894,7 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
     // перечитывал бы всю библиотеку.
     let mut place: HashSet<String> = HashSet::new();
     for change in &plan.remote {
-        let decision = plan
-            .effective_decision(&change.path)
-            .unwrap_or(Decision::Keep);
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
         if matches!(
             change.kind,
             ChangeKind::Added
@@ -904,12 +907,14 @@ pub fn finalize(replica: &mut Replica, plan: &Plan, peer_ops: &[Op]) -> Result<O
         }
     }
     for conflict in &plan.conflicts {
-        let Some(decision) = plan.explicit_entry(&conflict.path) else {
+        let Some(action) = resolution.action(&conflict.path) else {
             continue;
         };
         place.insert(conflict.path.clone());
-        if decision.action == Decision::KeepBoth {
-            place.insert(keep_both_copy(plan, decision, &me));
+        if action == Decision::KeepBoth {
+            if let Some(decision) = plan.explicit_entry(&conflict.path) {
+                place.insert(keep_both_copy(plan, decision, &me));
+            }
         }
     }
 

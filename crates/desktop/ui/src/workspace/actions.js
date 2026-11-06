@@ -22,6 +22,15 @@ export function selectTab(tab) {
   state.workspace.tab = tab;
 }
 
+/// Раскрыть строку автоматического режима, чтобы выбрать действие вручную.
+/// Это только состояние окна: решение появится после нажатия кнопки.
+export function toggleManualOpen(path) {
+  const open = state.workspace.manualOpen;
+  state.workspace.manualOpen = open.includes(path)
+    ? open.filter((item) => item !== path)
+    : [...open, path];
+}
+
 export async function decide(path, action) {
   if (!hasBridge || state.workspace.action || state.workspace.refreshing) return;
   const gen = nextWorkspaceGeneration();
@@ -31,7 +40,10 @@ export async function decide(path, action) {
   state.workspace.error = '';
   try {
     const data = await invoke('workspace_decide', { path, action });
-    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    if (isWorkspaceGeneration(gen)) {
+      state.workspace.data = data;
+      state.workspace.manualOpen = state.workspace.manualOpen.filter((item) => item !== path);
+    }
   } catch (error) {
     state.workspace.note = t('workspace.error.decision', { error: errorMessage(error) });
     state.workspace.noteError = true;
@@ -49,7 +61,10 @@ export async function undecide(path) {
   state.workspace.error = '';
   try {
     const data = await invoke('workspace_undecide', { path });
-    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    if (isWorkspaceGeneration(gen)) {
+      state.workspace.data = data;
+      state.workspace.manualOpen = state.workspace.manualOpen.filter((item) => item !== path);
+    }
   } catch (error) {
     state.workspace.note = t('workspace.error.decision', { error: errorMessage(error) });
     state.workspace.noteError = true;
@@ -69,7 +84,13 @@ export async function decideMany(paths, action) {
   state.workspace.error = '';
   try {
     const data = await invoke('workspace_decide_many', { paths, action });
-    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    if (isWorkspaceGeneration(gen)) {
+      state.workspace.data = data;
+      const decided = new Set(paths);
+      state.workspace.manualOpen = state.workspace.manualOpen.filter(
+        (item) => !decided.has(item),
+      );
+    }
     return true;
   } catch (error) {
     state.workspace.note = t('workspace.error.decision', { error: errorMessage(error) });
@@ -306,9 +327,14 @@ export async function toggleManual() {
   state.workspace.note = '';
   state.workspace.noteError = false;
   try {
-    await invoke('workspace_set_manual', { enabled });
+    const data = await invoke('workspace_set_manual', { enabled });
     if (!isWorkspaceGeneration(gen)) return;
-    if (state.workspace.data) state.workspace.data.manual_additions = enabled;
+    if (data) {
+      state.workspace.data = data;
+      state.workspace.stale = false;
+      state.workspace.error = '';
+    }
+    state.workspace.manualOpen = [];
     state.workspace.note = t(enabled ? 'workspace.manual.on' : 'workspace.manual.off');
   } catch (error) {
     state.workspace.note = t('workspace.error.manual', { error: errorMessage(error) });
@@ -326,9 +352,8 @@ export async function toggleManualChanges() {
   state.workspace.note = '';
   state.workspace.noteError = false;
   try {
-    // Бэкенд переоткрывает сеанс с новой политикой и сразу возвращает
-    // готовый план. Полный скан папок здесь не нужен: файлы не менялись,
-    // а «Проверяю папки» на секунду сбивало бы с толку.
+    // Бэкенд сохраняет настройку и сразу возвращает готовый payload:
+    // план не меняется, переоткрывать сеанс и сканировать папки не нужно.
     const data = await invoke('workspace_set_manual_changes', { enabled });
     if (!isWorkspaceGeneration(gen)) return;
     if (data) {
@@ -336,6 +361,7 @@ export async function toggleManualChanges() {
       state.workspace.stale = false;
       state.workspace.error = '';
     }
+    state.workspace.manualOpen = [];
     state.workspace.note = t(
       enabled ? 'workspace.manual_changes.on' : 'workspace.manual_changes.off',
     );

@@ -1,6 +1,5 @@
 <script setup>
 import DecisionButtons from './DecisionButtons.vue';
-import RejectButton from './RejectButton.vue';
 import UndoButton from './UndoButton.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
@@ -9,14 +8,14 @@ import { changeMeta, decisionLabel, kindLabel } from '../../workspace/model.js';
 
 const props = defineProps({
   entry: { type: Object, required: true },
-  manual: { type: Boolean, default: false },
+  open: { type: Boolean, default: false },
   showFolder: { type: Boolean, default: false },
   selection: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
   selectable: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(['toggle']);
+const emit = defineEmits(['toggle', 'manual']);
 
 const kind = computed(() => props.entry.change?.kind || 'conflict');
 
@@ -47,7 +46,7 @@ const meta = computed(() => {
       ? t('workspace.changes.undecided')
       : decisionLabel(props.entry.conflict?.decision);
   }
-  return changeMeta(props.entry.change, props.manual, props.showFolder, props.entry.pending);
+  return changeMeta(props.entry.change, props.showFolder, props.entry.pending);
 });
 
 // Клик по строке включает/выключает её в выделении. Кнопки решений и чекбокс
@@ -93,8 +92,19 @@ function onClick(event) {
     <div v-else-if="entry.decided" class="ws-row-actions">
       <UndoButton :path="entry.path" />
     </div>
-    <div v-else-if="entry.type === 'change'" class="ws-row-actions">
-      <RejectButton :path="entry.path" />
+    <div v-else-if="open" class="ws-row-actions">
+      <DecisionButtons :item="item" />
+      <button type="button" class="btn btn--quiet btn--small" @click="$emit('manual')">
+        {{ t('workspace.changes.collapse') }}
+      </button>
+    </div>
+    <div v-else class="ws-row-actions">
+      <button
+        type="button"
+        class="btn btn--quiet btn--small"
+        :title="t('workspace.changes.manual_hint')"
+        @click="$emit('manual')"
+      >{{ t('workspace.changes.manual') }}</button>
     </div>
   </div>
 </template>

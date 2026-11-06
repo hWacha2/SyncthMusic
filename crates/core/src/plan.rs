@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
@@ -43,32 +43,16 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    /// Действие по умолчанию. Удаления никогда не включаются сами: снятая
-    /// галочка — это осознанное «Остаётся», а не «ещё не решил».
-    ///
-    /// В ручном режиме правки, переименования и переносы тоже ждут человека:
-    /// `None` означает «решения ещё нет», а не «оставить как есть».
-    pub fn default_decision(self, manual_changes: bool) -> Option<Decision> {
+    /// Действие по умолчанию. Это смысл операции, а не политика интерфейса:
+    /// удаления никогда не включаются сами, остальные изменения применяются.
+    pub fn default_decision(self) -> Decision {
         match self {
-            ChangeKind::Added => Some(Decision::Accept),
-            ChangeKind::Updated | ChangeKind::Renamed | ChangeKind::Moved => {
-                if manual_changes {
-                    None
-                } else {
-                    Some(Decision::Accept)
-                }
-            }
-            ChangeKind::Deleted => Some(Decision::Keep),
+            ChangeKind::Added
+            | ChangeKind::Updated
+            | ChangeKind::Renamed
+            | ChangeKind::Moved => Decision::Accept,
+            ChangeKind::Deleted => Decision::Keep,
         }
-    }
-
-    /// Изменение содержимого или пути, которое можно принять или отклонить
-    /// вручную. Добавления и удаления решаются отдельно.
-    pub fn is_manual_change(self) -> bool {
-        matches!(
-            self,
-            ChangeKind::Updated | ChangeKind::Renamed | ChangeKind::Moved
-        )
     }
 
     /// Отличить переименование от переноса по родительским папкам. Регистр и
@@ -312,13 +296,10 @@ pub struct Plan {
     pub local: Vec<Change>,
     pub remote: Vec<Change>,
     pub conflicts: Vec<Conflict>,
-    #[serde(default)]
+    /// Снимок решений подмешивается при загрузке из `plan_decisions`.
+    /// В JSON плана он не входит: решения живут отдельной таблицей.
+    #[serde(skip)]
     pub decisions: DecisionSet,
-    /// Правки, переименования и переносы требуют явного решения. Политика
-    /// приходит от инициатора сеанса и должна быть одинаковой у обеих сторон:
-    /// иначе карты итоговых действий разойдутся ещё до commit.
-    #[serde(default)]
-    pub manual_changes: bool,
     pub version: Hlc,
 }
 
@@ -380,25 +361,6 @@ impl Plan {
         self.change(path).map(|change| change.blob.clone())
     }
 
-    /// Действие по умолчанию для пути, если человек ничего не выбрал.
-    pub fn default_decision(&self, path: &str) -> Option<Decision> {
-        if self.conflict(path).is_some() {
-            return None;
-        }
-        self.change(path).and_then(|change| {
-            if change.ignored {
-                Some(Decision::Keep)
-            } else if change.aligned {
-                // Содержимое уже совпало с пиром. Такие строки не показываются
-                // в интерфейсе, поэтому в ручном режиме их нельзя оставлять
-                // без решения: иначе база никогда не зафиксируется.
-                Some(Decision::Accept)
-            } else {
-                change.kind.default_decision(self.manual_changes)
-            }
-        })
-    }
-
     /// Явное решение человека, если оно есть и не отменено через `Unset`.
     pub fn explicit_entry(&self, path: &str) -> Option<&PathDecision> {
         self.decisions
@@ -412,32 +374,11 @@ impl Plan {
         self.explicit_entry(path).map(|decision| decision.action)
     }
 
-    /// Итоговое действие: явное решение человека важнее умолчания.
-    pub fn effective_decision(&self, path: &str) -> Option<Decision> {
-        self.explicit_decision(path)
-            .or_else(|| self.default_decision(path))
-    }
-
-    /// Пути без явного решения. Commit не разрешён, пока список не пуст:
-    /// конфликты решаются всегда, а правки/переносы — только в ручном режиме.
-    pub fn unresolved(&self) -> Vec<String> {
-        let mut paths = BTreeSet::new();
-        for conflict in &self.conflicts {
-            if self.explicit_entry(&conflict.path).is_none() {
-                paths.insert(conflict.path.as_str());
-            }
-        }
-        if self.manual_changes {
-            for change in self.local.iter().chain(self.remote.iter()) {
-                if change.aligned || change.ignored || !change.kind.is_manual_change() {
-                    continue;
-                }
-                if self.explicit_entry(&change.path).is_none() {
-                    paths.insert(change.path.as_str());
-                }
-            }
-        }
-        paths.into_iter().map(str::to_string).collect()
+    /// Итоговое действие по каждому пути и список нерешённых конфликтов.
+    /// Строится в момент commit или отображения, но не хранится в плане:
+    /// план описывает факты, а решение — отдельный слой.
+    pub fn resolve(&self) -> Resolution {
+        Resolution::new(self)
     }
 
     /// Отпечаток набора решений для статуса сеанса. Для сверки сторон он не
@@ -455,49 +396,20 @@ impl Plan {
         }
         // Конфликт без решения — такая же часть общего состояния, как и
         // выбранное действие: обе стороны обязаны видеть его одинаково.
-        for path in self.unresolved() {
-            hasher.update(b"unresolved\0");
-            hasher.update(path.as_bytes());
-            hasher.update(b"\n");
+        for conflict in &self.conflicts {
+            if self.explicit_entry(&conflict.path).is_none() {
+                hasher.update(b"unresolved\0");
+                hasher.update(conflict.path.as_bytes());
+                hasher.update(b"\n");
+            }
         }
         format!("b3:{}", hasher.finalize().to_hex())
-    }
-
-    /// Все пути плана с итоговым действием. `unresolved` — не действие,
-    /// а честная метка того, что решение ещё не принято.
-    pub fn effective_map(&self) -> BTreeMap<String, &'static str> {
-        let mut map = BTreeMap::new();
-        for change in self.local.iter().chain(self.remote.iter()) {
-            let action = self
-                .effective_decision(&change.path)
-                .map(Decision::as_str)
-                .unwrap_or("unresolved");
-            map.insert(change.path.clone(), action);
-        }
-        for conflict in &self.conflicts {
-            let action = self
-                .effective_decision(&conflict.path)
-                .map(Decision::as_str)
-                .unwrap_or("unresolved");
-            map.insert(conflict.path.clone(), action);
-        }
-        map
-    }
-
-    /// То же, что [`Plan::effective_map`], но в виде, который можно передать
-    /// пиру: обе стороны сверяют только общие пути.
-    pub fn effective_state(&self) -> BTreeMap<String, String> {
-        self.effective_map()
-            .into_iter()
-            .map(|(path, action)| (path, action.to_string()))
-            .collect()
     }
 
     /// Отпечаток самого плана (не решений). Нужен, чтобы отличить старый
     /// план от перестроенного при том же наборе решений.
     pub fn fingerprint(&self) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&[u8::from(self.manual_changes)]);
         hasher.update(self.peer_dev.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.created_at.to_string().as_bytes());
@@ -507,16 +419,13 @@ impl Plan {
             hasher.update(b"\0");
             hasher.update(change.blob.as_bytes());
             hasher.update(b"\0");
-            hasher.update(
-                change
-                    .kind
-                    .default_decision(self.manual_changes)
-                    .map(Decision::as_str)
-                    .unwrap_or("unresolved")
-                    .as_bytes(),
-            );
+            hasher.update(&[change.kind as u8]);
+            hasher.update(b"\0");
+            hasher.update(change.from.as_deref().unwrap_or("").as_bytes());
             hasher.update(b"\0");
             hasher.update(change.base_blob.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&[u8::from(change.ignored), u8::from(change.aligned)]);
         }
         for conflict in &self.conflicts {
             hasher.update(b"\nconflict\0");
@@ -652,6 +561,90 @@ impl Plan {
     }
 }
 
+/// Итоговые действия по плану: явное решение человека важнее базового смысла
+/// операции. Строится в момент commit или отображения и нигде не хранится:
+/// `Plan` описывает факты, `DecisionSet` — решения, а `Resolution` — их итог.
+///
+/// Конфликты не имеют умолчания: без явного решения путь остаётся нерешённым.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resolution {
+    actions: BTreeMap<String, Decision>,
+    unresolved: Vec<String>,
+}
+
+impl Resolution {
+    pub fn new(plan: &Plan) -> Self {
+        let mut actions = BTreeMap::new();
+        for change in plan.local.iter().chain(plan.remote.iter()) {
+            let action = if change.ignored {
+                // Локально исключённый путь не должен исчезнуть или уехать.
+                Decision::Keep
+            } else if change.aligned {
+                // Содержимое уже совпало: остаётся только зафиксировать базу.
+                Decision::Accept
+            } else {
+                change.kind.default_decision()
+            };
+            actions.insert(change.path.clone(), action);
+        }
+
+        let mut unresolved = Vec::new();
+        for conflict in &plan.conflicts {
+            match plan.explicit_decision(&conflict.path) {
+                Some(action) => {
+                    actions.insert(conflict.path.clone(), action);
+                }
+                None => {
+                    actions.remove(&conflict.path);
+                    unresolved.push(conflict.path.clone());
+                }
+            }
+        }
+
+        // Явное решение по обычному пути перекрывает базовое действие.
+        // Конфликты уже разобраны выше: у них нет умолчания.
+        for (path, decision) in &plan.decisions.entries {
+            if decision.action == Decision::Unset || plan.conflict(path).is_some() {
+                continue;
+            }
+            if plan.change(path).is_some() {
+                actions.insert(path.clone(), decision.action);
+            }
+        }
+
+        Self {
+            actions,
+            unresolved,
+        }
+    }
+
+    /// Итоговое действие по пути. `None` — только нерешённый конфликт.
+    pub fn action(&self, path: &str) -> Option<Decision> {
+        self.actions.get(path).copied()
+    }
+
+    /// Конфликты без явного решения. Обычные изменения всегда разрешимы:
+    /// у них есть базовое действие.
+    pub fn unresolved(&self) -> &[String] {
+        &self.unresolved
+    }
+
+    /// Итоговая карта для сверки сторон. Нерешённый конфликт тоже входит в
+    /// состояние: иначе одна сторона с решением и вторая без него выглядели
+    /// бы согласованными.
+    pub fn state(&self) -> BTreeMap<String, String> {
+        let mut state: BTreeMap<String, String> = self
+            .actions
+            .iter()
+            .map(|(path, action)| (path.clone(), action.as_str().to_string()))
+            .collect();
+        for path in &self.unresolved {
+            state.insert(path.clone(), "unresolved".to_string());
+        }
+        state
+    }
+}
+
 /// Расходятся ли стороны: есть ли общий путь с разными итоговыми действиями.
 ///
 /// Сравнивать карты целиком нельзя: план каждой стороны строится независимо,
@@ -687,27 +680,6 @@ pub fn build_with_peer_have(
     peer_name: &str,
     remote_ops: &[Op],
     peer_have: Option<&HashMap<String, (i64, i64)>>,
-) -> Result<Plan> {
-    build_with_policy(
-        replica,
-        peer_dev,
-        peer_name,
-        remote_ops,
-        peer_have,
-        false,
-    )
-}
-
-/// То же, но с политикой ручных изменений. Политика должна быть одинаковой
-/// у обеих сторон сеанса: иначе одна сторона считает правку принятой, а
-/// вторая — нерешённой, и `states_disagree` остановит commit.
-pub fn build_with_policy(
-    replica: &Replica,
-    peer_dev: &str,
-    peer_name: &str,
-    remote_ops: &[Op],
-    peer_have: Option<&HashMap<String, (i64, i64)>>,
-    manual_changes: bool,
 ) -> Result<Plan> {
     let created_at = Hlc::wall_ms();
     let mut version = Hlc::new(created_at, 0);
@@ -1118,7 +1090,6 @@ pub fn build_with_policy(
         remote: remote_changes,
         conflicts,
         decisions: DecisionSet::default(),
-        manual_changes,
         version,
     })
 }
@@ -1330,7 +1301,7 @@ mod tests {
         let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].kind, ChangeKind::Added);
-        assert_eq!(plan.effective_decision("new.flac"), Some(Decision::Accept));
+        assert_eq!(plan.resolve().action("new.flac"), Some(Decision::Accept));
     }
 
     #[test]
@@ -1350,7 +1321,7 @@ mod tests {
             "старый путь должен быть виден в плане"
         );
         assert_eq!(
-            plan.effective_decision("Telegram/new.flac"),
+            plan.resolve().action("Telegram/new.flac"),
             Some(Decision::Accept)
         );
     }
@@ -1521,7 +1492,7 @@ mod tests {
         assert!(plan.local[0].aligned);
         assert_eq!(plan.path_count(), 0);
         assert_eq!(plan.aligned_count(), 1);
-        assert!(plan.unresolved().is_empty());
+        assert!(plan.resolve().unresolved().is_empty());
     }
 
     #[test]
@@ -1654,8 +1625,8 @@ mod tests {
         let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].kind, ChangeKind::Deleted);
-        assert_eq!(plan.effective_decision("gone.flac"), Some(Decision::Keep));
-        assert!(plan.unresolved().is_empty());
+        assert_eq!(plan.resolve().action("gone.flac"), Some(Decision::Keep));
+        assert!(plan.resolve().unresolved().is_empty());
     }
 
     #[test]
@@ -1666,7 +1637,7 @@ mod tests {
         let plan = build(&a, "dev-b", "Phone", &[remote(del("old.flac"), 10)]).unwrap();
         assert_eq!(plan.remote.len(), 1);
         assert_eq!(plan.remote[0].kind, ChangeKind::Deleted);
-        assert_eq!(plan.effective_decision("old.flac"), Some(Decision::Keep));
+        assert_eq!(plan.resolve().action("old.flac"), Some(Decision::Keep));
         assert!(plan.conflicts.is_empty());
     }
 
@@ -1682,7 +1653,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.remote.len(), 1);
         assert_eq!(plan.remote[0].kind, ChangeKind::Added);
-        assert_eq!(plan.effective_decision("fresh.flac"), Some(Decision::Accept));
+        assert_eq!(plan.resolve().action("fresh.flac"), Some(Decision::Accept));
     }
 
     #[test]
@@ -1704,8 +1675,11 @@ mod tests {
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].local_blob, "b3:local");
         assert_eq!(plan.conflicts[0].remote_blob, "b3:remote");
-        assert_eq!(plan.unresolved(), vec!["song.flac".to_string()]);
-        assert_eq!(plan.effective_decision("song.flac"), None);
+        assert_eq!(
+            plan.resolve().unresolved().to_vec(),
+            vec!["song.flac".to_string()]
+        );
+        assert_eq!(plan.resolve().action("song.flac"), None);
     }
 
     #[test]
@@ -1723,7 +1697,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan.conflicts.is_empty());
-        assert_eq!(plan.effective_decision("song.flac"), Some(Decision::Accept));
+        assert_eq!(plan.resolve().action("song.flac"), Some(Decision::Accept));
     }
 
     #[test]
@@ -1769,7 +1743,7 @@ mod tests {
         assert_eq!(plan.remote.len(), 1);
         assert_eq!(plan.remote[0].kind, ChangeKind::Moved);
         assert_eq!(plan.remote[0].from.as_deref(), Some("old/name.flac"));
-        assert_eq!(plan.effective_decision("new/name.flac"), Some(Decision::Accept));
+        assert_eq!(plan.resolve().action("new/name.flac"), Some(Decision::Accept));
     }
 
     #[test]
@@ -1909,6 +1883,74 @@ mod tests {
             },
         );
         assert_ne!(before, with_extra.decisions_hash());
+    }
+
+    #[test]
+    fn resolution_applies_baseline_and_explicit_decisions() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        let op = a.make_op(put("new.flac", "b3:one")).unwrap();
+        a.apply(&op).unwrap();
+        let mut plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        let baseline = plan.resolve();
+        assert_eq!(baseline.action("new.flac"), Some(Decision::Accept));
+        assert!(baseline.unresolved().is_empty());
+
+        plan.decisions.entries.insert(
+            "new.flac".into(),
+            PathDecision {
+                path: "new.flac".into(),
+                action: Decision::Revert,
+                blob: "b3:one".into(),
+                hlc: Hlc::new(10, 0),
+                dev: "dev-a".into(),
+            },
+        );
+        assert_eq!(
+            plan.resolve().action("new.flac"),
+            Some(Decision::Revert)
+        );
+    }
+
+    #[test]
+    fn resolution_keeps_conflicts_unresolved_without_an_explicit_decision() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "song.flac", "b3:base");
+        let op = a.make_op(put("song.flac", "b3:local")).unwrap();
+        a.apply(&op).unwrap();
+        let mut plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("song.flac", "b3:remote"), 10)],
+        )
+        .unwrap();
+
+        let unresolved = plan.resolve();
+        assert_eq!(unresolved.action("song.flac"), None);
+        assert_eq!(unresolved.unresolved(), ["song.flac".to_string()]);
+        assert_eq!(
+            unresolved.state().get("song.flac").map(String::as_str),
+            Some("unresolved")
+        );
+
+        plan.decisions.entries.insert(
+            "song.flac".into(),
+            PathDecision {
+                path: "song.flac".into(),
+                action: Decision::Keep,
+                blob: "b3:local|b3:remote".into(),
+                hlc: Hlc::new(10, 0),
+                dev: "dev-a".into(),
+            },
+        );
+        let resolved = plan.resolve();
+        assert_eq!(resolved.action("song.flac"), Some(Decision::Keep));
+        assert!(resolved.unresolved().is_empty());
+        assert_eq!(
+            resolved.state().get("song.flac").map(String::as_str),
+            Some("keep")
+        );
     }
 
     #[test]
@@ -2102,7 +2144,7 @@ mod tests {
         assert_eq!(plan.explicit_decision("new.flac"), None);
         // Для добавления возвращается действие по умолчанию, а не решение.
         assert_eq!(
-            plan.effective_decision("new.flac"),
+            plan.resolve().action("new.flac"),
             Some(Decision::Accept)
         );
 
@@ -2158,7 +2200,7 @@ mod tests {
         let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
         assert!(plan.local.is_empty(), "призрак не должен быть изменением");
         assert!(plan.conflicts.is_empty());
-        assert!(plan.unresolved().is_empty());
+        assert!(plan.resolve().unresolved().is_empty());
 
         // Скан чистит такой призрак целиком, а не оставляет вечное удаление.
         assert_eq!(a.prune_ghost_deletes().unwrap(), 1);

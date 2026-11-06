@@ -25,28 +25,28 @@ export function decisionItems(data = workspaceData()) {
       type: 'conflict',
       path: conflict.path,
       conflict,
-      decided: !conflict.unresolved,
+      decided: Boolean(conflict.decided),
+      pending: Boolean(conflict.pending),
       decision: conflict.decision,
       size: Math.max(Number(conflict.local_size) || 0, Number(conflict.remote_size) || 0),
     });
   }
 
-  const manualAdditions = Boolean(data && data.manual_additions);
-  const manualChanges = Boolean(data && data.manual_changes);
   for (const change of plan.changes || []) {
-    if (change.aligned) continue;
-    const addition = manualAdditions && change.kind === 'added';
-    const deletion = change.kind === 'deleted';
-    const changed = manualChanges
-      && (change.kind === 'updated' || change.kind === 'renamed' || change.kind === 'moved');
-    if (!addition && !deletion && !changed) continue;
-    if (paths.has(change.path)) continue;
+    if (change.aligned || change.ignored || paths.has(change.path)) continue;
+    // В карточку внимания попадают только те пути, которым действительно
+    // нужно решение, и уже решённые удаления: их решение можно сбросить.
+    const relevant = change.pending || change.decided || change.kind === 'deleted';
+    if (!relevant) continue;
     paths.add(change.path);
     items.push({
-      type: addition ? 'addition' : deletion ? 'deletion' : 'change',
+      type: change.kind === 'added'
+        ? 'addition'
+        : change.kind === 'deleted' ? 'deletion' : 'change',
       path: change.path,
       change,
       decided: Boolean(change.decided),
+      pending: Boolean(change.pending),
       decision: change.decision,
       size: change.size,
     });
@@ -56,10 +56,12 @@ export function decisionItems(data = workspaceData()) {
 }
 
 export function pendingDecisions(data = workspaceData()) {
-  return decisionItems(data).filter((item) => !item.decided);
+  return decisionItems(data).filter((item) => item.pending);
 }
 
 export function pendingCount(data = workspaceData()) {
+  const plan = planData(data);
+  if (plan && Array.isArray(plan.pending)) return plan.pending.length;
   return pendingDecisions(data).length;
 }
 
@@ -68,8 +70,6 @@ export function pendingCount(data = workspaceData()) {
 export function changeEntries(data = workspaceData()) {
   const plan = planData(data);
   if (!plan) return [];
-  const manualAdditions = Boolean(data && data.manual_additions);
-  const manualChanges = Boolean(data && data.manual_changes);
   const entries = [];
   const seen = new Set();
 
@@ -82,33 +82,52 @@ export function changeEntries(data = workspaceData()) {
       change: null,
       side: null,
       folder: dirname(conflict.path),
-      decided: !conflict.unresolved,
-      pending: Boolean(conflict.unresolved),
+      decided: Boolean(conflict.decided),
+      pending: Boolean(conflict.pending),
+      decision: conflict.decision,
       size: Math.max(Number(conflict.local_size) || 0, Number(conflict.remote_size) || 0),
     });
   }
 
   for (const change of plan.changes || []) {
-    if (change.aligned || seen.has(change.path)) continue;
+    if (change.aligned || change.ignored || seen.has(change.path)) continue;
     seen.add(change.path);
-    const addition = manualAdditions && change.kind === 'added';
-    const deletion = change.kind === 'deleted';
-    const changed = manualChanges
-      && (change.kind === 'updated' || change.kind === 'renamed' || change.kind === 'moved');
     entries.push({
-      type: addition ? 'addition' : deletion ? 'deletion' : 'change',
+      // Тип строки — это вид факта, а не режим: действия в ручном режиме
+      // зависят от вида, даже если путь сейчас принят автоматически.
+      type: change.kind === 'added'
+        ? 'addition'
+        : change.kind === 'deleted' ? 'deletion' : 'change',
       path: change.path,
       conflict: null,
       change,
       side: change.side,
       folder: dirname(change.path),
       decided: Boolean(change.decided),
-      pending: Boolean(!change.decided && (addition || deletion || changed)),
+      pending: Boolean(change.pending),
+      decision: change.decision,
       size: change.size,
     });
   }
 
   return entries;
+}
+
+/// Строки, которые сейчас приняты автоматически и ещё допускают ручной выбор.
+/// Раскрытие такой строки — временное состояние окна, а не решение.
+export function autoEntries(data = workspaceData()) {
+  return changeEntries(data).filter(
+    (entry) => !entry.pending && !entry.decided && entry.type !== 'conflict',
+  );
+}
+
+export function manualOpenSet(data = workspaceData()) {
+  const available = new Set(autoEntries(data).map((entry) => entry.path));
+  return new Set(state.workspace.manualOpen.filter((path) => available.has(path)));
+}
+
+export function manualOpenCount(data = workspaceData()) {
+  return manualOpenSet(data).size;
 }
 
 function locale() {
@@ -186,7 +205,10 @@ export function canCommit(data = workspaceData()) {
     && !state.workspace.action
     && plan
     && (paths > 0 || aligned > 0)
-    && pendingCount(data) === 0,
+    && pendingCount(data) === 0
+    // Раскрытая строка ещё не значит решение. Пока человек не выбрал,
+    // авто-правило не должно применяться незаметно.
+    && manualOpenCount(data) === 0,
   );
 }
 
@@ -293,7 +315,7 @@ export function attentionKind(item) {
   return { css: 'is-delete', label: t('workspace.attention.deletion') };
 }
 
-export function changeMeta(change, manual = false, showFolder = false, pending = false) {
+export function changeMeta(change, showFolder = false, pending = false) {
   const parts = [];
   if (showFolder) {
     parts.push(dirname(change.path) || t('workspace.changes.root'));
@@ -313,7 +335,7 @@ export function changeMeta(change, manual = false, showFolder = false, pending =
     parts.push(change.decided ? decisionLabel(change.decision) : t('workspace.changes.undecided'));
   } else if (change.decided) {
     parts.push(decisionLabel(change.decision));
-  } else if (pending || (manual && change.kind === 'added')) {
+  } else if (pending) {
     parts.push(t('workspace.changes.undecided'));
   } else {
     parts.push(t('workspace.changes.auto'));

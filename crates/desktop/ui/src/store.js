@@ -57,6 +57,9 @@ export const state = reactive({
     tab: 'overview',
     changesSide: 'remote',
     changesSort: 'folders',
+    // Раскрытые вручную строки автоматического режима. Это состояние окна,
+    // а не решение: если человек ничего не выбрал, действует авто-правило.
+    manualOpen: [],
     note: '',
     noteError: false,
     progress: {
@@ -92,6 +95,7 @@ export function resetWorkspace() {
   state.workspace.stale = false;
   state.workspace.error = '';
   state.workspace.statusError = '';
+  state.workspace.manualOpen = [];
 }
 
 // Порядок экранов как в старом интерфейсе: язык → папка → устройства →
@@ -365,6 +369,9 @@ export async function refreshWorkspace(options = {}) {
     if (isWorkspaceGeneration(gen)) {
       state.workspace.data = data;
       state.workspace.stale = false;
+      // Полная проверка пересобирает план: старые раскрытые строки к нему
+      // уже не относятся. Явные решения при этом остаются в базе.
+      state.workspace.manualOpen = [];
     }
   } catch (error) {
     if (isWorkspaceGeneration(gen)) state.workspace.error = errorMessage(error);
