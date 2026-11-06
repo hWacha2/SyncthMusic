@@ -241,6 +241,30 @@ cargo tauri android build --apk
 
 APK появится в `crates\mobile\src-tauri\gen\android\app\build\outputs\apk\`.
 
+Debug-APK содержит отладочные символы и весит сотни мегабайт. Для устройства
+достаточно release-сборки только под arm64:
+
+```powershell
+cd crates\mobile
+cargo tauri android build --apk --split-per-abi --target aarch64 --ci
+```
+
+Готовый APK (~15 МБ) лежит в `...\outputs\apk\arm64\release\`. Для локальной
+установки его можно подписать debug-ключом:
+
+```powershell
+$bt = "$env:LOCALAPPDATA\SyncthMusic\android\sdk\build-tools\36.0.0"
+$src = "src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release-unsigned.apk"
+& "$bt\zipalign.exe" -f -p 4 $src "$env:TEMP\app-aligned.apk"
+& "$bt\apksigner.bat" sign --ks "$env:USERPROFILE\.android\debug.keystore" `
+  --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android `
+  --out "$env:TEMP\app-release.apk" "$env:TEMP\app-aligned.apk"
+adb install -r "$env:TEMP\app-release.apk"
+```
+
+Debug-ключ подходит только для своих устройств: для публикации нужен отдельный
+release-keystore.
+
 Чего пока нет: foreground-сервиса и работы в фоне (входящий сервер живёт только
 пока приложение открыто), ограничения работы по Wi-Fi и зарядке. Это следующий
 шаг — см. [план](docs/roadmap.md).

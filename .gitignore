@@ -15,6 +15,7 @@
 .e2e/
 /data-a/
 /data-b/
+/dist/
 /crates/desktop/ui/node_modules/
 /crates/desktop/ui/dist/
 /crates/mobile/ui/node_modules/
