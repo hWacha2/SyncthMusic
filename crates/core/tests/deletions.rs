@@ -259,6 +259,53 @@ fn restored_track_returns_to_the_change_queue() {
     );
 }
 
+/// Регрессия: файл удалён на ПК через приложение, а вернули его не из корзины
+/// приложения, а вручную — из корзины проводника. Скан оживляет томбстоун;
+/// прежняя общая база больше не база, и путь обязан снова попасть в очередь.
+#[test]
+fn track_restored_from_explorer_returns_to_the_change_queue() {
+    let (ctx, mut a, mut b) = pair();
+
+    let blob = a.entry("Album/01.flac").unwrap().unwrap().blob;
+    // Файл удалён в проводнике, поэтому в корзину приложения копия не попала.
+    fs::remove_file(ctx.root_a.join("Album/01.flac")).unwrap();
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    resolve::resolve(&mut a, "Album/01.flac", Action::DeleteEverywhere).unwrap();
+    let deleted = a.entry("Album/01.flac").unwrap().unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(
+        a.synced_blob("Album/01.flac").unwrap(),
+        blob,
+        "томбстоун хранит прежнюю базу — иначе план не отличит восстановление"
+    );
+    sync(&mut a, &mut b, &ctx.pipe);
+    resolve::prune_deleted_files(&mut b, &ctx.root_b).unwrap();
+
+    // Обе стороны согласны: удаление не висит в плане.
+    let peer_have = b.watermarks().unwrap();
+    let before =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    assert!(!before
+        .local
+        .iter()
+        .any(|change| change.path == "Album/01.flac"));
+
+    // Пользователь вернул файл прямо в папку библиотеки.
+    fs::write(ctx.root_a.join("Album/01.flac"), b"one").unwrap();
+    let report = scan::scan(&ctx.root_a, &mut a).unwrap();
+    assert_eq!(report.added, 1);
+
+    let restored =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    let change = restored
+        .local
+        .iter()
+        .find(|change| change.path == "Album/01.flac")
+        .expect("возвращённый файл должен попасть в очередь изменений");
+    assert_eq!(change.kind, plan::ChangeKind::Added);
+    assert!(change.base_blob.is_empty());
+}
+
 #[test]
 fn pending_delete_is_not_created_for_files_that_never_arrived() {
     let ctx = setup(&[("Album/01.flac", b"one")]);

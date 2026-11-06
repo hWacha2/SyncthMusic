@@ -40,9 +40,12 @@ const rows = computed(() => {
     });
   }
   if (state.workspace.note) {
+    // Результат операции — событие, а не постоянное состояние: у каждого
+    // сообщения свой ключ, чтобы новые тосты не вытесняли предыдущие.
+    const tone = state.workspace.noteError ? 'bad' : 'ok';
     list.push({
-      key: 'note',
-      tone: state.workspace.noteError ? 'bad' : 'ok',
+      key: `note:${tone}|${state.workspace.note}`,
+      tone,
       text: state.workspace.note,
     });
   }
@@ -64,7 +67,8 @@ function dismiss(id) {
 }
 
 function show(row) {
-  // Один источник — один тост: новый текст заменяет старый, а не копится.
+  // Один постоянный источник — один тост: новый текст заменяет старый.
+  // Сообщения операций приходят с разными ключами и копятся до четырёх.
   for (const toast of toasts.value.filter((toast) => toast.key === row.key)) {
     dismiss(toast.id);
   }
@@ -106,24 +110,28 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <TransitionGroup name="ws-toast" tag="div" class="ws-toasts">
-    <div
-      v-for="toast in toasts"
-      :key="toast.id"
-      class="ws-toast"
-      :class="`is-${toast.tone}`"
-      :role="toast.tone === 'bad' ? 'alert' : 'status'"
-    >
-      <span class="ws-toast-dot" aria-hidden="true"></span>
-      <span class="ws-toast-text">{{ toast.text }}</span>
-      <button
-        type="button"
-        class="ws-toast-close"
-        :aria-label="t('workspace.toast.dismiss')"
-        @click="dismiss(toast.id)"
+  <!-- Телепорт в body: иначе `position: fixed` привязан к анимированному
+       предку экрана и тосты уезжают вместе с прокруткой. -->
+  <Teleport to="body">
+    <TransitionGroup name="ws-toast" tag="div" class="ws-toasts">
+      <div
+        v-for="toast in toasts"
+        :key="toast.id"
+        class="ws-toast"
+        :class="`is-${toast.tone}`"
+        :role="toast.tone === 'bad' ? 'alert' : 'status'"
       >
-        ×
-      </button>
-    </div>
-  </TransitionGroup>
+        <span class="ws-toast-dot" aria-hidden="true"></span>
+        <span class="ws-toast-text">{{ toast.text }}</span>
+        <button
+          type="button"
+          class="ws-toast-close"
+          :aria-label="t('workspace.toast.dismiss')"
+          @click="dismiss(toast.id)"
+        >
+          ×
+        </button>
+      </div>
+    </TransitionGroup>
+  </Teleport>
 </template>

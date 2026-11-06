@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
-use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PORT, AGENT_PROTO};
+use syncth_core::agent::{self, AgentIdentity, AgentMsg, VaultEntry, AGENT_PORT, AGENT_PROTO};
 use syncth_core::scan;
 use syncth_core::transport::Transport;
+use syncth_core::vault;
 use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,6 +615,76 @@ fn command_loop(
                         error,
                     },
                 )?;
+            }
+            AgentMsg::GetVault => {
+                let result = crate::open(app).and_then(|replica| {
+                    let rows = replica.vault_rows().map_err(crate::err)?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        // Показываем только реально удалённые пути: строки,
+                        // оставшиеся от уже живой версии, восстанавливать не
+                        // нужно и опасно — они перезапишут актуальный файл.
+                        let deleted = replica
+                            .entry(&row.path)
+                            .map_err(crate::err)?
+                            .map(|entry| entry.deleted)
+                            .unwrap_or(true);
+                        if deleted {
+                            out.push(VaultEntry {
+                                path: row.path,
+                                size: row.size,
+                                deleted_at: row.deleted_at,
+                            });
+                        }
+                    }
+                    Ok(out)
+                });
+                match result {
+                    Ok(rows) => agent::send(transport, &AgentMsg::VaultInfo { rows })?,
+                    Err(message) => agent::send(transport, &AgentMsg::Error { message })?,
+                }
+            }
+            AgentMsg::RestoreVault { path } => {
+                let result = crate::open(app).and_then(|mut replica| {
+                    vault::restore(&mut replica, &path).map_err(crate::err)?;
+                    // Файл снова на диске — пусть медиатека Android его увидит.
+                    if let Ok(Some(root)) = replica.root() {
+                        let _ = crate::media::scan(&root);
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => agent::send(transport, &AgentMsg::VaultRestored { path })?,
+                    Err(message) => agent::send(transport, &AgentMsg::Error { message })?,
+                }
+            }
+            AgentMsg::GcVault { ttl_days } => {
+                let result = crate::open(app)
+                    .and_then(|replica| vault::gc(&replica, ttl_days).map_err(crate::err));
+                match result {
+                    Ok(report) => agent::send(
+                        transport,
+                        &AgentMsg::VaultPruned {
+                            rows_removed: report.rows_removed,
+                            blobs_removed: report.blobs_removed,
+                        },
+                    )?,
+                    Err(message) => agent::send(transport, &AgentMsg::Error { message })?,
+                }
+            }
+            AgentMsg::ClearVault => {
+                let result = crate::open(app)
+                    .and_then(|replica| vault::clear(&replica).map_err(crate::err));
+                match result {
+                    Ok(report) => agent::send(
+                        transport,
+                        &AgentMsg::VaultPruned {
+                            rows_removed: report.rows_removed,
+                            blobs_removed: report.blobs_removed,
+                        },
+                    )?,
+                    Err(message) => agent::send(transport, &AgentMsg::Error { message })?,
+                }
             }
             AgentMsg::Bye => break,
             AgentMsg::Error { message } => anyhow::bail!(message),

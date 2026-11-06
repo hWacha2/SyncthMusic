@@ -168,6 +168,9 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
 /// пользователя. Файлы библиотеки не затрагиваются: hardlink в корзине — лишь
 /// второе имя, его удаление не трогает оригинал.
 pub fn clear(replica: &Replica) -> Result<GcReport> {
+    // Копии нельзя удалять, пока скан или commit читает те же блобы.
+    let lock = replica.library_lock();
+    let _guard = lock.lock();
     let Some(data_dir) = replica.data_dir() else {
         return Ok(GcReport::default());
     };
@@ -200,6 +203,9 @@ pub fn clear(replica: &Replica) -> Result<GcReport> {
 /// Чистит корзину: строки старше `ttl_days`, блобы без ссылок и файлы-сироты
 /// (например, оставшиеся после ручного удаления БД).
 pub fn gc(replica: &Replica, ttl_days: u64) -> Result<GcReport> {
+    // Как и `clear`: не трогаем блобы, которые прямо сейчас читает сеанс.
+    let lock = replica.library_lock();
+    let _guard = lock.lock();
     let Some(data_dir) = replica.data_dir() else {
         return Ok(GcReport::default());
     };

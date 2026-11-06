@@ -18,7 +18,10 @@ use crate::transport::{self, Transport};
 /// Версия 3: команда `ResetHistory` — сброс журнала телефона из настроек ПК.
 /// Версия 4: `ScanProgress` — телефон сообщает, сколько файлов уже проверено.
 /// Версия 5: `ScanProgress` также сообщает байты, чтобы показывать скорость и ETA.
-pub const AGENT_PROTO: u32 = 5;
+/// Версия 6: `GetVault` / `RestoreVault` — ПК видит корзину телефона и может
+/// вернуть трек из неё, даже если на ПК копии нет.
+/// Версия 7: `GcVault` / `ClearVault` — ПК обслуживает корзину телефона целиком.
+pub const AGENT_PROTO: u32 = 7;
 
 /// Сколько агент ждёт подтверждения сопряжения на телефоне.
 pub const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -62,6 +65,19 @@ pub struct ManifestEntry {
     pub size: u64,
     /// Время изменения в миллисекундах Unix. Нужно для быстрого сравнения.
     pub mtime_ms: u64,
+}
+
+/// Удалённый трек, который ещё лежит в корзине телефона.
+///
+/// Блоб не передаётся: восстановление идёт по пути, а содержимое телефон
+/// отдаст обычным сеансом синхронизации, когда ПК попросит его.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultEntry {
+    /// Путь относительно корня библиотеки.
+    pub path: String,
+    pub size: u64,
+    /// Когда файл попал в корзину, миллисекунды Unix.
+    pub deleted_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +150,29 @@ pub enum AgentMsg {
     },
     /// ПК спрашивает, поднят ли на телефоне приём полной синхронизации.
     GetSyncInfo,
+    /// ПК просит список удалённых треков, которые ещё лежат в корзине телефона.
+    GetVault,
+    VaultInfo {
+        rows: Vec<VaultEntry>,
+    },
+    /// ПК просит вернуть трек из корзины телефона в библиотеку.
+    RestoreVault {
+        path: String,
+    },
+    VaultRestored {
+        path: String,
+    },
+    /// ПК просит удалить из корзины телефона копии старше `ttl_days`.
+    GcVault {
+        ttl_days: u64,
+    },
+    /// ПК просит очистить корзину телефона полностью.
+    ClearVault,
+    /// Ответ на `GcVault` и `ClearVault`.
+    VaultPruned {
+        rows_removed: usize,
+        blobs_removed: usize,
+    },
     Error {
         message: String,
     },

@@ -160,6 +160,28 @@ export function askClearVault() {
   });
 }
 
+export function askPhoneVaultGc() {
+  openModal({
+    kicker: t('workspace.phone_vault.panel'),
+    title: t('workspace.modal.phone_gc_title'),
+    text: t('workspace.modal.phone_gc_text'),
+    label: t('workspace.phone_vault.gc'),
+    danger: true,
+    onConfirm: () => gcPhoneVault(),
+  });
+}
+
+export function askPhoneVaultClear() {
+  openModal({
+    kicker: t('workspace.phone_vault.panel'),
+    title: t('workspace.modal.phone_clear_title'),
+    text: t('workspace.modal.phone_clear_text'),
+    label: t('workspace.phone_vault.clear'),
+    danger: true,
+    onConfirm: () => clearPhoneVault(),
+  });
+}
+
 export function askClearHistory() {
   openModal({
     kicker: t('workspace.tab.settings'),
@@ -253,7 +275,8 @@ export async function undoExclusion(path) {
 }
 
 export async function restoreVault(path) {
-  if (!hasBridge || state.workspace.action) return;  state.workspace.action = `restore:${path}`;
+  if (!hasBridge || state.workspace.action) return;
+  state.workspace.action = `restore:${path}`;
   state.workspace.note = '';
   state.workspace.noteError = false;
   state.workspace.error = '';
@@ -268,6 +291,106 @@ export async function restoreVault(path) {
     state.workspace.action = '';
   }
   await refreshWorkspace({ keepNote: true });
+}
+
+/// Список треков в корзине телефона. Запрашивается отдельно от общего статуса:
+/// это редкий экран, а лишний обмен с телефоном на каждый опрос не нужен.
+export async function loadPhoneVault(force = false) {
+  if (!hasBridge) return;
+  if (!state.workspace.data?.phone?.connected) {
+    state.workspace.phoneVault = null;
+    state.workspace.phoneVaultError = '';
+    return;
+  }
+  if (state.workspace.phoneVaultLoading) return;
+  if (!force && state.workspace.phoneVault !== null) return;
+  state.workspace.phoneVaultLoading = true;
+  state.workspace.phoneVaultError = '';
+  try {
+    const result = await invoke('workspace_phone_vault');
+    state.workspace.phoneVault = Array.isArray(result?.rows) ? result.rows : [];
+  } catch (error) {
+    state.workspace.phoneVault = [];
+    state.workspace.phoneVaultError = errorMessage(error);
+  } finally {
+    state.workspace.phoneVaultLoading = false;
+  }
+}
+
+/// Вернуть трек из корзины телефона. Телефон создаёт операцию добавления,
+/// поэтому путь сразу появляется в «Изменениях» — как обычное изменение.
+export async function restorePhoneVault(path) {
+  if (!hasBridge || state.workspace.action) return;
+  state.workspace.action = `restore-phone:${path}`;
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  try {
+    const data = await invoke('workspace_restore_phone_vault', { path });
+    if (data) state.workspace.data = data;
+    state.workspace.note = t('workspace.phone_vault.restored', { path });
+    state.workspace.noteError = false;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.phone_vault_restore', {
+      error: errorMessage(error),
+    });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  await loadPhoneVault(true);
+}
+
+/// Удалить с телефона копии старше срока хранения. Список перезапрашиваем:
+/// строки и размеры на телефоне изменились.
+export async function gcPhoneVault() {
+  if (!hasBridge || state.workspace.action) return;
+  state.workspace.action = 'phone-vault-gc';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  try {
+    const result = await invoke('workspace_phone_vault_gc', { ttlDays: 30 });
+    const rows = number(result?.rows || 0);
+    const blobs = number(result?.blobs || 0);
+    state.workspace.note = rows || blobs
+      ? t('workspace.phone_vault.gc_done', { rows, blobs })
+      : t('workspace.phone_vault.gc_empty');
+    state.workspace.noteError = false;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.phone_vault_gc', {
+      error: errorMessage(error),
+    });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  await loadPhoneVault(true);
+}
+
+/// Полностью очистить корзину телефона. ПК не трогаем: это отдельные копии.
+export async function clearPhoneVault() {
+  if (!hasBridge || state.workspace.action) return;
+  state.workspace.action = 'phone-vault-clear';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  try {
+    const result = await invoke('workspace_phone_vault_clear');
+    state.workspace.note = t('workspace.phone_vault.cleared', {
+      rows: number(result?.rows || 0),
+      blobs: number(result?.blobs || 0),
+    });
+    state.workspace.noteError = false;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.phone_vault_clear', {
+      error: errorMessage(error),
+    });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  await loadPhoneVault(true);
 }
 
 export async function gcVault() {

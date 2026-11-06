@@ -60,6 +60,10 @@ export const state = reactive({
     // Раскрытые вручную строки автоматического режима. Это состояние окна,
     // а не решение: если человек ничего не выбрал, действует авто-правило.
     manualOpen: [],
+    // Корзина телефона: null — ещё не запрашивали, [] — пусто.
+    phoneVault: null,
+    phoneVaultError: '',
+    phoneVaultLoading: false,
     note: '',
     noteError: false,
     progress: {
@@ -96,6 +100,9 @@ export function resetWorkspace() {
   state.workspace.error = '';
   state.workspace.statusError = '';
   state.workspace.manualOpen = [];
+  state.workspace.phoneVault = null;
+  state.workspace.phoneVaultError = '';
+  state.workspace.phoneVaultLoading = false;
 }
 
 // Порядок экранов как в старом интерфейсе: язык → папка → устройства →

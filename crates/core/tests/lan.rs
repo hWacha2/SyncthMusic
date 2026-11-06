@@ -552,6 +552,74 @@ fn wrong_token_is_rejected() {
     assert!(b.live_entries().unwrap().is_empty());
 }
 
+/// Регрессия по второму пользовательскому сценарию: файл удалили на ПК, и
+/// копии в корзине ПК нет. «Удалить везде» отправило удаление на телефон —
+/// именно там файл лёг в корзину. Телефон возвращает трек из своей корзины,
+/// и ПК обязан увидеть добавление и скачать блоб.
+#[test]
+fn track_restored_from_the_phone_vault_reaches_the_pc() {
+    use syncth_core::plan::ChangeKind;
+
+    let ctx = setup();
+    session(&ctx);
+
+    let path = "Album/01.flac";
+    // Пользователь удалил файл на ПК: в корзину ПК копия не попала.
+    fs::remove_file(ctx.root_a.join(path)).unwrap();
+    {
+        let mut a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+        scan::scan(&ctx.root_a, &mut a).unwrap();
+        syncth_core::resolve::resolve(&mut a, path, syncth_core::Action::DeleteEverywhere).unwrap();
+        assert!(a.vault_for_path(path).unwrap().is_none());
+    }
+
+    // Телефон получает удаление: его копия уходит в корзину телефона.
+    session(&ctx);
+    {
+        let b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+        assert!(b.entry(path).unwrap().unwrap().deleted);
+        assert!(b.vault_for_path(path).unwrap().is_some());
+    }
+    assert!(!ctx.root_b.join(path).exists());
+
+    // Телефон возвращает трек из своей корзины.
+    {
+        let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+        syncth_core::vault::restore(&mut b, path).unwrap();
+    }
+    assert!(ctx.root_b.join(path).is_file());
+
+    // Следующий сеанс: ПК видит чужое добавление и скачивает блоб.
+    let b = Replica::open(&ctx.data_b, "dev-b").unwrap();
+    let handle = net::spawn_one(b, "127.0.0.1:0", ctx.token.clone()).unwrap();
+    let mut a = Replica::open(&ctx.data_a, "dev-a").unwrap();
+    let mut session = net::PreviewSession::open(&mut a, &handle.addr, &ctx.token).unwrap();
+    let remote = session
+        .plan
+        .remote
+        .iter()
+        .find(|change| change.path == path)
+        .expect("восстановление с телефона должно вернуться в план ПК");
+    assert_eq!(remote.kind, ChangeKind::Added);
+    assert!(remote.base_blob.is_empty());
+    session.commit(&mut a).unwrap();
+    drop(session);
+    let _ = handle.finish();
+
+    assert_eq!(
+        fs::read(ctx.root_a.join(path)).unwrap(),
+        b"alpha-bytes",
+        "файл должен приехать с телефона"
+    );
+    assert!(!Replica::open(&ctx.data_a, "dev-a")
+        .unwrap()
+        .entry(path)
+        .unwrap()
+        .unwrap()
+        .deleted);
+    assert_eq!(state(&ctx.data_a), state(&ctx.data_b));
+}
+
 #[test]
 fn deleted_track_disappears_on_the_peer_after_resolution() {
     let ctx = setup();

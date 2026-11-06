@@ -659,6 +659,18 @@ button:focus-visible {
   flex: none;
 }
 
+/* Шапка хранилища: переключатель устройства и справка к выбранной стороне. */
+.ws-vault-device .ws-segmented {
+  margin-top: 0;
+}
+
+.ws-vault-hint {
+  margin: 10px 0 0;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 @media (max-width: 620px) {
   .ws-vault-action {
     flex-direction: column;
@@ -759,6 +771,16 @@ button:focus-visible {
   background: var(--action);
   color: var(--action-ink);
   font-weight: 600;
+}
+
+.ws-segment:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.ws-segment:disabled:hover {
+  background: transparent;
+  color: var(--muted);
 }
 
 .ws-setting-card .ws-card-actions {

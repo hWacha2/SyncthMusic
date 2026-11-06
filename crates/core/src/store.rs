@@ -2014,6 +2014,15 @@ fn upsert_entry(
              mtime_ns = excluded.mtime_ns,
              added_at = excluded.added_at,
              deleted = 0,
+             -- Оживление томбстоуна: удаление уже стало общим фактом, поэтому
+             -- прежний `synced_blob` больше не база. Без сброса план видел бы
+             -- blob == synced_blob и не показывал вернувшийся файл в очереди.
+             -- RHS видит старую строку, поэтому `entries.deleted` — прежнее
+             -- значение; обычная правка живой записи базу сохраняет.
+             synced_blob = CASE
+                 WHEN entries.deleted = 1 THEN ''
+                 ELSE entries.synced_blob
+             END,
              hlc_ms = excluded.hlc_ms,
              hlc_counter = excluded.hlc_counter,
              dev = excluded.dev",

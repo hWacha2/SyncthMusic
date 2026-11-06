@@ -378,9 +378,21 @@ fn save_agent_link(link: AgentLink) -> Result<(), String> {
     save_config(&config)
 }
 
+/// Консольные дочерние процессы (`adb`, `netsh`, `powershell`) при запуске из
+/// GUI-приложения получают собственное окно консоли. На Windows его скрывает
+/// `CREATE_NO_WINDOW`; на других платформах флаг не нужен.
+fn hidden_command(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn run_adb(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("adb")
-        .args(args)
+    let output = hidden_command(Command::new("adb").args(args))
         .output()
         .map_err(|e| format!("adb не найден: {e}"))?;
     if !output.status.success() {
@@ -681,17 +693,16 @@ async fn allow_lan_discovery() -> Result<Value, String> {
             let script = format!(
                 "$p = Start-Process -FilePath '{exe_text}' -ArgumentList '--allow-firewall' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
             );
-            let status = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    &script,
-                ])
-                .status()
-                .map_err(|e| format!("Не удалось запустить PowerShell: {e}"))?;
+            let status = hidden_command(Command::new("powershell").args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ]))
+            .status()
+            .map_err(|e| format!("Не удалось запустить PowerShell: {e}"))?;
             if !status.success() {
                 return Err(
                     "Правило не добавлено: запрос администратора отменён или netsh вернул ошибку."
@@ -716,36 +727,40 @@ fn add_firewall_rule() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let program = format!("program={}", exe.to_string_lossy());
 
-    let _ = Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            &format!("name={FIREWALL_RULE}"),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = hidden_command(
+        Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .status();
 
-    let output = Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={FIREWALL_RULE}"),
-            "dir=in",
-            "action=allow",
-            &program,
-            "protocol=udp",
-            "profile=any",
-            "enable=yes",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("netsh: {e}"))?;
+    let output = hidden_command(
+        Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
+                "dir=in",
+                "action=allow",
+                &program,
+                "protocol=udp",
+                "profile=any",
+                "enable=yes",
+            ])
+            .stdin(Stdio::null()),
+    )
+    .output()
+    .map_err(|e| format!("netsh: {e}"))?;
 
     if output.status.success() {
         Ok(())
@@ -1796,6 +1811,142 @@ async fn workspace_restore(path: String) -> Result<Value, String> {
     .await
 }
 
+/// Корзина телефона: треки, удалённые из общей библиотеки, но ещё лежащие
+/// на телефоне. Блоб не запрашиваем — только список, чтобы показать его в UI.
+#[tauri::command]
+async fn workspace_phone_vault(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let rows = with_session(&app, |session| {
+            session
+                .transport
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .map_err(|error| format!("{error:#}"))?;
+            agent::send(session.transport.as_mut(), &AgentMsg::GetVault)
+                .map_err(|error| format!("{error:#}"))?;
+            loop {
+                match agent::recv(session.transport.as_mut())
+                    .map_err(|error| format!("{error:#}"))?
+                {
+                    AgentMsg::VaultInfo { rows } => return Ok(Ok(rows)),
+                    AgentMsg::Error { message } => return Ok(Err(message)),
+                    // В очереди мог остаться ответ на heartbeat `GetRoot`.
+                    _ => {}
+                }
+            }
+        })?;
+        // На ПК путь мог уже вернуться другим способом: предлагать его к
+        // восстановлению незачем, иначе телефон перезапишет живую версию.
+        // Исключённые пути тоже скрываем: их операции ПК не применяет.
+        let replica = workspace_replica()?;
+        let excluded = replica.exclusion_paths().unwrap_or_default();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| !excluded.contains(&row.path))
+            .filter(|row| {
+                replica
+                    .entry(&row.path)
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.deleted)
+                    .unwrap_or(true)
+            })
+            .collect();
+        Ok(json!({ "rows": rows }))
+    })
+    .await
+}
+
+/// Вернуть трек из корзины телефона. Телефон сам достаёт копию и создаёт
+/// `entry_put`; ПК затем видит путь как чужое добавление и скачивает блоб
+/// обычным сеансом. Поэтому после команды закрываем старый план и строим
+/// новый — иначе восстановление не появилось бы в «Изменениях».
+#[tauri::command]
+async fn workspace_restore_phone_vault(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+    blocking(move || {
+        with_session(&app, |session| {
+            session
+                .transport
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .map_err(|error| format!("{error:#}"))?;
+            agent::send(
+                session.transport.as_mut(),
+                &AgentMsg::RestoreVault { path: path.clone() },
+            )
+            .map_err(|error| format!("{error:#}"))?;
+            loop {
+                match agent::recv(session.transport.as_mut())
+                    .map_err(|error| format!("{error:#}"))?
+                {
+                    AgentMsg::VaultRestored { .. } => return Ok(Ok(())),
+                    AgentMsg::Error { message } => return Ok(Err(message)),
+                    _ => {}
+                }
+            }
+        })?;
+
+        let mut replica = workspace_replica()?;
+        let desktop = app.state::<Desktop>();
+        let mut ws = desktop
+            .workspace
+            .lock()
+            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+        ws.close();
+        ws.session_error = match ensure_preview(&app, &mut ws, &mut replica) {
+            Ok(()) => None,
+            Err(error) => Some(error),
+        };
+        Ok(workspace_payload(&app, &replica, &ws))
+    })
+    .await
+}
+
+/// Попросить телефон почистить корзину. Возвращает, сколько строк и файлов
+/// удалено; на ПК это не влияет на план, поэтому сеанс не пересобираем.
+fn phone_vault_prune(app: &tauri::AppHandle, message: AgentMsg) -> Result<Value, String> {
+    let (rows, blobs) = with_session(app, |session| {
+        session
+            .transport
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|error| format!("{error:#}"))?;
+        agent::send(session.transport.as_mut(), &message)
+            .map_err(|error| format!("{error:#}"))?;
+        loop {
+            match agent::recv(session.transport.as_mut())
+                .map_err(|error| format!("{error:#}"))?
+            {
+                AgentMsg::VaultPruned {
+                    rows_removed,
+                    blobs_removed,
+                } => return Ok(Ok((rows_removed, blobs_removed))),
+                AgentMsg::Error { message } => return Ok(Err(message)),
+                // В очереди мог остаться ответ на heartbeat `GetRoot`.
+                _ => {}
+            }
+        }
+    })?;
+    Ok(json!({ "rows": rows, "blobs": blobs }))
+}
+
+/// Удалить из корзины телефона копии старше срока хранения.
+#[tauri::command]
+async fn workspace_phone_vault_gc(app: tauri::AppHandle, ttl_days: Option<u64>) -> Result<Value, String> {
+    blocking(move || {
+        phone_vault_prune(
+            &app,
+            AgentMsg::GcVault {
+                ttl_days: ttl_days.unwrap_or(vault::DEFAULT_TTL_DAYS),
+            },
+        )
+    })
+    .await
+}
+
+/// Полностью очистить корзину телефона. Вернуть треки после этого нельзя.
+#[tauri::command]
+async fn workspace_phone_vault_clear(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || phone_vault_prune(&app, AgentMsg::ClearVault)).await
+}
+
 /// Вернуть путь в синхронизацию. Старый план построен без этого пути, поэтому
 /// закрываем сеанс и сразу открываем новый: путь возвращается в «Изменения» без
 /// ручной проверки. Если телефон недоступен, исключение всё равно снято —
@@ -2070,12 +2221,7 @@ fn open_target(target: &str) -> Result<(), String> {
         command
     };
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    hidden_command(&mut command);
 
     command
         .stdin(Stdio::null())
@@ -2153,6 +2299,10 @@ pub fn run() {
             workspace_progress,
             workspace_commit,
             workspace_restore,
+            workspace_phone_vault,
+            workspace_restore_phone_vault,
+            workspace_phone_vault_gc,
+            workspace_phone_vault_clear,
             workspace_exclusion_undo,
             workspace_gc,
             workspace_clear_vault,
