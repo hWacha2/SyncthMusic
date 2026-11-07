@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PROTO};
-use syncth_core::net::{PreviewSession, SYNC_PORT};
+use syncth_core::net::{CommitStage, PreviewSession, SYNC_PORT};
 use syncth_core::plan::{ChangeKind, Plan};
 use syncth_core::transport::Transport;
 use syncth_core::{scan, vault, Decision, Hlc, Replica};
@@ -1759,15 +1759,32 @@ async fn workspace_commit(app: tauri::AppHandle) -> Result<Value, String> {
             ));
         }
 
-        let outcome = match session.commit(&mut replica) {
+        set_progress(&app, "sync_prepare", 0, 0, 0, 0);
+        let outcome = match session.commit_with_progress(&mut replica, &mut |progress| {
+            let stage = match progress.stage {
+                CommitStage::Receiving => "sync_recv",
+                CommitStage::Sending => "sync_send",
+                CommitStage::Applying => "sync_apply",
+            };
+            set_progress(
+                &app,
+                stage,
+                0,
+                0,
+                progress.done_bytes,
+                progress.total_bytes,
+            );
+        }) {
             Ok(outcome) => outcome,
             Err(error) => {
+                clear_progress(&app);
                 let message = format!("{error:#}");
                 ws.close();
                 ws.session_error = Some(message.clone());
                 return Err(message);
             }
         };
+        clear_progress(&app);
         ws.close();
         ws.session_error = None;
 

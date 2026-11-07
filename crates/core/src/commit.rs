@@ -11,7 +11,7 @@
 //! 4. Применение операций пира и `finalize` — раскладка блобов и фиксация базы.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::hlc::Hlc;
@@ -29,6 +29,9 @@ pub struct Prepared {
     pub ops: Vec<Op>,
     /// Блобы, которых у нас нет: их надо скачать до применения.
     pub needs: Vec<String>,
+    /// Ожидаемые размеры блобов из `needs`. По ним интерфейс показывает,
+    /// сколько байт осталось принять; сам протокол размеры не передаёт.
+    pub need_sizes: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +138,10 @@ pub fn cleanup_staged(replica: &Replica, blobs: &[String]) {
     }
 }
 
-fn need(state: &mut Prepared, seen: &mut HashSet<String>, blob: &str) {
+fn need(state: &mut Prepared, seen: &mut HashSet<String>, blob: &str, size: u64) {
     if !blob.is_empty() && seen.insert(blob.to_string()) {
         state.needs.push(blob.to_string());
+        state.need_sizes.insert(blob.to_string(), size);
     }
 }
 
@@ -251,7 +255,10 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
                             change.path
                         );
                         if !has_blob(replica, &root, &change.base_blob) {
-                            need(&mut prepared, &mut seen, &change.base_blob);
+                            // Точный размер базовой версии неизвестен: в записи
+                            // пути хранится только текущий. Для полосы прогресса
+                            // берём текущий размер как оценку.
+                            need(&mut prepared, &mut seen, &change.base_blob, change.size);
                         }
                         let (_, mtime_ns, added_at) = entry_meta(replica, &change.path)?
                             .unwrap_or((change.size, change.mtime_ns, Hlc::wall_ms()));
@@ -300,7 +307,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
                 }
                 Decision::KeepInLibrary => {
                     if !has_blob(replica, &root, &change.blob) {
-                        need(&mut prepared, &mut seen, &change.blob);
+                        need(&mut prepared, &mut seen, &change.blob, change.size);
                     }
                     prepared.ops.push(put_op(
                         replica,
@@ -329,7 +336,12 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
                 let keep_local = (action == Decision::Keep && chooser)
                     || (action == Decision::Accept && !chooser);
                 if !keep_local && !has_blob(replica, &root, &conflict.remote_blob) {
-                    need(&mut prepared, &mut seen, &conflict.remote_blob);
+                    need(
+                        &mut prepared,
+                        &mut seen,
+                        &conflict.remote_blob,
+                        conflict.remote_size,
+                    );
                 }
                 // Решение разрешает конфликт для обеих сторон; операцию
                 // создаёт только автор решения, иначе HLC-гонка.
@@ -367,7 +379,12 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
             }
             Decision::KeepBoth => {
                 if !has_blob(replica, &root, &conflict.remote_blob) {
-                    need(&mut prepared, &mut seen, &conflict.remote_blob);
+                    need(
+                        &mut prepared,
+                        &mut seen,
+                        &conflict.remote_blob,
+                        conflict.remote_size,
+                    );
                 }
                 let meta = entry_meta(replica, &conflict.path)?.unwrap_or((
                     conflict.local_size,
@@ -417,7 +434,7 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
             ChangeKind::Deleted => decision == Decision::KeepInLibrary,
         };
         if wanted && !has_blob(replica, &root, &change.blob) {
-            need(&mut prepared, &mut seen, &change.blob);
+            need(&mut prepared, &mut seen, &change.blob, change.size);
         }
         // Чужое добавление можно не забирать, а удалить везде. Решение
         // исполняет только его автор: источник удалит файл у себя, а мы

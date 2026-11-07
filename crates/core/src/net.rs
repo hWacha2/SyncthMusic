@@ -179,6 +179,31 @@ impl SyncStats {
     }
 }
 
+// ------------------------------------------------------------------ progress
+
+/// Фаза commit, о которой можно сообщить интерфейсу.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStage {
+    /// Скачиваем блобы с пира.
+    Receiving,
+    /// Отдаём блобы пиру.
+    Sending,
+    /// Раскладываем полученное по библиотеке.
+    Applying,
+}
+
+/// Ход передачи блобов внутри commit.
+///
+/// `done_bytes` — сколько байт уже прошло в этой фазе, `total_bytes` — сколько
+/// всего предстоит передать. У `Applying` оба нулевые: точный объём работы
+/// зависит от плана и заранее не считается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitProgress {
+    pub stage: CommitStage,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
 // ------------------------------------------------------------------ framing
 
 fn send_msg<W: Write>(w: &mut W, msg: &Msg) -> Result<()> {
@@ -270,6 +295,18 @@ fn send_blob<W: Write>(w: &mut W, path: &Path, blob: &str) -> Result<u64> {
 /// Отдать блоб начиная с `start`. Нужно для докачки: получатель говорит,
 /// сколько байт у него уже лежит в `.part`.
 fn send_blob_from<W: Write>(w: &mut W, path: &Path, blob: &str, start: u64) -> Result<u64> {
+    send_blob_from_with(w, path, blob, start, &mut |_| {})
+}
+
+/// То же, но с отчётом о каждом отправленном куске: полоса прогресса не
+/// должна ждать конца файла.
+fn send_blob_from_with<W: Write>(
+    w: &mut W,
+    path: &Path,
+    blob: &str,
+    start: u64,
+    on_chunk: &mut dyn FnMut(u64),
+) -> Result<u64> {
     let mut f =
         std::fs::File::open(path).with_context(|| format!("открытие {}", path.display()))?;
     let size = f.metadata()?.len();
@@ -283,16 +320,24 @@ fn send_blob_from<W: Write>(w: &mut W, path: &Path, blob: &str, start: u64) -> R
             offset: start,
         },
     )?;
-    let left = size - start;
-    let mut limited = (&mut f).take(left);
-    let n = std::io::copy(&mut limited, w)?;
-    anyhow::ensure!(
-        n == left,
-        "файл изменился во время передачи: {}",
-        path.display()
-    );
+    let mut left = size - start;
+    let mut sent = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = f.read(&mut buf[..want])?;
+        anyhow::ensure!(
+            n > 0,
+            "файл изменился во время передачи: {}",
+            path.display()
+        );
+        w.write_all(&buf[..n])?;
+        left -= n as u64;
+        sent += n as u64;
+        on_chunk(n as u64);
+    }
     w.flush()?;
-    Ok(n)
+    Ok(sent)
 }
 
 /// Приём одного блоба: временный файл → проверка BLAKE3 → размещение по всем
@@ -707,6 +752,7 @@ fn receive_blob_resumable<R: Read>(
     size: u64,
     offset: u64,
     stats: &mut SyncStats,
+    on_chunk: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let part = commit::part_path(replica, blob)?;
     if let Some(parent) = part.parent() {
@@ -743,6 +789,7 @@ fn receive_blob_resumable<R: Read>(
         file.write_all(&buf[..n])?;
         remaining -= n as u64;
         stats.received_bytes += n as u64;
+        on_chunk(n as u64);
     }
     file.sync_all()?;
     drop(file);
@@ -767,15 +814,25 @@ fn serve_wants_resumable<R: Read, W: Write>(
     replica: &Replica,
     root: &Path,
     stats: &mut SyncStats,
+    on_progress: &mut dyn FnMut(CommitProgress),
 ) -> Result<()> {
     match recv_msg(r)? {
         Msg::Want { blobs, offsets } => {
+            // Сначала проверяем, что все блобы на месте, и считаем общий
+            // объём: полосе прогресса нужен знаменатель до первой отправки.
+            let mut queue = Vec::with_capacity(blobs.len());
+            let mut total = 0u64;
             for blob in blobs {
                 let start = offsets.get(&blob).copied().unwrap_or(0);
                 match commit::blob_source(replica, root, &blob)? {
                     Some(path) => {
-                        stats.sent_bytes += send_blob_from(w, &path, &blob, start)?;
-                        stats.sent_blobs += 1;
+                        let size = std::fs::metadata(&path)?.len();
+                        anyhow::ensure!(
+                            start <= size,
+                            "смещение {start} больше размера {size} для {blob}"
+                        );
+                        total += size - start;
+                        queue.push((blob, path, start));
                     }
                     None => {
                         let message = format!("у пира нет блоба {blob}");
@@ -788,6 +845,27 @@ fn serve_wants_resumable<R: Read, W: Write>(
                         bail!("{message}");
                     }
                 }
+            }
+            if total > 0 {
+                on_progress(CommitProgress {
+                    stage: CommitStage::Sending,
+                    done_bytes: 0,
+                    total_bytes: total,
+                });
+            }
+            let mut done = 0u64;
+            for (blob, path, start) in queue {
+                stats.sent_bytes += send_blob_from_with(w, &path, &blob, start, &mut |n| {
+                    done += n;
+                    if total > 0 {
+                        on_progress(CommitProgress {
+                            stage: CommitStage::Sending,
+                            done_bytes: done,
+                            total_bytes: total,
+                        });
+                    }
+                })?;
+                stats.sent_blobs += 1;
             }
             send_msg(w, &Msg::Done)
         }
@@ -1440,6 +1518,17 @@ impl PreviewSession {
     /// блобами, применить только после полной загрузки. При обрыве `.part`
     /// остаётся на диске, решения — в БД, commit можно повторить.
     pub fn commit(&mut self, replica: &mut Replica) -> Result<commit::Outcome> {
+        self.commit_with_progress(replica, &mut |_| {})
+    }
+
+    /// То же, что `commit`, но с отчётом о ходе передачи блобов. Колбэк
+    /// вызывается из потока commit, поэтому интерфейс должен только записать
+    /// цифры в отдельное состояние, а не ждать этот же мьютекс.
+    pub fn commit_with_progress(
+        &mut self,
+        replica: &mut Replica,
+        on_progress: &mut dyn FnMut(CommitProgress),
+    ) -> Result<commit::Outcome> {
         anyhow::ensure!(!self.finished, "сессия уже завершена");
         anyhow::ensure!(!self.read_only, "передача уже началась");
         // Commit пишет файлы и журнал: скан не может идти параллельно —
@@ -1475,10 +1564,23 @@ impl PreviewSession {
 
             let mut stats = SyncStats::default();
             // 1. Тянем то, чего нет у нас.
-            self.receive_wanted(replica, &prepared.needs, &mut stats)?;
+            self.receive_wanted(
+                replica,
+                &prepared.needs,
+                &prepared.need_sizes,
+                &mut stats,
+                on_progress,
+            )?;
             // 2. Отдаём то, что нужно пиру.
             let root = replica.root()?.context("корень библиотеки не задан")?;
-            serve_wants_resumable(&mut self.r, &mut self.w, replica, &root, &mut stats)?;
+            serve_wants_resumable(
+                &mut self.r,
+                &mut self.w,
+                replica,
+                &root,
+                &mut stats,
+                on_progress,
+            )?;
 
             self.send(&Msg::CommitReady)?;
             match self.recv_commit_msg()? {
@@ -1487,6 +1589,11 @@ impl PreviewSession {
                 other => bail!("ожидали commit_ready, получили {other:?}"),
             }
 
+            on_progress(CommitProgress {
+                stage: CommitStage::Applying,
+                done_bytes: 0,
+                total_bytes: 0,
+            });
             commit::apply_local(replica, &self.plan, &resolution, &prepared)?;
             let outcome = commit::finalize(replica, &self.plan, &resolution, &peer_ops)?;
             self.send(&Msg::CommitDone {
@@ -1565,9 +1672,22 @@ impl PreviewSession {
             let mut stats = SyncStats::default();
             // Зеркальный порядок: сначала отдаём то, что просит пир.
             let root = replica.root()?.context("корень библиотеки не задан")?;
-            serve_wants_resumable(&mut self.r, &mut self.w, replica, &root, &mut stats)?;
+            serve_wants_resumable(
+                &mut self.r,
+                &mut self.w,
+                replica,
+                &root,
+                &mut stats,
+                &mut |_| {},
+            )?;
             // Потом тянем своё.
-            self.receive_wanted(replica, &prepared.needs, &mut stats)?;
+            self.receive_wanted(
+                replica,
+                &prepared.needs,
+                &prepared.need_sizes,
+                &mut stats,
+                &mut |_| {},
+            )?;
 
             self.send(&Msg::CommitReady)?;
             match self.recv_commit_msg()? {
@@ -1605,20 +1725,68 @@ impl PreviewSession {
         &mut self,
         replica: &mut Replica,
         blobs: &[String],
+        sizes: &HashMap<String, u64>,
         stats: &mut SyncStats,
+        on_progress: &mut dyn FnMut(CommitProgress),
     ) -> Result<()> {
         let offsets: HashMap<String, u64> = blobs
             .iter()
             .map(|blob| (blob.clone(), commit::partial_offset(replica, blob)))
             .collect();
+        let mut total: u64 = blobs
+            .iter()
+            .map(|blob| {
+                sizes
+                    .get(blob)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(offsets.get(blob).copied().unwrap_or(0))
+            })
+            .sum();
+        if total > 0 {
+            on_progress(CommitProgress {
+                stage: CommitStage::Receiving,
+                done_bytes: 0,
+                total_bytes: total,
+            });
+        }
         self.send(&Msg::Want {
             blobs: blobs.to_vec(),
             offsets,
         })?;
+        let mut done = 0u64;
         loop {
             match self.recv_commit_msg()? {
                 Msg::BlobHead { blob, size, offset } => {
-                    receive_blob_resumable(&mut self.r, replica, &blob, size, offset, stats)?;
+                    // Размер из плана мог быть оценкой (например, для старой
+                    // базовой версии). Уточняем знаменатель по факту.
+                    let expected = sizes
+                        .get(&blob)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(offset);
+                    let actual = size.saturating_sub(offset);
+                    if actual != expected {
+                        total = total.saturating_sub(expected).saturating_add(actual);
+                    }
+                    receive_blob_resumable(
+                        &mut self.r,
+                        replica,
+                        &blob,
+                        size,
+                        offset,
+                        stats,
+                        &mut |n| {
+                            done += n;
+                            if total > 0 {
+                                on_progress(CommitProgress {
+                                    stage: CommitStage::Receiving,
+                                    done_bytes: done,
+                                    total_bytes: total,
+                                });
+                            }
+                        },
+                    )?;
                 }
                 Msg::Done => return Ok(()),
                 Msg::Error { message } => bail!("пир не отдал блоб: {message}"),
@@ -2159,7 +2327,8 @@ mod tests {
 
         let mut empty: &[u8] = &[];
         let mut stats = SyncStats::default();
-        receive_blob_resumable(&mut empty, &replica, &blob, 0, 0, &mut stats).unwrap();
+        receive_blob_resumable(&mut empty, &replica, &blob, 0, 0, &mut stats, &mut |_| {})
+            .unwrap();
 
         assert_eq!(stats.received_bytes, 0);
         let staged = commit::verified(&replica, &blob).expect("пустой блоб должен быть принят");

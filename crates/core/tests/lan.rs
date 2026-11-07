@@ -350,8 +350,21 @@ fn commit_applies_accepted_additions_and_clears_the_plan() {
     let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
     let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
 
-    let outcome = session.commit(&mut b).unwrap();
+    let mut phases = Vec::new();
+    let outcome = session
+        .commit_with_progress(&mut b, &mut |progress| phases.push(progress))
+        .unwrap();
     assert!(outcome.accepted >= 2, "{outcome:?}");
+    let received = phases
+        .iter()
+        .filter(|progress| progress.stage == net::CommitStage::Receiving)
+        .last()
+        .expect("приём двух треков должен попасть в прогресс");
+    assert_eq!(received.total_bytes, 21);
+    assert_eq!(received.done_bytes, 21);
+    assert!(phases
+        .iter()
+        .any(|progress| progress.stage == net::CommitStage::Applying));
     assert!(session.finished);
     assert!(b
         .load_plan("dev-a", syncth_core::Hlc::wall_ms())
@@ -411,9 +424,23 @@ fn commit_resumes_a_partial_download_from_the_same_offset() {
     let mut b = Replica::open(&ctx.data_b, "dev-b").unwrap();
     let handle = net::spawn_one(a, "127.0.0.1:0", ctx.token.clone()).unwrap();
     let mut session = net::PreviewSession::open(&mut b, &handle.addr, &ctx.token).unwrap();
-    session.commit(&mut b).unwrap();
+    let mut phases = Vec::new();
+    session
+        .commit_with_progress(&mut b, &mut |progress| phases.push(progress))
+        .unwrap();
     drop(session);
     let _ = handle.finish();
+
+    // Полоса должна считать только то, что реально переносится: пять байт
+    // первого трека уже лежат в `.part`, поэтому вместо 11 + 10 = 21 байта
+    // переносим 6 + 10 = 16.
+    let received = phases
+        .iter()
+        .filter(|progress| progress.stage == net::CommitStage::Receiving)
+        .last()
+        .expect("докачка должна попасть в прогресс");
+    assert_eq!(received.total_bytes, 16);
+    assert_eq!(received.done_bytes, 16);
 
     assert_eq!(
         fs::read(ctx.root_b.join("Album/01.flac")).unwrap(),

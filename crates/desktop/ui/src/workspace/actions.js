@@ -232,15 +232,18 @@ export async function commitWorkspace() {
   state.workspace.note = '';
   state.workspace.noteError = false;
   state.workspace.error = '';
+  startProgressWatch();
   let outcome = null;
   try {
     outcome = await invoke('workspace_commit');
   } catch (error) {
+    stopProgressWatch();
     state.workspace.action = '';
     state.workspace.note = t('workspace.error.commit', { error: errorMessage(error) });
     state.workspace.noteError = true;
     return;
   }
+  stopProgressWatch();
   state.workspace.action = '';
   state.workspace.data = null;
   state.workspace.note = t('workspace.commit_done', {

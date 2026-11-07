@@ -64,6 +64,10 @@ const label = computed(() => {
       : t('workspace.progress.phone_start');
   }
   if (stage === 'plan') return t('workspace.progress.plan');
+  if (stage === 'sync_prepare') return t('workspace.progress.sync_prepare');
+  if (stage === 'sync_recv') return t('workspace.progress.sync_recv');
+  if (stage === 'sync_send') return t('workspace.progress.sync_send');
+  if (stage === 'sync_apply') return t('workspace.progress.sync_apply');
   return '';
 });
 </script>
