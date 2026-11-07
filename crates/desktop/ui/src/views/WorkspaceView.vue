@@ -1,5 +1,6 @@
 <script setup>
 import ChangesTab from '../components/workspace/ChangesTab.vue';
+import DevicesTab from '../components/workspace/DevicesTab.vue';
 import ExclusionsTab from '../components/workspace/ExclusionsTab.vue';
 import OverviewTab from '../components/workspace/OverviewTab.vue';
 import SettingsTab from '../components/workspace/SettingsTab.vue';
@@ -44,7 +45,8 @@ watch(
       <WorkspaceNotices :data="body" />
       <WorkspaceProgress />
       <div class="workspace-body">
-        <WorkspaceEmpty v-if="!body" />
+        <DevicesTab v-if="tab === 'devices'" :data="body" />
+        <WorkspaceEmpty v-else-if="!body" />
         <OverviewTab v-else-if="tab === 'overview'" :data="body" />
         <ChangesTab v-else-if="tab === 'changes'" :data="body" />
         <ExclusionsTab v-else-if="tab === 'exclusions'" :data="body" />

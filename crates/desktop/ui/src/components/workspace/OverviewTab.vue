@@ -1,17 +1,11 @@
 <script setup>
 import DecisionButtons from './DecisionButtons.vue';
 import IconCheck from '../icons/IconCheck.vue';
-import IconPc from '../icons/IconPc.vue';
-import IconPhone from '../icons/IconPhone.vue';
-import Spinner from '../Spinner.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
-import { basename, formatSize, number } from '../../format.js';
-import { disconnectPhone, openDevices, reconnect, requestRootChange, state } from '../../store.js';
+import { formatSize, number } from '../../format.js';
 import {
   attentionKind,
-  checkedText,
-  connectionState,
   decisionItems,
   decisionLabel,
   decisionMeta,
@@ -19,7 +13,7 @@ import {
   planData,
   vaultTotals,
 } from '../../workspace/model.js';
-import { askForget, selectTab } from '../../workspace/actions.js';
+import { selectTab } from '../../workspace/actions.js';
 
 const props = defineProps({
   data: { type: Object, default: null },
@@ -32,9 +26,6 @@ const paths = computed(() => Number(plan.value?.paths) || 0);
 const aligned = computed(() => Number(plan.value?.aligned) || 0);
 const phoneScan = computed(() => props.data?.phone_scan);
 const items = computed(() => decisionItems(props.data));
-const conn = computed(() => connectionState(props.data));
-const connected = computed(() => conn.value.tone === 'on');
-const phone = computed(() => props.data?.phone || {});
 const vault = computed(() => vaultTotals(props.data));
 
 // Карточка «Требует решения» не должна расти вместе со списком: показываем
@@ -94,127 +85,44 @@ function attentionMeta(item) {
     </div>
   </div>
 
-  <div class="ws-grid">
-    <section class="ws-card ws-connection">
-      <div class="ws-card-head">
-        <h2 class="ws-card-title">{{ t('workspace.connection.title') }}</h2>
-        <span
-          class="ws-tag"
-          :class="{ 'is-on': connected, 'is-warn': conn.tone === 'warn' }"
-        >{{ conn.label }}</span>
-      </div>
-      <div class="ws-signal" :class="connected ? 'is-live' : 'is-idle'">
-        <div class="ws-node">
-          <span class="ws-node-icon is-on"><IconPc /></span>
-          <div class="ws-node-copy">
-            <span class="ws-node-name">{{ pc.name || t('workspace.this_pc') }}</span>
-            <span class="ws-node-sub">{{ t('workspace.connection.this_pc') }}</span>
-          </div>
+  <section class="ws-card ws-attention">
+    <div class="ws-card-head">
+      <h2 class="ws-card-title">{{ t('workspace.attention.title') }}</h2>
+      <span class="ws-tag" :class="pending ? 'is-warn' : 'is-on'">
+        {{ pending
+          ? t('workspace.attention.count', { count: pending })
+          : items.length ? t('workspace.attention.done') : t('workspace.attention.none') }}
+      </span>
+    </div>
+    <div v-if="shownItems.length" class="ws-decisions">
+      <div
+        v-for="item in shownItems"
+        :key="item.path"
+        class="ws-decision"
+        :class="{ 'is-decided': item.decided }"
+      >
+        <div class="ws-decision-main">
+          <span class="ws-kind" :class="attentionKind(item).css">{{ attentionKind(item).label }}</span>
+          <span class="ws-decision-path" :title="item.path">{{ item.path }}</span>
+          <span class="ws-decision-meta">{{ attentionMeta(item) }}</span>
         </div>
-        <div class="ws-wire" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div class="ws-node">
-          <span class="ws-node-icon" :class="{ 'is-on': connected }"><IconPhone /></span>
-          <div class="ws-node-copy">
-            <span class="ws-node-name">{{ phone.linked ? (phone.name || phone.dev || t('workspace.connection.phone')) : t('workspace.connection.phone') }}</span>
-            <span class="ws-node-sub">{{ phone.linked
-              ? (phone.root ? basename(phone.root) : t('workspace.connection.no_folder'))
-              : t('workspace.connection.not_linked') }}</span>
-          </div>
+        <div class="ws-decision-actions">
+          <DecisionButtons :item="item" />
         </div>
       </div>
-      <div class="ws-kv-list">
-        <div class="ws-kv">
-          <span class="ws-kv-label">{{ t('workspace.connection.folder') }}</span>
-          <span class="ws-kv-main">
-            <span v-if="phone.root" class="ws-kv-value is-mono" :title="phone.root">{{ phone.root }}</span>
-            <span v-else class="ws-kv-value is-empty">{{ t('workspace.connection.no_folder') }}</span>
-          </span>
-          <button
-            v-if="phone.linked && phone.connected"
-            class="btn btn--quiet btn--small"
-            :disabled="Boolean(state.phoneBusy)"
-            @click="requestRootChange()"
-          >
-            <Spinner v-if="state.phoneBusy === 'root'" />{{ t('workspace.change_root') }}
-          </button>
-        </div>
-        <div class="ws-kv">
-          <span class="ws-kv-label">{{ t('workspace.connection.address') }}</span>
-          <span class="ws-kv-main"><span class="ws-kv-value is-mono">{{ phone.addr || '—' }}</span></span>
-        </div>
-        <div class="ws-kv">
-          <span class="ws-kv-label">{{ t('workspace.connection.checked') }}</span>
-          <span class="ws-kv-main"><span class="ws-kv-value">{{ checkedText(data) }}</span></span>
-        </div>
+      <button v-if="hiddenCount" class="ws-more" @click="selectTab('changes')">
+        <span>{{ t('workspace.attention.more', { count: hiddenCount }) }}</span>
+        <span class="ws-more-arrow" aria-hidden="true">→</span>
+      </button>
+    </div>
+    <div v-else class="ws-calm">
+      <span class="ws-calm-icon"><IconCheck /></span>
+      <div>
+        <b>{{ t('workspace.attention.empty_title') }}</b>
+        <p>{{ data?.manual_additions || data?.manual_changes
+          ? t('workspace.attention.empty_manual')
+          : t('workspace.attention.empty_text') }}</p>
       </div>
-      <div class="ws-card-actions">
-        <button
-          v-if="phone.linked && !phone.connected"
-          class="btn btn--small"
-          :disabled="Boolean(state.busy)"
-          @click="reconnect()"
-        >
-          <Spinner v-if="state.busy === 'reconnect'" />{{ t('workspace.reconnect') }}
-        </button>
-        <button
-          v-if="phone.linked && phone.connected"
-          class="btn btn--quiet btn--small"
-          :disabled="Boolean(state.phoneBusy)"
-          @click="disconnectPhone"
-        >
-          <Spinner v-if="state.phoneBusy === 'disconnect'" />{{ t('workspace.disconnect') }}
-        </button>
-        <button
-          v-if="phone.linked"
-          class="btn btn--quiet btn--small btn--danger"
-          :disabled="Boolean(state.phoneBusy)"
-          @click="askForget"
-        >
-          <Spinner v-if="state.phoneBusy === 'forget'" />{{ t('workspace.forget') }}
-        </button>
-        <button v-else class="btn btn--small" @click="openDevices">{{ t('workspace.connect') }}</button>
-      </div>
-    </section>
-
-    <section class="ws-card ws-attention">
-      <div class="ws-card-head">
-        <h2 class="ws-card-title">{{ t('workspace.attention.title') }}</h2>
-        <span class="ws-tag" :class="pending ? 'is-warn' : 'is-on'">
-          {{ pending
-            ? t('workspace.attention.count', { count: pending })
-            : items.length ? t('workspace.attention.done') : t('workspace.attention.none') }}
-        </span>
-      </div>
-      <div v-if="shownItems.length" class="ws-decisions">
-        <div
-          v-for="item in shownItems"
-          :key="item.path"
-          class="ws-decision"
-          :class="{ 'is-decided': item.decided }"
-        >
-          <div class="ws-decision-main">
-            <span class="ws-kind" :class="attentionKind(item).css">{{ attentionKind(item).label }}</span>
-            <span class="ws-decision-path" :title="item.path">{{ item.path }}</span>
-            <span class="ws-decision-meta">{{ attentionMeta(item) }}</span>
-          </div>
-          <div class="ws-decision-actions">
-            <DecisionButtons :item="item" />
-          </div>
-        </div>
-        <button v-if="hiddenCount" class="ws-more" @click="selectTab('changes')">
-          <span>{{ t('workspace.attention.more', { count: hiddenCount }) }}</span>
-          <span class="ws-more-arrow" aria-hidden="true">→</span>
-        </button>
-      </div>
-      <div v-else class="ws-calm">
-        <span class="ws-calm-icon"><IconCheck /></span>
-        <div>
-          <b>{{ t('workspace.attention.empty_title') }}</b>
-          <p>{{ data?.manual_additions || data?.manual_changes
-            ? t('workspace.attention.empty_manual')
-            : t('workspace.attention.empty_text') }}</p>
-        </div>
-      </div>
-    </section>
-  </div>
+    </div>
+  </section>
 </template>

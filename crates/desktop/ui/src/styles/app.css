@@ -618,6 +618,45 @@ button:focus-visible {
   max-width: 760px;
 }
 
+.ws-devices {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 760px;
+}
+
+/* Компактный выбор языка внутри настроек: тот же dropdown, что на старте. */
+.ws-lang-select {
+  max-width: 280px;
+  margin-top: 12px;
+}
+
+.ws-lang-select .lang-trigger {
+  height: 38px;
+  padding: 0 12px;
+  border-radius: 11px;
+  font-size: 12.5px;
+}
+
+.ws-lang-select .lang-option {
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 12.5px;
+}
+
+/* Список устройств живёт внутри карточки: фон строк не должен сливаться. */
+.ws-devices .device-item {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ws-devices .device-item:hover {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.ws-devices .group-empty {
+  background: rgba(255, 255, 255, 0.016);
+}
+
 .ws-vault {
   display: flex;
   flex-direction: column;

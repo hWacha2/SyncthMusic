@@ -3,7 +3,7 @@ import { computed } from 'vue';
 import Spinner from '../Spinner.vue';
 import { t } from '../../i18n/index.js';
 import { formatSize, number } from '../../format.js';
-import { refreshWorkspace, state } from '../../store.js';
+import { discoverAll, refreshWorkspace, state } from '../../store.js';
 import {
   canCommit,
   excludedCount,
@@ -21,6 +21,9 @@ const props = defineProps({
 
 const busy = computed(() => Boolean(state.workspace.refreshing || state.workspace.action));
 const refreshing = computed(() => state.workspace.refreshing);
+const phoneConnected = computed(
+  () => Boolean(props.data?.phone?.connected ?? state.phone?.connected),
+);
 
 const head = computed(() => {
   if (props.tab === 'changes') {
@@ -34,6 +37,12 @@ const head = computed(() => {
         : pending
           ? t('workspace.changes.sub_pending', { count, pending })
           : t('workspace.changes.sub', { count }),
+    };
+  }
+  if (props.tab === 'devices') {
+    return {
+      title: t('workspace.tab.devices'),
+      text: t('workspace.devices.sub'),
     };
   }
   if (props.tab === 'settings') {
@@ -83,7 +92,18 @@ const commitLabel = computed(() => {
       <h1 class="ws-title">{{ head.title }}</h1>
       <p class="ws-sub">{{ head.text }}</p>
     </div>
-    <div v-if="tab !== 'settings' && tab !== 'vault' && tab !== 'exclusions'" class="ws-head-actions">
+    <div v-if="tab === 'devices'" class="ws-head-actions">
+      <button
+        v-if="!phoneConnected"
+        class="btn btn--quiet"
+        :disabled="state.discovering"
+        @click="discoverAll()"
+      >
+        <Spinner v-if="state.discovering" />
+        {{ state.discovering ? t('setup.searching') : t('setup.refresh') }}
+      </button>
+    </div>
+    <div v-else-if="tab !== 'settings' && tab !== 'vault' && tab !== 'exclusions'" class="ws-head-actions">
       <button class="btn btn--quiet" :disabled="busy" @click="refreshWorkspace()">
         <Spinner v-if="refreshing" />
         {{ refreshing ? t('workspace.checking') : t('workspace.check') }}

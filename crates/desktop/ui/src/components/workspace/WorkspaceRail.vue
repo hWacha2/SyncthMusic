@@ -1,6 +1,7 @@
 <script setup>
 import IconList from '../icons/IconList.vue';
 import IconOverview from '../icons/IconOverview.vue';
+import IconPhone from '../icons/IconPhone.vue';
 import IconSettings from '../icons/IconSettings.vue';
 import IconVault from '../icons/IconVault.vue';
 import IconExclude from '../icons/IconExclude.vue';
@@ -28,6 +29,7 @@ const tabs = [
   { id: 'changes', icon: IconList, label: 'workspace.tab.changes', hot: true },
   { id: 'exclusions', icon: IconExclude, label: 'workspace.tab.exclusions' },
   { id: 'vault', icon: IconVault, label: 'workspace.tab.vault' },
+  { id: 'devices', icon: IconPhone, label: 'workspace.tab.devices' },
   { id: 'settings', icon: IconSettings, label: 'workspace.tab.settings' },
 ];
 

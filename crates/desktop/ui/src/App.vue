@@ -5,14 +5,12 @@ import TitleBar from './components/TitleBar.vue';
 import ErrorView from './views/ErrorView.vue';
 import LanguageView from './views/LanguageView.vue';
 import LibraryView from './views/LibraryView.vue';
-import DevicesView from './views/DevicesView.vue';
 import WorkspaceView from './views/WorkspaceView.vue';
 import { boot, state } from './store.js';
 
 const views = {
   language: LanguageView,
   library: LibraryView,
-  devices: DevicesView,
   workspace: WorkspaceView,
   error: ErrorView,
 };

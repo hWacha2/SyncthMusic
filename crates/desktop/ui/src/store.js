@@ -176,8 +176,10 @@ export async function discoverAll(keepNote = false) {
 
 async function applyLink(result) {
   // Переподключение из рабочей области не должно перебрасывать на «Обзор»:
-  // вкладку сбрасываем только при входе с другого экрана.
+  // вкладку сбрасываем только при входе с другого экрана или когда телефон
+  // подключён со вкладки «Устройства».
   const wasWorkspace = state.view === 'workspace';
+  const fromDevices = wasWorkspace && state.workspace.tab === 'devices';
   state.phone = {
     linked: true,
     connected: true,
@@ -189,7 +191,7 @@ async function applyLink(result) {
   state.note = '';
   state.error = false;
   resetWorkspace();
-  if (!wasWorkspace) state.workspace.tab = 'overview';
+  if (!wasWorkspace || fromDevices) state.workspace.tab = 'overview';
   state.view = state.root ? 'workspace' : 'library';
   if (result.needs_root) {
     state.note = t('library.waiting_phone');
@@ -210,8 +212,8 @@ export async function connectLan(dev, addr) {
     await applyLink(result);
   } catch (error) {
     state.busy = '';
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
+    state.note = '';
+    reportSetupError(t('phone.error', { error: errorMessage(error) }));
   }
 }
 
@@ -226,8 +228,8 @@ export async function connectAdb(serial) {
     await applyLink(result);
   } catch (error) {
     state.busy = '';
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
+    state.note = '';
+    reportSetupError(t('phone.error', { error: errorMessage(error) }));
   }
 }
 
@@ -280,13 +282,14 @@ export async function chooseFolder() {
   await refreshWorkspace();
 }
 
-export async function openDevices() {
+/// Подключение живёт на отдельной вкладке рабочей области. Выбор вкладки
+/// не закрывает сеанс: устройства можно смотреть, не выходя из библиотеки.
+export function openDevices() {
   if (state.busy) return;
-  await closeWorkspace();
-  state.view = 'devices';
   state.error = false;
   state.note = '';
-  await discoverAll();
+  if (state.view !== 'workspace' && state.root) state.view = 'workspace';
+  state.workspace.tab = 'devices';
 }
 
 export async function openWorkspace() {
