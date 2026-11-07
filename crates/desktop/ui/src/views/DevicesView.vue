@@ -10,7 +10,6 @@ import {
   connectAdb,
   connectLan,
   discoverAll,
-  openLibrary,
   openWorkspace,
   state,
 } from '../store.js';
@@ -31,11 +30,8 @@ function adbLabel(device) {
     <div class="setup-head">
       <h1 class="setup-title">{{ t('setup.title') }}</h1>
       <div class="setup-actions">
-        <button v-if="state.phone.linked" class="btn" @click="openWorkspace">
+        <button v-if="state.root" class="btn" @click="openWorkspace">
           {{ t('workspace.back') }}
-        </button>
-        <button v-if="state.root" class="btn btn--quiet" @click="openLibrary">
-          {{ t('setup.change_folder') }}
         </button>
         <button class="btn btn--quiet" :disabled="state.discovering" @click="discoverAll()">
           <Spinner v-if="state.discovering" />{{ t('setup.refresh') }}

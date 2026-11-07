@@ -11,23 +11,23 @@ const props = defineProps({
   data: { type: Object, default: null },
 });
 
-const rows = computed(() => props.data?.exclusions || []);
+const rows = computed(() => (props.data?.states || []).filter((row) => row.excluded));
 const busy = computed(() => Boolean(state.workspace.action || state.workspace.refreshing));
 
-// На ПК сторона `remote` — это телефон, `local` — сам ПК. Таблица хранит
-// сторону относительно устройства, принявшего решение.
+// `ExcludedRemote` — уцелевшая копия осталась на телефоне, `ExcludedLocal` —
+// на этом ПК. Группируем по состоянию, а не по старому полю `side`.
 const groups = computed(() => [
   {
     side: 'remote',
     title: t('workspace.exclusions.phone_group'),
     hint: t('workspace.exclusions.phone_hint'),
-    items: rows.value.filter((row) => row.side !== 'local'),
+    items: rows.value.filter((row) => row.state === 'excluded_remote'),
   },
   {
     side: 'local',
     title: t('workspace.exclusions.pc_group'),
     hint: t('workspace.exclusions.pc_hint'),
-    items: rows.value.filter((row) => row.side === 'local'),
+    items: rows.value.filter((row) => row.state === 'excluded_local'),
   },
 ]);
 </script>

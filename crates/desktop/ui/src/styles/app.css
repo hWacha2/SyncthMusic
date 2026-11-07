@@ -709,6 +709,14 @@ button:focus-visible {
   cursor: default;
 }
 
+.ws-setting-row.is-static {
+  cursor: default;
+}
+
+.ws-setting-row.is-static:hover {
+  background: rgba(255, 255, 255, 0.016);
+}
+
 .ws-setting-copy {
   display: flex;
   flex-direction: column;

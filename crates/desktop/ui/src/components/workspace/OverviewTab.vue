@@ -7,7 +7,7 @@ import Spinner from '../Spinner.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
 import { basename, formatSize, number } from '../../format.js';
-import { disconnectPhone, openDevices, requestRootChange, state } from '../../store.js';
+import { disconnectPhone, openDevices, reconnect, requestRootChange, state } from '../../store.js';
 import {
   attentionKind,
   checkedText,
@@ -130,7 +130,7 @@ function attentionMeta(item) {
             <span v-else class="ws-kv-value is-empty">{{ t('workspace.connection.no_folder') }}</span>
           </span>
           <button
-            v-if="phone.linked"
+            v-if="phone.linked && phone.connected"
             class="btn btn--quiet btn--small"
             :disabled="Boolean(state.phoneBusy)"
             @click="requestRootChange()"
@@ -149,7 +149,15 @@ function attentionMeta(item) {
       </div>
       <div class="ws-card-actions">
         <button
-          v-if="phone.linked"
+          v-if="phone.linked && !phone.connected"
+          class="btn btn--small"
+          :disabled="Boolean(state.busy)"
+          @click="reconnect()"
+        >
+          <Spinner v-if="state.busy === 'reconnect'" />{{ t('workspace.reconnect') }}
+        </button>
+        <button
+          v-if="phone.linked && phone.connected"
           class="btn btn--quiet btn--small"
           :disabled="Boolean(state.phoneBusy)"
           @click="disconnectPhone"

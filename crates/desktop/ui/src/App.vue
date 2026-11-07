@@ -7,8 +7,7 @@ import LanguageView from './views/LanguageView.vue';
 import LibraryView from './views/LibraryView.vue';
 import DevicesView from './views/DevicesView.vue';
 import WorkspaceView from './views/WorkspaceView.vue';
-import { langShort, t } from './i18n/index.js';
-import { boot, openLanguage, state } from './store.js';
+import { boot, state } from './store.js';
 
 const views = {
   language: LanguageView,
@@ -45,14 +44,6 @@ onMounted(boot);
     <main ref="screen" class="screen" :class="{ 'view-enter': enter }">
       <component :is="current" v-if="current" />
     </main>
-    <button
-      v-if="state.view !== 'language' && state.view !== 'loading'"
-      type="button"
-      class="lang-switch"
-      @click="openLanguage"
-    >
-      {{ t('language.switch') }}: <span class="lang-switch-code">{{ langShort }}</span>
-    </button>
     <ModalLayer />
   </div>
 </template>

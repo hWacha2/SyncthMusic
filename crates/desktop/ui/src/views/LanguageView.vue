@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { LANGUAGES, lang, t } from '../i18n/index.js';
-import { chooseLanguage, closeLanguage, state } from '../store.js';
+import { chooseLanguage } from '../store.js';
 
 const open = ref(false);
 const root = ref(null);
@@ -19,14 +19,7 @@ function onPointerDown(event) {
 }
 
 function onKeyDown(event) {
-  if (event.key !== 'Escape') return;
-  if (open.value) {
-    open.value = false;
-    return;
-  }
-  // Если экран открыли из готового интерфейса, Escape возвращает назад
-  // без смены языка.
-  if (state.langReturn) closeLanguage();
+  if (event.key === 'Escape') open.value = false;
 }
 
 onMounted(() => {

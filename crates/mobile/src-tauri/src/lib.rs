@@ -331,15 +331,20 @@ fn status_json(replica: &Replica) -> Value {
     let root = replica.root().ok().flatten();
     let root_text = root.as_ref().map(|p| p.to_string_lossy().to_string());
     let entries = replica.live_entries().unwrap_or_default();
+    let path_states = replica.path_states().unwrap_or_default();
     let local = entries
         .iter()
         .filter(|e| replica.is_present(&e.path).unwrap_or(false))
         .count();
-    let pending: Vec<Value> = replica
-        .pending_deletes()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| json!({ "path": p.path, "detected_at": p.detected_at }))
+    let pending: Vec<Value> = path_states
+        .iter()
+        .filter(|row| row.pending_hlc.is_some())
+        .map(|row| {
+            json!({
+                "path": &row.path,
+                "detected_at": row.pending_hlc.map(|hlc| hlc.ms).unwrap_or(0),
+            })
+        })
         .collect();
     let vault: Vec<Value> = replica
         .vault_rows()
@@ -348,6 +353,25 @@ fn status_json(replica: &Replica) -> Value {
         .map(|v| json!({ "path": v.path, "size": v.size, "deleted_at": v.deleted_at }))
         .collect();
     let known_peers = replica.known_peers().unwrap_or_default();
+    let states: Vec<Value> = path_states
+        .iter()
+        .map(|row| {
+            json!({
+                "path": &row.path,
+                "state": row.state.as_str(),
+                "base": &row.base,
+                "blob": &row.blob,
+                "size": row.size,
+                "mtime_ns": row.mtime_ns,
+                "added_at": row.added_at,
+                "present": row.present,
+                "pending": row.pending_hlc.is_some(),
+                "excluded": row.state.is_excluded(),
+                "resurrecting": row.state.is_resurrecting(),
+                "created_at": row.created_at.unwrap_or(0),
+            })
+        })
+        .collect();
     let connected = replica
         .get_meta("session_peer")
         .ok()
@@ -396,6 +420,7 @@ fn status_json(replica: &Replica) -> Value {
         "listen": server::info_json(),
         "last_scan": last_scan,
         "last_sync": last_sync,
+        "states": states,
         "ignored": replica.ignored_paths().unwrap_or_default(),
         "ready": root.is_some(),
     })

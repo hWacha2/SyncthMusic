@@ -65,6 +65,12 @@ export function pendingCount(data = workspaceData()) {
   return pendingDecisions(data).length;
 }
 
+/// Число путей вне синхронизации. Флаг `excluded` вычислен на бэкенде,
+/// поэтому старые `exclusions` для счётчиков больше не нужны.
+export function excludedCount(data = workspaceData()) {
+  return (data?.states || []).filter((row) => row.excluded).length;
+}
+
 /// Суммарная корзина: файлы ПК плюс уже прочитанная корзина подключённого
 /// телефона. Пока список телефона не загружен, показываем хотя бы корзину ПК.
 export function vaultTotals(data = workspaceData()) {
@@ -236,6 +242,9 @@ export function headline(data = workspaceData()) {
   const pending = pendingCount(data);
   const paths = Number(plan?.paths) || 0;
   const aligned = Number(plan?.aligned) || 0;
+  if (!data.phone?.linked) {
+    return { title: t('workspace.status.local'), text: t('workspace.sub.local') };
+  }
   if (data.session && data.session.diverged) {
     return { title: t('workspace.status.diverged'), text: t('workspace.sub.diverged') };
   }
@@ -264,7 +273,7 @@ export function headline(data = workspaceData()) {
 
 export function connectionState(data = workspaceData()) {
   if (!data || !data.phone || !data.phone.linked) {
-    return { tone: 'off', label: t('workspace.status.offline') };
+    return { tone: 'off', label: t('workspace.settings.not_linked') };
   }
   if (!data.phone.connected) {
     return { tone: 'off', label: t('workspace.status.offline') };

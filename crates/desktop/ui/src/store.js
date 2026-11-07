@@ -32,7 +32,6 @@ export function setToastSeconds(value) {
 // меняют через функции ниже — так проще переносить старую логику по кускам.
 export const state = reactive({
   view: 'loading',
-  langReturn: null,
   info: null,
   root: null,
   phone: { linked: false },
@@ -92,6 +91,18 @@ export function errorMessage(error) {
   return error.message || String(error);
 }
 
+/// Ошибка настройки внутри рабочей области не должна уводить на отдельный
+/// экран: показываем её тем же тостом, что и остальные действия.
+function reportSetupError(text) {
+  if (state.view === 'workspace') {
+    state.workspace.note = text;
+    state.workspace.noteError = true;
+    return;
+  }
+  state.error = true;
+  state.note = text;
+}
+
 export function resetWorkspace() {
   nextWorkspaceGeneration();
   workspacePendingRefresh = false;
@@ -105,8 +116,9 @@ export function resetWorkspace() {
   state.workspace.phoneVaultLoading = false;
 }
 
-// Порядок экранов как в старом интерфейсе: язык → папка → устройства →
-// рабочая область. Пока человек не выбрал язык, библиотеку не трогаем.
+// Порядок экранов: язык → папка → рабочая область. Подключение телефона
+// необязательно: оно живёт внутри рабочей области и не прерывает работу,
+// если связи нет.
 export async function boot() {
   if (!chosen.value) {
     state.view = 'language';
@@ -121,46 +133,23 @@ export async function boot() {
     state.info = await invoke('app_info');
     state.root = state.info?.config?.root || null;
     const link = await invoke('agent_link');
-    state.phone = link?.linked ? link : { linked: false };
-    if (!state.root) state.view = 'library';
-    else if (!state.phone.linked) state.view = 'devices';
-    else state.view = 'workspace';
+    state.phone = link?.linked ? { ...link, connected: false } : { linked: false };
+    state.view = state.root ? 'workspace' : 'library';
   } catch (error) {
     state.view = 'error';
     state.note = errorMessage(error);
     return;
   }
   startPolling();
-  if (state.view === 'devices') await discoverAll();
-  if (state.view === 'workspace') {
-    await reconnect();
-    if (state.view === 'workspace') await refreshWorkspace();
-  }
-}
-
-/// Открывает выбор языка поверх текущего экрана. После выбора возвращаемся
-/// туда же: перезапускать загрузку и рвать соединение с телефоном не нужно.
-export function openLanguage() {
-  if (state.view === 'language') return;
-  state.langReturn = state.view;
-  state.view = 'language';
+  if (state.view !== 'workspace') return;
+  let connected = false;
+  if (state.phone.linked) connected = await reconnect(true);
+  if (state.view === 'workspace' && !connected) await refreshWorkspace();
 }
 
 export function chooseLanguage(next) {
   setLang(next);
-  const back = state.langReturn;
-  state.langReturn = null;
-  if (back) {
-    state.view = back;
-    return;
-  }
   boot();
-}
-
-export function closeLanguage() {
-  if (!state.langReturn) return;
-  state.view = state.langReturn;
-  state.langReturn = null;
 }
 
 // ---------------------------------------------------------------- setup
@@ -186,6 +175,9 @@ export async function discoverAll(keepNote = false) {
 }
 
 async function applyLink(result) {
+  // Переподключение из рабочей области не должно перебрасывать на «Обзор»:
+  // вкладку сбрасываем только при входе с другого экрана.
+  const wasWorkspace = state.view === 'workspace';
   state.phone = {
     linked: true,
     connected: true,
@@ -197,16 +189,14 @@ async function applyLink(result) {
   state.note = '';
   state.error = false;
   resetWorkspace();
-  state.workspace.tab = 'overview';
+  if (!wasWorkspace) state.workspace.tab = 'overview';
   state.view = state.root ? 'workspace' : 'library';
   if (result.needs_root) {
     state.note = t('library.waiting_phone');
-  }
-  if (result.needs_root) {
     await requestRootChange(true);
-  } else if (state.view === 'workspace') {
-    await refreshWorkspace();
+    return;
   }
+  if (state.view === 'workspace') await refreshWorkspace();
 }
 
 export async function connectLan(dev, addr) {
@@ -254,13 +244,14 @@ export async function chooseFolder() {
   if (state.busy || !hasBridge) return;
   state.error = false;
   state.note = '';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
 
   let folder;
   try {
     folder = await invoke('pick_folder', { title: t('library.dialog') });
   } catch (error) {
-    state.error = true;
-    state.note = t('error.init', { error: errorMessage(error) });
+    reportSetupError(t('error.init', { error: errorMessage(error) }));
     return;
   }
   if (!folder) return;
@@ -276,31 +267,17 @@ export async function chooseFolder() {
     state.note = '';
     opened = true;
   } catch (error) {
-    state.error = true;
-    state.note = t('error.init', { error: errorMessage(error) });
+    reportSetupError(t('error.init', { error: errorMessage(error) }));
   } finally {
     state.busy = '';
   }
   if (!opened) return;
 
   await closeWorkspace();
-  // Сначала локальная папка, потом телефон: после выбора папки показываем
-  // устройства. Если телефон уже был сопряжён, пробуем вернуться к нему.
-  if (state.phone.linked) {
-    state.view = 'workspace';
-    await reconnect();
-  } else {
-    state.view = 'devices';
-    await discoverAll();
-  }
-}
-
-export function openLibrary() {
-  if (state.busy) return;
-  closeWorkspace();
-  state.view = 'library';
-  state.error = false;
-  state.note = '';
+  // Новая папка сразу открывается в рабочей области. Телефон подключается
+  // отдельно и не является условием входа.
+  state.view = 'workspace';
+  await refreshWorkspace();
 }
 
 export async function openDevices() {
@@ -317,7 +294,6 @@ export async function openWorkspace() {
   state.view = 'workspace';
   state.error = false;
   state.note = '';
-  state.workspace.tab = 'overview';
   await refreshWorkspace();
 }
 
@@ -336,7 +312,7 @@ export async function closeWorkspace() {
 export async function requestRootChange(quiet = false) {
   if (state.phoneBusy || !hasBridge) return;
   state.phoneBusy = 'root';
-  if (!quiet) state.note = t('phone.wait_root');
+  if (!quiet && state.view !== 'workspace') state.note = t('phone.wait_root');
   try {
     const result = await invoke('agent_request_root_change');
     if (state.phone.linked) state.phone.root = result?.root || state.phone.root;
@@ -345,8 +321,7 @@ export async function requestRootChange(quiet = false) {
     await closeWorkspace();
     if (state.view === 'workspace') await refreshWorkspace();
   } catch (error) {
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
+    reportSetupError(t('phone.error', { error: errorMessage(error) }));
   } finally {
     state.phoneBusy = '';
   }
@@ -461,45 +436,52 @@ export function stopProgressWatch() {
 
 // ---------------------------------------------------------------- status
 
-/// Закрывает текущий сеанс, не трогая сохранённую пару. Телефон снова
-/// появится в списке устройств, а подключение к нему пройдёт без
-/// подтверждения на телефоне.
+/// Закрывает текущий сеанс, не трогая сохранённую пару. Рабочая область
+/// остаётся открытой: телефон можно подключить снова из «Обзора» или
+/// «Настроек», а следующий сеанс пройдёт без подтверждения.
 export async function disconnectPhone() {
   if (state.phoneBusy || !hasBridge) return;
   state.phoneBusy = 'disconnect';
   state.note = '';
   state.error = false;
   try {
-    await invoke('agent_disconnect');
+    const link = await invoke('agent_disconnect');
     await closeWorkspace();
-    state.phone = { linked: false };
-    state.view = 'devices';
-    await discoverAll(true);
-    state.note = t('phone.disconnected');
+    state.phone = link?.linked
+      ? { ...link, connected: false }
+      : { linked: false };
+    state.view = state.root ? 'workspace' : 'library';
+    if (state.view === 'workspace') {
+      await refreshWorkspace();
+      state.workspace.note = t('phone.disconnected');
+      state.workspace.noteError = false;
+    } else {
+      state.note = t('phone.disconnected');
+    }
   } catch (error) {
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
+    reportSetupError(t('phone.error', { error: errorMessage(error) }));
   } finally {
     state.phoneBusy = '';
   }
 }
 
-export async function reconnect() {
-  if (!hasBridge || state.busy || !state.phone.linked) return;
+/// Переподключение к сохранённому телефону. При неудаче рабочая область
+/// остаётся на месте: связь — необязательная часть, а не условие входа.
+export async function reconnect(quiet = false) {
+  if (!hasBridge || state.busy || !state.phone.linked) return false;
   state.busy = 'reconnect';
   state.error = false;
-  state.note = t('setup.connecting');
+  if (!quiet) state.note = t('setup.connecting');
   try {
     const result = await invoke('agent_reconnect');
     state.busy = '';
     await applyLink(result);
+    return true;
   } catch (error) {
     state.busy = '';
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
-    state.phone = { linked: false };
-    state.view = 'devices';
-    await discoverAll(true);
+    state.phone = { ...state.phone, linked: true, connected: false };
+    if (!quiet) reportSetupError(t('phone.error', { error: errorMessage(error) }));
+    return false;
   }
 }
 
@@ -520,14 +502,22 @@ async function pollStatus() {
   if (!status || status.busy || state.phoneBusy) return;
 
   if (!status.connected) {
-    state.phone = { linked: false };
-    resetWorkspace();
-    state.view = 'devices';
-    state.error = true;
-    state.note = t('phone.lost');
-    await closeWorkspace();
-    await discoverAll(true);
+    const wasConnected = state.phone.connected === true;
+    state.phone = { ...state.phone, linked: true, connected: false };
+    if (wasConnected) {
+      state.workspace.note = t('phone.lost');
+      state.workspace.noteError = true;
+      await refreshWorkspace({ keepNote: true });
+    }
     return;
+  }
+
+  const wasDisconnected = state.phone.connected !== true;
+  state.phone = { ...state.phone, connected: true };
+  if (wasDisconnected && state.view === 'workspace') {
+    // Сеанс появился без нашей команды (например, после ручного
+    // переподключения) — пересобираем данные рабочей области.
+    await refreshWorkspace();
   }
 
   if (status.root !== undefined && status.root !== state.phone.root) {

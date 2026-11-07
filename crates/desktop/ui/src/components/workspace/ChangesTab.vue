@@ -7,7 +7,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { t } from '../../i18n/index.js';
 import { number } from '../../format.js';
 import { state } from '../../store.js';
-import { refreshWorkspace } from '../../store.js';
+import { openDevices, reconnect, refreshWorkspace } from '../../store.js';
 import {
   changeEntries,
   groupByFolder,
@@ -27,6 +27,8 @@ const plan = computed(() => planData(props.data));
 const entries = computed(() => changeEntries(props.data));
 const openSet = computed(() => manualOpenSet(props.data));
 const aligned = computed(() => Number(plan.value?.aligned) || 0);
+const phoneLinked = computed(() => Boolean(props.data?.phone?.linked));
+const phoneReady = computed(() => Boolean(props.data?.phone?.connected));
 
 const remote = computed(() => entries.value.filter(
   (entry) => entry.type !== 'conflict' && entry.side === 'remote',
@@ -311,9 +313,30 @@ function typeTitle(type) {
   <div class="changes-tab">
     <section v-if="!plan" class="ws-card ws-empty-card">
       <span class="ws-empty-icon"><IconList /></span>
-      <b>{{ t('workspace.changes.empty_title') }}</b>
-      <p>{{ t('workspace.changes.empty_text') }}</p>
-      <button class="btn btn--small" @click="refreshWorkspace()">{{ t('workspace.check') }}</button>
+      <template v-if="!phoneReady">
+        <b>{{ t(phoneLinked
+          ? 'workspace.changes.offline_title'
+          : 'workspace.changes.no_phone_title') }}</b>
+        <p>{{ t(phoneLinked
+          ? 'workspace.changes.offline_text'
+          : 'workspace.changes.no_phone_text') }}</p>
+        <button
+          v-if="phoneLinked"
+          class="btn btn--small"
+          :disabled="Boolean(state.busy)"
+          @click="reconnect()"
+        >
+          <Spinner v-if="state.busy === 'reconnect'" />{{ t('workspace.reconnect') }}
+        </button>
+        <button v-else class="btn btn--small" @click="openDevices">
+          {{ t('workspace.connect') }}
+        </button>
+      </template>
+      <template v-else>
+        <b>{{ t('workspace.changes.empty_title') }}</b>
+        <p>{{ t('workspace.changes.empty_text') }}</p>
+        <button class="btn btn--small" @click="refreshWorkspace()">{{ t('workspace.check') }}</button>
+      </template>
     </section>
 
     <section v-else-if="!hasAny" class="ws-card ws-empty-card">

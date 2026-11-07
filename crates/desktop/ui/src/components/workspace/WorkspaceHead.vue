@@ -4,7 +4,14 @@ import Spinner from '../Spinner.vue';
 import { t } from '../../i18n/index.js';
 import { formatSize, number } from '../../format.js';
 import { refreshWorkspace, state } from '../../store.js';
-import { canCommit, headline, pendingCount, planData, vaultTotals } from '../../workspace/model.js';
+import {
+  canCommit,
+  excludedCount,
+  headline,
+  pendingCount,
+  planData,
+  vaultTotals,
+} from '../../workspace/model.js';
 import { commitWorkspace } from '../../workspace/actions.js';
 
 const props = defineProps({
@@ -49,7 +56,7 @@ const head = computed(() => {
     return {
       title: t('workspace.tab.exclusions'),
       text: t('workspace.exclusions.sub', {
-        count: number(props.data?.exclusions?.length || 0),
+        count: number(excludedCount(props.data)),
       }),
     };
   }

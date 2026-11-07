@@ -1170,6 +1170,28 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
     let local_total = local_rows.iter().map(|entry| entry.size).sum::<u64>();
     let vault_rows = replica.vault_rows().unwrap_or_default();
     let vault_size = vault_rows.iter().map(|row| row.size).sum::<u64>();
+    // Единый источник истины для интерфейса: состояние пути плюс локальные
+    // флаги. Старые `exclusions`/`pending` остаются совместимой проекцией.
+    let path_states = replica.path_states().unwrap_or_default();
+    let states = path_states
+        .iter()
+        .map(|row| {
+            json!({
+                "path": &row.path,
+                "state": row.state.as_str(),
+                "base": &row.base,
+                "blob": &row.blob,
+                "size": row.size,
+                "mtime_ns": row.mtime_ns,
+                "added_at": row.added_at,
+                "present": row.present,
+                "pending": row.pending_hlc.is_some(),
+                "excluded": row.state.is_excluded(),
+                "resurrecting": row.state.is_resurrecting(),
+                "created_at": row.created_at.unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
     let exclusions = replica
         .exclusions()
         .unwrap_or_default()
@@ -1183,11 +1205,15 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
             })
         })
         .collect::<Vec<_>>();
-    let pending = replica
-        .pending_deletes()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|row| json!({ "path": row.path, "detected_at": row.detected_at }))
+    let pending = path_states
+        .iter()
+        .filter(|row| row.pending_hlc.is_some())
+        .map(|row| {
+            json!({
+                "path": &row.path,
+                "detected_at": row.pending_hlc.map(|hlc| hlc.ms).unwrap_or(0),
+            })
+        })
         .collect::<Vec<_>>();
     let peers = replica
         .known_peers()
@@ -1257,6 +1283,7 @@ fn workspace_payload(app: &tauri::AppHandle, replica: &Replica, ws: &WorkspaceSt
             "size": row.size,
             "deleted_at": row.deleted_at,
         })).collect::<Vec<_>>(),
+        "states": states,
         "exclusions": exclusions,
     })
 }
@@ -1529,7 +1556,22 @@ fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
     .map_err(|error| format!("{error:#}"))?;
 
     set_progress(app, "phone", 0, 0, 0, 0);
-    let phone = scan_phone_now(app);
+    // Без живого сеанса агента телефон не опрашиваем: рабочая область
+    // открывается и без него, а «Телефон не подключён» здесь не ошибка.
+    let agent_connected = {
+        let desktop = app.state::<Desktop>();
+        let connected = match desktop.agent.try_lock() {
+            Ok(guard) => guard.session.is_some(),
+            // Команда уже держит сеанс — значит, связь есть.
+            Err(_) => true,
+        };
+        connected
+    };
+    let phone = if agent_connected {
+        Some(scan_phone_now(app))
+    } else {
+        None
+    };
     set_progress(app, "plan", 0, 0, 0, 0);
     let desktop = app.state::<Desktop>();
     let mut ws = desktop
@@ -1545,34 +1587,43 @@ fn refresh_workspace(app: &tauri::AppHandle) -> Result<Value, String> {
         at: Hlc::wall_ms(),
     });
 
-    match phone {
-        Ok(value) => {
-            ws.phone_error = None;
-            ws.phone_scan = Some(PhoneScanView {
-                root: value
-                    .get("root")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                count: value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
-                total: value.get("total").and_then(Value::as_u64).unwrap_or(0),
-                at: Hlc::wall_ms(),
-            });
+    if let Some(result) = phone {
+        match result {
+            Ok(value) => {
+                ws.phone_error = None;
+                ws.phone_scan = Some(PhoneScanView {
+                    root: value
+                        .get("root")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    count: value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    total: value.get("total").and_then(Value::as_u64).unwrap_or(0),
+                    at: Hlc::wall_ms(),
+                });
+            }
+            Err(error) => {
+                ws.phone_scan = None;
+                ws.phone_error = Some(error);
+            }
         }
-        Err(error) => {
-            ws.phone_scan = None;
-            ws.phone_error = Some(error);
-        }
+    } else {
+        ws.phone_scan = None;
+        ws.phone_error = None;
     }
 
     ws.checked_at = Some(Hlc::wall_ms());
     // «Проверить» пересобирает план по свежим сканам. Старый сеанс
     // держал бы план, построенный до сканирования, поэтому закрываем его.
     ws.close();
-    ws.session_error = match ensure_preview(app, &mut ws, &mut replica) {
-        Ok(()) => None,
-        Err(error) => Some(error),
-    };
+    if agent_connected {
+        ws.session_error = match ensure_preview(app, &mut ws, &mut replica) {
+            Ok(()) => None,
+            Err(error) => Some(error),
+        };
+    } else {
+        ws.session_error = None;
+    }
     let payload = workspace_payload(app, &replica, &ws);
     clear_progress(app);
     Ok(payload)

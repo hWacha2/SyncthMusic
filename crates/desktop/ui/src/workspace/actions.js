@@ -3,7 +3,6 @@ import { t } from '../i18n/index.js';
 import { number } from '../format.js';
 import {
   closeWorkspace,
-  discoverAll,
   errorMessage,
   openModal,
   refreshWorkspace,
@@ -513,11 +512,18 @@ export async function forgetPhone() {
     await invoke('agent_forget');
     await closeWorkspace();
     state.phone = { linked: false };
-    state.view = 'devices';
-    await discoverAll();
+    // Сопряжение — не условие работы: остаёмся в библиотеке.
+    state.view = state.root ? 'workspace' : 'library';
+    if (state.view === 'workspace') await refreshWorkspace();
   } catch (error) {
-    state.error = true;
-    state.note = t('phone.error', { error: errorMessage(error) });
+    const text = t('phone.error', { error: errorMessage(error) });
+    if (state.view === 'workspace') {
+      state.workspace.note = text;
+      state.workspace.noteError = true;
+    } else {
+      state.error = true;
+      state.note = text;
+    }
   } finally {
     state.phoneBusy = '';
   }

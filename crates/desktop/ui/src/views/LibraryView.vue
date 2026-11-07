@@ -3,7 +3,7 @@ import IconFolder from '../components/icons/IconFolder.vue';
 import NoteLine from '../components/NoteLine.vue';
 import Spinner from '../components/Spinner.vue';
 import { t } from '../i18n/index.js';
-import { chooseFolder, openDevices, state } from '../store.js';
+import { chooseFolder, openWorkspace, state } from '../store.js';
 </script>
 
 <template>
@@ -17,8 +17,8 @@ import { chooseFolder, openDevices, state } from '../store.js';
           <Spinner v-if="state.busy === 'folder'" />
           {{ state.busy === 'folder' ? t('library.choosing') : t('library.action') }}
         </button>
-        <button v-if="state.root" class="btn btn--quiet" @click="openDevices">
-          {{ t('library.back') }}
+        <button v-if="state.root" class="btn btn--quiet" @click="openWorkspace">
+          {{ t('workspace.back') }}
         </button>
       </div>
       <NoteLine />
