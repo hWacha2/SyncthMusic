@@ -258,22 +258,6 @@ impl PathStateRow {
     }
 }
 
-/// Состояние пути, нужное сканеру: метаданные записи плюс локальные флаги.
-/// Читается один раз на скан, чтобы не делать SELECT на каждый файл.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanRow {
-    pub path: String,
-    pub blob: String,
-    pub size: u64,
-    pub mtime_ns: i64,
-    pub added_at: u64,
-    pub deleted: bool,
-    pub present: bool,
-    pub ignored: bool,
-    pub dev: String,
-    pub synced_blob: String,
-}
-
 /// Перенос, уже записанный в локальный журнал. Нужен плану, чтобы отличить
 /// переименование от добавления: в `entries` от переноса остаются только
 /// «старый путь удалён» и «новый путь жив», а связь между ними хранится в
@@ -680,6 +664,29 @@ impl Replica {
         )?;
         let rows = stmt.query_map([], read_path_state_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Сохранить итоговые состояния после скана. Скан сам реализует переходы
+    /// из `docs/path-state.md`, поэтому пишет строки целиком, а не отдельные
+    /// флаги. Удалённые пути забываются вместе с решениями по ним.
+    pub fn save_scan_states(
+        &mut self,
+        rows: &[PathStateRow],
+        removed: &[String],
+    ) -> Result<()> {
+        if rows.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for row in rows {
+            write_path_state(&tx, row)?;
+        }
+        for path in removed {
+            tx.execute("DELETE FROM path_state WHERE path = ?1", params![path])?;
+            tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Сохранить замороженный план. Решения в JSON не входят: они живут
@@ -1207,35 +1214,6 @@ impl Replica {
             .collect())
     }
 
-    /// Всё состояние путей одним запросом: скан использует его вместо
-    /// `entry()`/`is_present()`/`is_ignored()` на каждый файл.
-    pub fn scan_rows(&self) -> Result<Vec<ScanRow>> {
-        Ok(self
-            .path_states()?
-            .into_iter()
-            .map(|row| {
-                let deleted = row.state.is_tombstone();
-                let (blob, size, mtime_ns, added_at) = if deleted {
-                    (String::new(), 0, 0, 0)
-                } else {
-                    (row.blob.clone(), row.size, row.mtime_ns, row.added_at)
-                };
-                ScanRow {
-                    path: row.path,
-                    blob,
-                    size,
-                    mtime_ns,
-                    added_at,
-                    deleted,
-                    present: !deleted && row.present,
-                    ignored: row.state.is_excluded(),
-                    dev: row.dev,
-                    synced_blob: row.base.unwrap_or_default(),
-                }
-            })
-            .collect())
-    }
-
     // -------------------------------------------------------- content cache
 
     /// Кэш содержимого: `path → (size, mtime_ns, blob)`. Переживает
@@ -1321,76 +1299,6 @@ impl Replica {
 
     pub fn mark_absent(&self, path: &str) -> Result<()> {
         mark_absent_in(&self.conn, path)
-    }
-
-    /// Пакетное обновление локальных флагов после скана. Сканер передаёт
-    /// только те пути, где состояние действительно меняется.
-    pub fn mark_presence_batch(
-        &mut self,
-        present: &[String],
-        unignore: &[String],
-        clear_pending: &[String],
-    ) -> Result<()> {
-        if present.is_empty() && unignore.is_empty() && clear_pending.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for path in present {
-            mark_present_in(&tx, path)?;
-        }
-        // `unignore` — след старого `local_ignored`. В новой модели исключение
-        // снимается только явной отменой, поэтому скан его не трогает.
-        let _ = unignore;
-        for path in clear_pending {
-            clear_pending_in(&tx, path)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Пакетная фиксация пропавших файлов: `record` — новые ожидающие
-    /// удаления, `forget` — собственные добавления, которые ещё никому не
-    /// показывались. Одной транзакцией вместо одной на путь.
-    pub fn apply_missing_batch(
-        &mut self,
-        hlc: Hlc,
-        record: &[(String, String)],
-        forget: &[String],
-    ) -> Result<()> {
-        if record.is_empty() && forget.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (path, blob) in record {
-            let Some(mut row) = read_path_state(&tx, path)? else {
-                continue;
-            };
-            if row.state != PathState::Live {
-                continue;
-            }
-            // Сюда попадают только строки, которые скан видел присутствующими:
-            // «ещё не скачано» отсеивается по `present` выше. Поэтому `base`
-            // здесь ни при чём — пропавший файл всегда ждёт решения человека.
-            if row.blob.is_empty() {
-                row.blob = blob.clone();
-            }
-            row.state = PathState::Missing;
-            row.present = false;
-            row.pending_hlc = Some(hlc);
-            write_path_state(&tx, &row)?;
-        }
-
-        for path in forget {
-            let Some(row) = read_path_state(&tx, path)? else {
-                continue;
-            };
-            if row.state == PathState::Live && row.base.is_none() && row.dev == self.dev {
-                tx.execute("DELETE FROM path_state WHERE path = ?1", params![path])?;
-                tx.execute("DELETE FROM plan_decisions WHERE path = ?1", params![path])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     /// Локальное исключение: запись остаётся в общей библиотеке, но на этом
@@ -2187,21 +2095,6 @@ fn mark_absent_in(conn: &Connection, path: &str) -> Result<()> {
         params![path],
     )?;
     Ok(())
-}
-
-fn clear_pending_in(conn: &Connection, path: &str) -> Result<()> {
-    let Some(mut row) = read_path_state(conn, path)? else {
-        return Ok(());
-    };
-    if row.pending_hlc.is_none() && row.state != PathState::Missing {
-        return Ok(());
-    }
-    row.pending_hlc = None;
-    if row.state == PathState::Missing {
-        row.state = PathState::Live;
-        row.created_at = None;
-    }
-    write_path_state(conn, &row)
 }
 
 /// Отметить путь согласованным: `base = blob`. Маркер возврата снимается:

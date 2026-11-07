@@ -6,7 +6,7 @@
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::{Replica, ResurrectionRow, ScanRow};
+use crate::store::{PathState, PathStateRow, Replica};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -46,7 +46,7 @@ pub struct ScanReport {
     /// Переименования/переносы, распознанные по блобу.
     pub renamed: usize,
     /// Пути, которые были в БД, но пропали с диска. В операции не превращаются —
-    /// только в `pending_deletes`.
+    /// только в `Missing`.
     pub missing: Vec<String>,
     pub skipped_busy: usize,
     pub ops_emitted: usize,
@@ -79,10 +79,6 @@ pub fn scan_with_progress(
     );
 
     let mut report = ScanReport::default();
-    // Пути вне синхронизации: их нельзя ни хешировать, ни превращать в
-    // операции, ни считать пропавшими. Иначе исключение вернулось бы в план
-    // при следующей же проверке.
-    let excluded = replica.exclusion_paths()?;
 
     // Сначала собираем список файлов. Иначе нельзя отличить переименование
     // `Foo.flac → foo.flac` от двух реально существующих файлов, различающихся
@@ -112,9 +108,6 @@ pub fn scan_with_progress(
         };
         match path::normalize(&rel_raw) {
             Ok(rel) => {
-                if excluded.contains(&rel) {
-                    continue;
-                }
                 if let Ok(meta) = abs.metadata() {
                     total_bytes = total_bytes.saturating_add(meta.len());
                 }
@@ -142,49 +135,22 @@ pub fn scan_with_progress(
 
     let seen: BTreeSet<String> = files.iter().map(|(_, rel)| rel.clone()).collect();
 
-    // Пути, возвращаемые после отмены исключения. Пока файла здесь нет, их
-    // нельзя записывать в `pending_deletes`: иначе отмена снова превратится
-    // в удаление. Когда файл доехал (или, наоборот, исчез с уцелевшей
-    // стороны), маркер больше не нужен.
-    let resurrections: HashMap<String, ResurrectionRow> = replica
-        .resurrections()?
+    // Один снимок состояний на весь скан. Сканер сам реализует переходы из
+    // `docs/path-state.md`; совместимые проекции вроде `scan_rows` больше не
+    // нужны.
+    let mut states: HashMap<String, PathStateRow> = replica
+        .path_states()?
         .into_iter()
         .map(|row| (row.path.clone(), row))
-        .collect();
-    let mut resurrected: HashSet<String> = resurrections.keys().cloned().collect();
-    let mut stale_markers = Vec::new();
-    for (path, marker) in &resurrections {
-        let present = seen.contains(path);
-        if (marker.side == "remote" && present) || (marker.side == "local" && !present) {
-            stale_markers.push(path.clone());
-        }
-    }
-    for path in stale_markers {
-        replica.remove_resurrection(&path)?;
-        resurrected.remove(&path);
-    }
-
-    // Всё состояние путей читаем один раз. Раньше на каждый файл делались
-    // отдельные SELECT'ы `entry`/`is_present`/`is_ignored`, а на телефоне это
-    // заметная часть времени скана.
-    let mut rows: HashMap<String, ScanRow> = replica
-        .scan_rows()?
-        .into_iter()
-        .map(|row| (row.path.clone(), row))
-        .collect();
-    let pending: HashSet<String> = replica
-        .pending_deletes()?
-        .into_iter()
-        .map(|delete| delete.path)
         .collect();
     let cache = replica.content_cache()?;
     let my_dev = replica.device_id().to_string();
 
     // Живые локальные записи по блобу — кандидаты в «старое имя» переименования.
-    let mut by_blob: HashMap<String, Vec<ScanRow>> = HashMap::new();
-    let mut by_key: HashMap<String, Vec<ScanRow>> = HashMap::new();
-    for row in rows.values() {
-        if row.deleted || !row.present || excluded.contains(&row.path) {
+    let mut by_blob: HashMap<String, Vec<PathStateRow>> = HashMap::new();
+    let mut by_key: HashMap<String, Vec<PathStateRow>> = HashMap::new();
+    for row in states.values() {
+        if row.state != PathState::Live || !row.present {
             continue;
         }
         by_blob.entry(row.blob.clone()).or_default().push(row.clone());
@@ -197,6 +163,8 @@ pub fn scan_with_progress(
 
     let mut hashed: Vec<(String, u64, i64, String)> = Vec::new();
     let mut ops: Vec<Op> = Vec::new();
+    let mut dirty: HashSet<String> = HashSet::new();
+    let mut removed: Vec<String> = Vec::new();
     let mut hash_buf = vec![0u8; 1024 * 1024];
     let mut done_bytes: u64 = 0;
 
@@ -216,13 +184,25 @@ pub fn scan_with_progress(
         let mtime_before = mtime_ns(&before);
         done_bytes = done_bytes.saturating_add(size);
 
-        let existing = rows.get(&rel).cloned();
+        let existing = states.get(&rel).cloned();
 
         // Быстрый путь 1: запись уже есть и размер с mtime не менялись.
         // Блоб при этом кладём в кэш содержимого — для будущего сброса истории.
+        //
+        // Для `Live { present=0 }` и `ExcludedRemote` доверять mtime нельзя:
+        // локального файла здесь ещё не было, и совпадение с метаданными пира
+        // ничего не говорит о содержимом. Такие пути читаем и хешируем.
         if let Some(e) = &existing {
-            if !e.deleted && e.size == size && e.mtime_ns == mtime_before {
-                report.unchanged += 1;
+            let content_known = e.state != PathState::Tombstone
+                && !e.blob.is_empty()
+                && (e.present || e.state == PathState::Missing);
+            if content_known && e.size == size && e.mtime_ns == mtime_before {
+                if mark_seen(&mut states, &rel) {
+                    dirty.insert(rel.clone());
+                }
+                if !e.state.is_excluded() {
+                    report.unchanged += 1;
+                }
                 hashed.push((rel, size, mtime_before, e.blob.clone()));
                 continue;
             }
@@ -278,43 +258,55 @@ pub fn scan_with_progress(
 
         hashed.push((rel.clone(), size, mtime_before, blob.clone()));
 
-        let is_new = existing.as_ref().map(|e| e.deleted).unwrap_or(true);
+        let is_new = existing
+            .as_ref()
+            .map_or(true, |e| e.state == PathState::Tombstone);
 
         // Переименование/перенос: блоб тот же, старого пути больше нет на диске.
         // Проверяем до добавления записи и только для нового/удалённого пути —
         // иначе это была бы обычная правка содержимого.
         if is_new {
-            if let Some(cand) = rename_candidate(&rel, &blob, &seen, &by_blob, &by_key, &moved_from)
+            if let Some((from, added_at)) =
+                rename_candidate(&rel, &blob, &seen, &by_blob, &by_key, &moved_from)
             {
-                let kind = OpKind::EntryMove {
-                    from: cand.path.clone(),
+                let op = replica.make_op(OpKind::EntryMove {
+                    from: from.clone(),
                     to: rel.clone(),
                     blob: blob.clone(),
                     size,
                     mtime_ns: mtime_before,
-                    added_at: cand.added_at,
-                };
-                ops.push(replica.make_op(kind)?);
-                if let Some(from) = rows.get_mut(&cand.path) {
-                    from.deleted = true;
-                    from.present = false;
+                    added_at,
+                })?;
+                let hlc = op.hlc;
+                ops.push(op);
+                if let Some(source) = states.get_mut(&from) {
+                    source.state = PathState::Tombstone;
+                    source.present = false;
+                    source.pending_hlc = None;
+                    source.created_at = None;
+                    source.hlc = hlc;
+                    source.dev = my_dev.clone();
+                    dirty.insert(from.clone());
                 }
-                rows.insert(
+                states.insert(
                     rel.clone(),
-                    ScanRow {
+                    PathStateRow {
                         path: rel.clone(),
+                        state: PathState::Live,
+                        base: None,
                         blob: blob.clone(),
                         size,
                         mtime_ns: mtime_before,
-                        added_at: cand.added_at,
-                        deleted: false,
-                        present: false,
-                        ignored: false,
+                        added_at,
+                        hlc,
                         dev: my_dev.clone(),
-                        synced_blob: String::new(),
+                        present: true,
+                        pending_hlc: None,
+                        created_at: None,
                     },
                 );
-                moved_from.insert(cand.path.clone());
+                dirty.insert(rel.clone());
+                moved_from.insert(from);
                 report.renamed += 1;
                 report.ops_emitted += 1;
                 flush_ops(replica, &mut ops)?;
@@ -339,75 +331,113 @@ pub fn scan_with_progress(
             }
         }
 
-        if !is_new {
-            if let Some(e) = &existing {
-                if e.blob == blob {
-                    // Изменился только mtime — это важно для порядка в плеерах.
-                    let kind = OpKind::EntryPut {
-                        path: rel.clone(),
-                        blob: blob.clone(),
-                        size,
-                        mtime_ns: mtime_before,
-                        added_at: e.added_at,
-                    };
-                    ops.push(replica.make_op(kind)?);
-                    if let Some(row) = rows.get_mut(&rel) {
-                        row.mtime_ns = mtime_before;
-                    }
-                    report.changed += 1;
-                    report.ops_emitted += 1;
-                    flush_ops(replica, &mut ops)?;
-                    continue;
+        // Переход по таблице 5.1: откуда → куда и нужен ли `EntryPut`.
+        let mut row = existing.clone().unwrap_or_else(|| PathStateRow {
+            path: rel.clone(),
+            state: PathState::Live,
+            base: None,
+            blob: String::new(),
+            size: 0,
+            mtime_ns: 0,
+            added_at: 0,
+            hlc: Hlc::default(),
+            dev: String::new(),
+            present: false,
+            pending_hlc: None,
+            created_at: None,
+        });
+        let previous = existing.as_ref().map(|e| e.state);
+        let emit_put;
+        let added_at;
+        match previous {
+            None => {
+                emit_put = true;
+                added_at = Hlc::wall_ms();
+                row.state = PathState::Live;
+                row.base = None;
+            }
+            Some(PathState::Live) => {
+                let e = existing.as_ref().unwrap();
+                // Файл уже совпадает с известным содержимым (например, это
+                // принятое, но ещё не подтверждённое добавление пира) —
+                // достаточно отметить присутствие. Иначе это локальная правка
+                // или смена только mtime.
+                emit_put = e.present || e.blob != blob;
+                added_at = e.added_at;
+                if !e.present && e.blob == blob && e.base.is_none() {
+                    // Блоб пришёл от пира и теперь есть у обеих сторон —
+                    // это и есть общая база, даже если сеанс ещё не
+                    // подтвердил её целиком.
+                    row.base = Some(blob.clone());
                 }
             }
-        }
-
-        let added_at = existing
-            .as_ref()
-            .map(|e| e.added_at)
-            .unwrap_or_else(Hlc::wall_ms);
-        let kind = OpKind::EntryPut {
-            path: rel.clone(),
-            blob: blob.clone(),
-            size,
-            mtime_ns: mtime_before,
-            added_at,
-        };
-        ops.push(replica.make_op(kind)?);
-        match rows.get_mut(&rel) {
-            Some(row) => {
-                row.blob = blob;
-                row.size = size;
-                row.mtime_ns = mtime_before;
-                row.added_at = added_at;
-                row.deleted = false;
-                row.dev = my_dev.clone();
-                row.synced_blob = String::new();
+            Some(PathState::Missing) => {
+                // Файл вернулся: ожидание удаления снимается. Если блоб тот
+                // же, но mtime изменился, отправим `EntryPut` ради mtime.
+                emit_put = true;
+                added_at = row.added_at;
+                row.state = PathState::Live;
+                row.pending_hlc = None;
             }
-            None => {
-                rows.insert(
-                    rel.clone(),
-                    ScanRow {
-                        path: rel.clone(),
-                        blob,
-                        size,
-                        mtime_ns: mtime_before,
-                        added_at,
-                        deleted: false,
-                        present: false,
-                        ignored: false,
-                        dev: my_dev.clone(),
-                        synced_blob: String::new(),
-                    },
-                );
+            Some(PathState::Tombstone) => {
+                // Восстановил из проводника: это новая жизнь, прежняя база
+                // больше не база.
+                emit_put = true;
+                added_at = Hlc::wall_ms();
+                row.state = PathState::Live;
+                row.base = None;
+            }
+            Some(PathState::ExcludedLocal) => {
+                // Исключение — решение человека: содержимое обновляем, ops не шлём.
+                emit_put = false;
+                added_at = row.added_at;
+            }
+            Some(PathState::ExcludedRemote) => {
+                // Файл появился локально; исключение сохраняется до явной отмены.
+                emit_put = false;
+                added_at = row.added_at;
+                row.state = PathState::ExcludedLocal;
+            }
+            Some(PathState::ResurrectingLocal) => {
+                emit_put = true;
+                added_at = row.added_at;
+            }
+            Some(PathState::ResurrectingRemote) => {
+                // Копия уже здесь: маркер снимается. Если содержимое отличается
+                // от ожидаемого, это локальная правка.
+                emit_put = existing.as_ref().is_some_and(|e| e.blob != blob);
+                added_at = row.added_at;
+                row.state = PathState::Live;
+                row.created_at = None;
             }
         }
-        if is_new {
-            report.added += 1;
-        } else {
-            report.changed += 1;
+        row.path = rel.clone();
+        row.blob = blob.clone();
+        row.size = size;
+        row.mtime_ns = mtime_before;
+        row.added_at = added_at;
+        row.present = true;
+        if emit_put {
+            let op = replica.make_op(OpKind::EntryPut {
+                path: rel.clone(),
+                blob: blob.clone(),
+                size,
+                mtime_ns: mtime_before,
+                added_at,
+            })?;
+            row.hlc = op.hlc;
+            row.dev = my_dev.clone();
+            ops.push(op);
+            report.ops_emitted += 1;
         }
-        report.ops_emitted += 1;
+        states.insert(rel.clone(), row);
+        dirty.insert(rel.clone());
+        match previous {
+            Some(PathState::ExcludedLocal | PathState::ExcludedRemote) => {}
+            Some(PathState::Tombstone) | None => report.added += 1,
+            _ if emit_put => report.changed += 1,
+            _ => report.unchanged += 1,
+        }
         flush_ops(replica, &mut ops)?;
     }
 
@@ -428,63 +458,131 @@ pub fn scan_with_progress(
     let keep: HashSet<String> = seen.iter().cloned().collect();
     replica.prune_content_cache(&keep)?;
 
-    // Всё, что реально лежит на диске: локально присутствует, ожидание
-    // удаления снимается, ручное исключение снимается (файл вернули).
-    let mut present = Vec::new();
-    let mut unignore = Vec::new();
-    let mut clear_pending = Vec::new();
-    for rel in &seen {
-        if excluded.contains(rel) {
-            continue;
-        }
-        if let Some(row) = rows.get(rel) {
-            if !row.deleted && !row.present {
-                present.push(rel.clone());
-            }
-            if row.ignored {
-                unignore.push(rel.clone());
-            }
-        }
-        if pending.contains(rel) {
-            clear_pending.push(rel.clone());
-        }
-    }
-    replica.mark_presence_batch(&present, &unignore, &clear_pending)?;
-
     // Пропавшие файлы: только те, что раньше были здесь. «Ещё не скачано» и
     // «намеренно не держим здесь» удалением не считается. Ничего не удаляем.
     //
-    // Собственное добавление, которое ни разу не входило в общую базу, при
-    // удалении забывается целиком: пир о пути не знает, а мягкое удаление без
-    // общей базы только расходится с его представлением и блокирует commit.
+    // Без сопряжённых устройств мягкое удаление всё равно нужно: его можно
+    // подтвердить («удалить везде») или вернуть из корзины. Поэтому черновики
+    // забываются только когда есть с кем сверяться.
     let has_peers = replica.has_peers()?;
-    if has_peers {
-        replica.prune_ghost_deletes()?;
-    }
-    let hlc = replica.next_hlc()?;
-    let mut record = Vec::new();
-    let mut forget = Vec::new();
-    for row in rows.values() {
-        if row.deleted
-            || !row.present
-            || seen.contains(&row.path)
-            || row.ignored
-            || excluded.contains(&row.path)
-            || resurrected.contains(&row.path)
-        {
+    let pending_hlc = if states.values().any(|row| {
+        !seen.contains(&row.path)
+            && row.state == PathState::Live
+            && row.present
+            && (row.base.is_some() || !has_peers)
+    }) {
+        Some(replica.next_hlc()?)
+    } else {
+        None
+    };
+
+    for row in states.values_mut() {
+        if seen.contains(&row.path) {
             continue;
         }
-        if has_peers && row.dev == my_dev && row.synced_blob.is_empty() {
-            forget.push(row.path.clone());
-            continue;
+        match row.state {
+            PathState::Live => {
+                if !row.present {
+                    // Чужое добавление ещё не скачано: его отсутствие — не
+                    // удаление, а ожидание файла от пира.
+                    continue;
+                }
+                if row.base.is_some() || !has_peers {
+                    row.state = PathState::Missing;
+                    row.present = false;
+                    row.pending_hlc = pending_hlc;
+                    dirty.insert(row.path.clone());
+                    report.missing.push(row.path.clone());
+                } else if row.dev == my_dev {
+                    // Собственное добавление, которое ни разу не входило в
+                    // общую базу, при удалении забывается целиком: пир о пути
+                    // не знает.
+                    removed.push(row.path.clone());
+                } else {
+                    // Файл пира, ещё не подтверждённый как база: просто нет здесь.
+                    row.present = false;
+                    dirty.insert(row.path.clone());
+                }
+            }
+            PathState::Missing => {
+                if row.base.is_none() && has_peers {
+                    // Черновик, удалённый до первой синхронизации.
+                    removed.push(row.path.clone());
+                }
+            }
+            PathState::Tombstone => {}
+            PathState::ExcludedLocal => {
+                // Уцелевшая копия исчезла: на отмене исключения проверим пира.
+                row.state = PathState::ExcludedRemote;
+                row.present = false;
+                dirty.insert(row.path.clone());
+            }
+            PathState::ExcludedRemote => {}
+            PathState::ResurrectingLocal => {
+                // Локальная копия не вернулась: пусть отмена ищет её у пира.
+                row.state = PathState::ExcludedRemote;
+                row.present = false;
+                dirty.insert(row.path.clone());
+            }
+            PathState::ResurrectingRemote => {}
         }
-        record.push((row.path.clone(), row.blob.clone()));
-        report.missing.push(row.path.clone());
     }
-    replica.apply_missing_batch(hlc, &record, &forget)?;
+
+    let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();
+    let changed_rows: Vec<PathStateRow> = dirty
+        .iter()
+        .filter(|path| !removed_set.contains(path.as_str()))
+        .filter_map(|path| states.get(path).cloned())
+        .collect();
+    replica.save_scan_states(&changed_rows, &removed)?;
     replica.flush_hlc()?;
 
     Ok(report)
+}
+
+/// Отметить, что файл снова на диске. Возвращает `true`, если состояние
+/// действительно изменилось. Для `Tombstone` этот путь не вызывается: файл,
+/// вернувшийся после подтверждённого удаления, — новая жизнь через `EntryPut`.
+fn mark_seen(states: &mut HashMap<String, PathStateRow>, path: &str) -> bool {
+    let Some(row) = states.get_mut(path) else {
+        return false;
+    };
+    match row.state {
+        PathState::Live => {
+            if row.present {
+                false
+            } else {
+                row.present = true;
+                true
+            }
+        }
+        PathState::Missing => {
+            row.state = PathState::Live;
+            row.present = true;
+            row.pending_hlc = None;
+            true
+        }
+        PathState::ExcludedRemote => {
+            row.state = PathState::ExcludedLocal;
+            row.present = true;
+            true
+        }
+        PathState::ResurrectingRemote => {
+            row.state = PathState::Live;
+            row.present = true;
+            row.created_at = None;
+            true
+        }
+        PathState::ExcludedLocal | PathState::ResurrectingLocal => {
+            if row.present {
+                false
+            } else {
+                row.present = true;
+                true
+            }
+        }
+        PathState::Tombstone => false,
+    }
 }
 
 /// Записать накопленные операции, когда их стало достаточно много.
@@ -509,24 +607,22 @@ fn finish_ops(replica: &mut Replica, ops: &mut Vec<Op>) -> Result<()> {
 /// Приоритет — путь, совпадающий по регистру/Unicode: на Windows/macOS это
 /// типичное переименование `Foo.flac → foo.flac`, и старый путь физически
 /// указывает на тот же файл.
-fn rename_candidate<'a>(
+fn rename_candidate(
     new_path: &str,
     blob: &str,
     seen: &BTreeSet<String>,
-    by_blob: &'a HashMap<String, Vec<ScanRow>>,
-    by_key: &'a HashMap<String, Vec<ScanRow>>,
+    by_blob: &HashMap<String, Vec<PathStateRow>>,
+    by_key: &HashMap<String, Vec<PathStateRow>>,
     moved_from: &HashSet<String>,
-) -> Option<&'a ScanRow> {
+) -> Option<(String, u64)> {
     let new_key = path::key(new_path);
 
     // Сначала путь, совпадающий с точностью до регистра/NFC. Он не должен
     // лежать в `seen`: иначе на case-sensitive ФС это два разных файла.
-    if let Some(cand) =
-        by_key.get(&new_key).into_iter().flatten().find(|c| {
-            c.path != new_path && !moved_from.contains(&c.path) && !seen.contains(&c.path)
-        })
-    {
-        return Some(cand);
+    if let Some(cand) = by_key.get(&new_key).into_iter().flatten().find(|c| {
+        c.path != new_path && !moved_from.contains(&c.path) && !seen.contains(&c.path)
+    }) {
+        return Some((cand.path.clone(), cand.added_at));
     }
 
     // Затем перенос в другую папку: содержимое обязано совпасть, иначе это
@@ -537,10 +633,10 @@ fn rename_candidate<'a>(
             continue;
         }
         if path::key(&cand.path) == new_key {
-            return Some(cand);
+            return Some((cand.path.clone(), cand.added_at));
         }
         if fallback.is_none() {
-            fallback = Some(cand);
+            fallback = Some((cand.path.clone(), cand.added_at));
         }
     }
     fallback
@@ -599,3 +695,242 @@ pub fn restore_mtime(path: &Path, mtime_ns: i64) -> Result<()> {
     filetime::set_file_mtime(path, filetime::FileTime::from_system_time(t))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn state(replica: &Replica, path: &str) -> PathStateRow {
+        replica
+            .path_state(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("нет состояния для {path}"))
+    }
+
+    #[test]
+    fn scan_transitions_new_changed_and_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        let report = scan(root, &mut replica).unwrap();
+        assert_eq!(report.added, 1);
+
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base, None);
+        assert!(row.present);
+
+        // Успешный сеанс подтверждает текущее содержимое как общую базу.
+        replica.confirm_synced().unwrap();
+        let base = state(&replica, "track.flac").base.unwrap();
+
+        fs::write(root.join("track.flac"), b"two").unwrap();
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base.as_deref(), Some(base.as_str()));
+        assert_ne!(row.blob, base, "правка не должна менять базу");
+        assert!(row.present);
+
+        let blob = row.blob.clone();
+        fs::remove_file(root.join("track.flac")).unwrap();
+        let report = scan(root, &mut replica).unwrap();
+        assert_eq!(report.missing, vec!["track.flac".to_string()]);
+
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Missing);
+        assert!(!row.present);
+        assert!(row.pending_hlc.is_some());
+        assert_eq!(row.base.as_deref(), Some(base.as_str()));
+        assert_eq!(row.blob, blob);
+    }
+
+    #[test]
+    fn scan_restores_missing_with_the_same_and_a_different_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+        let base = state(&replica, "track.flac").base.unwrap();
+
+        fs::remove_file(root.join("track.flac")).unwrap();
+        scan(root, &mut replica).unwrap();
+        assert_eq!(state(&replica, "track.flac").state, PathState::Missing);
+
+        // Файл вернулся с тем же содержимым: база сохраняется, ожидание снимается.
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base.as_deref(), Some(base.as_str()));
+        assert_eq!(row.blob, base);
+        assert!(row.present);
+        assert!(row.pending_hlc.is_none());
+
+        // Пропал снова и вернулся уже другим содержимым: это локальная правка.
+        fs::remove_file(root.join("track.flac")).unwrap();
+        scan(root, &mut replica).unwrap();
+        fs::write(root.join("track.flac"), b"three").unwrap();
+        scan(root, &mut replica).unwrap();
+
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base.as_deref(), Some(base.as_str()));
+        assert_ne!(row.blob, base);
+        assert_eq!(row.dev, "dev-a");
+        assert!(row.present);
+        assert!(row.pending_hlc.is_none());
+    }
+
+    #[test]
+    fn scan_revives_tombstone_as_a_new_life() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+
+        let op = replica
+            .make_op(OpKind::EntryDel {
+                path: "track.flac".into(),
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+        assert_eq!(state(&replica, "track.flac").state, PathState::Tombstone);
+
+        fs::write(root.join("track.flac"), b"two").unwrap();
+        scan(root, &mut replica).unwrap();
+
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base, None, "после tombstone это новая жизнь");
+        assert!(row.present);
+        assert_eq!(row.dev, "dev-a");
+        assert_eq!(row.blob, hash_file(&root.join("track.flac")).unwrap());
+    }
+
+    #[test]
+    fn scan_keeps_exclusions_on_their_side() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+        let row = state(&replica, "track.flac");
+        replica
+            .add_exclusion("track.flac", "local", &row.blob, row.size, row.mtime_ns)
+            .unwrap();
+        assert_eq!(state(&replica, "track.flac").state, PathState::ExcludedLocal);
+
+        // Содержимое исключённого файла обновляется, но операций не появляется.
+        let ops_before = replica.op_count().unwrap();
+        fs::write(root.join("track.flac"), b"two").unwrap();
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::ExcludedLocal);
+        assert_eq!(row.blob, hash_file(&root.join("track.flac")).unwrap());
+        assert_eq!(replica.op_count().unwrap(), ops_before);
+
+        // Уцелевшая копия исчезла: исключение остаётся, но сторона меняется.
+        fs::remove_file(root.join("track.flac")).unwrap();
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::ExcludedRemote);
+        assert!(!row.present);
+
+        // Файл вернули: исключение сохраняется до явной отмены.
+        fs::write(root.join("track.flac"), b"three").unwrap();
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::ExcludedLocal);
+        assert!(row.present);
+    }
+
+    #[test]
+    fn scan_finishes_resurrections() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+
+        // Ожидание копии от пира: файл появился здесь — маркер снимается.
+        let row = state(&replica, "track.flac");
+        replica
+            .add_exclusion("remote.flac", "remote", &row.blob, row.size, row.mtime_ns)
+            .unwrap();
+        replica
+            .add_resurrection("remote.flac", "remote", &row.blob, row.size, row.mtime_ns)
+            .unwrap();
+        assert_eq!(
+            state(&replica, "remote.flac").state,
+            PathState::ResurrectingRemote
+        );
+        fs::write(root.join("remote.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        let restored = state(&replica, "remote.flac");
+        assert_eq!(restored.state, PathState::Live);
+        assert!(restored.present);
+
+        // Локальная копия не вернулась: путь снова уходит на сторону пира.
+        let row = state(&replica, "track.flac");
+        replica
+            .add_resurrection("track.flac", "local", &row.blob, row.size, row.mtime_ns)
+            .unwrap();
+        assert_eq!(
+            state(&replica, "track.flac").state,
+            PathState::ResurrectingLocal
+        );
+        fs::remove_file(root.join("track.flac")).unwrap();
+        scan(root, &mut replica).unwrap();
+        let lost = state(&replica, "track.flac");
+        assert_eq!(lost.state, PathState::ExcludedRemote);
+        assert!(!lost.present);
+    }
+
+    #[test]
+    fn downloaded_peer_addition_becomes_a_common_base() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        let blob = hash_file(&root.join("track.flac")).unwrap();
+        let mut peer = Replica::in_memory("dev-peer").unwrap();
+        let op = peer
+            .make_op(OpKind::EntryPut {
+                path: "track.flac".into(),
+                blob: blob.clone(),
+                size: 3,
+                mtime_ns: 1,
+                added_at: 1,
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+
+        let waiting = state(&replica, "track.flac");
+        assert_eq!(waiting.state, PathState::Live);
+        assert!(!waiting.present);
+        assert_eq!(waiting.dev, "dev-peer");
+
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert!(row.present);
+        assert_eq!(row.base.as_deref(), Some(blob.as_str()));
+    }
+}
+
