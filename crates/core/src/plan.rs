@@ -794,19 +794,21 @@ pub fn build_with_peer_have(
             // лежит (или который ещё не применил нашу операцию удаления).
             // Иначе после общего удаления путь всплывал бы в плане вечно,
             // хотя обе стороны уже согласны.
-            let peer_deleted = remote
-                .get(&row.path)
-                .is_some_and(|state| !state.present);
-            let peer_has_it = remote
-                .get(&row.path)
-                .is_some_and(|state| state.present)
+            let peer = remote.get(&row.path);
+            // Пир уже вернул файл более новой операцией. Это добавление с его
+            // стороны, а не наше удаление: иначе один путь попадал бы в план
+            // дважды, и интерфейс показывал бы восстановленный трек как
+            // «удалён на ПК», хотя на телефоне он снова живой.
+            let restored_by_peer = peer.is_some_and(|state| state.present && state.hlc > row.hlc);
+            let peer_deleted = peer.is_some_and(|state| !state.present);
+            let peer_has_it = peer.is_some_and(|state| state.present)
                 || (!peer_deleted
                     && !peer_applied_delete(
                         peer_have,
                         &me,
                         removals.get(&row.path).copied(),
                     ));
-            if peer_has_it && !row.synced_blob.is_empty() {
+            if peer_has_it && !row.synced_blob.is_empty() && !restored_by_peer {
                 local.push(Change {
                     path: row.path.clone(),
                     from: None,

@@ -602,6 +602,10 @@ fn track_restored_from_the_phone_vault_reaches_the_pc() {
         .expect("восстановление с телефона должно вернуться в план ПК");
     assert_eq!(remote.kind, ChangeKind::Added);
     assert!(remote.base_blob.is_empty());
+    assert!(
+        session.plan.local.iter().all(|change| change.path != path),
+        "восстановленный на телефоне трек не должен одновременно показываться удалённым на ПК"
+    );
     session.commit(&mut a).unwrap();
     drop(session);
     let _ = handle.finish();
