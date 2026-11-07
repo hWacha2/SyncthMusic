@@ -31,7 +31,7 @@ const connected = computed(() => Boolean(phone.value.connected));
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.language') }}</h2>
       </div>
-      <p class="ws-setting-hint">{{ t('workspace.settings.language_text') }}</p>
+      <p class="ws-card-hint">{{ t('workspace.settings.language_text') }}</p>
       <LanguageSelect class="ws-lang-select" @pick="setLang" />
     </section>
 
@@ -39,7 +39,7 @@ const connected = computed(() => Boolean(phone.value.connected));
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.library') }}</h2>
       </div>
-      <p class="ws-setting-hint">{{ t('workspace.settings.folder_text') }}</p>
+      <p class="ws-card-hint">{{ t('workspace.settings.folder_text') }}</p>
       <div class="ws-setting-row is-static">
         <span class="ws-setting-copy">
           <span class="ws-setting-title">{{ t('workspace.settings.folder') }}</span>
@@ -101,7 +101,7 @@ const connected = computed(() => Boolean(phone.value.connected));
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.toasts_title') }}</h2>
       </div>
-      <p class="ws-setting-hint">{{ t('workspace.settings.toasts_text') }}</p>
+      <p class="ws-card-hint">{{ t('workspace.settings.toasts_text') }}</p>
       <div class="ws-segmented" role="group" :aria-label="t('workspace.settings.toasts_title')">
         <button
           v-for="value in toastChoices"
@@ -121,7 +121,7 @@ const connected = computed(() => Boolean(phone.value.connected));
       <div class="ws-card-head">
         <h2 class="ws-card-title">{{ t('workspace.settings.history_title') }}</h2>
       </div>
-      <p class="ws-setting-hint">{{ t('workspace.settings.history_text') }}</p>
+      <p class="ws-card-hint">{{ t('workspace.settings.history_text') }}</p>
       <p class="ws-setting-note">{{ t('workspace.settings.history_note') }}</p>
       <p v-if="!connected" class="ws-setting-note">
         {{ t('workspace.settings.history_offline') }}

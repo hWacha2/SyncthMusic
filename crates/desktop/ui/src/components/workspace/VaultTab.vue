@@ -1,10 +1,12 @@
 <script setup>
 import IconVault from '../icons/IconVault.vue';
+import SortTabs from './SortTabs.vue';
 import Spinner from '../Spinner.vue';
 import { computed, ref } from 'vue';
 import { t } from '../../i18n/index.js';
 import { ago, formatSize } from '../../format.js';
 import { state } from '../../store.js';
+import { sortByFolder, sortByTime, sortEntries } from '../../workspace/model.js';
 import {
   askClearVault,
   askGc,
@@ -24,9 +26,21 @@ const props = defineProps({
 const device = ref('pc');
 const onPhone = computed(() => device.value === 'phone');
 
+const sort = ref('time');
+const sortOptions = [
+  { id: 'time', label: 'workspace.sort.time' },
+  { id: 'folders', label: 'workspace.changes.sort_folders' },
+  { id: 'alpha', label: 'workspace.changes.sort_alpha' },
+];
+
 const pcRows = computed(() => props.data?.vault || []);
 const phoneRows = computed(() => state.workspace.phoneVault || []);
 const rows = computed(() => (onPhone.value ? phoneRows.value : pcRows.value));
+const sortedRows = computed(() => {
+  if (sort.value === 'alpha') return sortEntries(rows.value);
+  if (sort.value === 'folders') return sortByFolder(rows.value);
+  return sortByTime(rows.value, 'deleted_at');
+});
 
 const busy = computed(() => Boolean(state.workspace.action || state.workspace.refreshing));
 const gc = computed(() => state.workspace.action === (onPhone.value ? 'phone-vault-gc' : 'gc'));
@@ -187,8 +201,11 @@ function restoring(path) {
       <p v-if="onPhone && phoneError" class="ws-vault-hint">
         {{ t('workspace.error.phone_vault', { error: phoneError }) }}
       </p>
+      <div class="ws-sort-row ws-card-sort">
+        <SortTabs v-model="sort" :options="sortOptions" />
+      </div>
       <div class="ws-rows">
-        <div v-for="row in rows" :key="row.path" class="ws-row">
+        <div v-for="row in sortedRows" :key="row.path" class="ws-row">
           <span class="ws-row-kind is-vault">{{ formatSize(row.size) }}</span>
           <div class="ws-row-main">
             <div class="ws-row-path" :title="row.path">{{ row.path }}</div>

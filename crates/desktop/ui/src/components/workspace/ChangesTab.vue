@@ -150,6 +150,28 @@ function toggleFolder(folder) {
   selected.value = [...next];
 }
 
+function typeSelection(group) {
+  const items = group.items.filter((entry) => entry.pending);
+  const chosen = items.filter((entry) => selectedSet.value.has(entry.path)).length;
+  return {
+    total: items.length,
+    checked: items.length > 0 && chosen === items.length,
+    partial: chosen > 0 && chosen < items.length,
+  };
+}
+
+function toggleTypeSelection(group) {
+  const next = new Set(selected.value);
+  const items = group.items.filter((entry) => entry.pending);
+  if (!items.length) return;
+  const all = items.every((entry) => next.has(entry.path));
+  for (const entry of items) {
+    if (all) next.delete(entry.path);
+    else next.add(entry.path);
+  }
+  selected.value = [...next];
+}
+
 // После решения пути перестают быть pending — убираем их из выделения.
 watch(activeEntries, (list) => {
   if (!selected.value.length) return;
@@ -495,11 +517,27 @@ function typeTitle(type) {
           class="ws-card ws-group ws-type"
           :class="{ 'is-open': isTypeOpen(group.type) }"
         >
-          <button type="button" class="ws-group-toggle" @click="toggleType(group.type)">
-            <span class="ws-folder-arrow" aria-hidden="true">›</span>
-            <span class="ws-card-title">{{ typeTitle(group.type) }}</span>
-            <span class="ws-tag">{{ number(group.items.length) }}</span>
-          </button>
+          <div class="ws-type-head">
+            <button
+              v-if="typeSelection(group).total"
+              type="button"
+              class="ws-check"
+              :class="{
+                'is-on': typeSelection(group).checked,
+                'is-partial': typeSelection(group).partial,
+              }"
+              role="checkbox"
+              :aria-checked="typeSelection(group).checked ? 'true' : 'false'"
+              :aria-label="typeTitle(group.type)"
+              @click="toggleTypeSelection(group)"
+            ></button>
+            <span v-else class="ws-check-space" aria-hidden="true"></span>
+            <button type="button" class="ws-group-toggle" @click="toggleType(group.type)">
+              <span class="ws-folder-arrow" aria-hidden="true">›</span>
+              <span class="ws-card-title">{{ typeTitle(group.type) }}</span>
+              <span class="ws-tag">{{ number(group.items.length) }}</span>
+            </button>
+          </div>
           <div v-if="isTypeOpen(group.type)" class="ws-rows">
             <ChangeRow
               v-for="entry in group.items"

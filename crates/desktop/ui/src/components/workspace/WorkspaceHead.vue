@@ -48,7 +48,7 @@ const head = computed(() => {
   if (props.tab === 'settings') {
     return {
       title: t('workspace.tab.settings'),
-      text: t('workspace.settings.sub'),
+      text: '',
     };
   }
   if (props.tab === 'vault') {
@@ -90,7 +90,7 @@ const commitLabel = computed(() => {
     <div class="ws-head-copy">
       <p class="ws-kicker">{{ t('workspace.kicker') }}</p>
       <h1 class="ws-title">{{ head.title }}</h1>
-      <p class="ws-sub">{{ head.text }}</p>
+      <p v-if="head.text" class="ws-sub">{{ head.text }}</p>
     </div>
     <div v-if="tab === 'devices'" class="ws-head-actions">
       <button

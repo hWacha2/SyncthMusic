@@ -776,6 +776,20 @@ button:focus-visible {
   line-height: 1.5;
 }
 
+/* Подсказка на уровне всей карточки, а не строки: отделяем её от списка. */
+.ws-card-hint {
+  margin: 0 0 12px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ws-card-hint + .ws-segmented,
+.ws-card-hint + .ws-lang-select,
+.ws-card-hint + .ws-setting-note {
+  margin-top: 0;
+}
+
 .ws-setting-note {
   margin: 8px 0 0;
   color: var(--dim);
@@ -1185,7 +1199,7 @@ button:focus-visible {
 
 .ws-card-title {
   margin: 0;
-  font-size: 12px;
+  font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.005em;
 }
@@ -1717,6 +1731,19 @@ button:focus-visible {
   padding: 0 2px;
 }
 
+/* Сортировка внутри карточки: без внешних отступов, но с воздухом до строк. */
+.ws-card-sort {
+  margin-bottom: 8px;
+  padding: 0;
+}
+
+.ws-empty-line {
+  margin: 0;
+  padding: 18px 0;
+  color: var(--dim);
+  font-size: 12px;
+}
+
 .ws-sort-tabs {
   display: flex;
   gap: 2px;
@@ -1836,23 +1863,31 @@ button:focus-visible {
 
 /* -------------------------------------------------------- изменения: типы */
 
+.ws-type-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  margin-bottom: 12px;
+}
+
+.ws-type:not(.is-open) .ws-type-head {
+  margin-bottom: 0;
+}
+
 .ws-group-toggle {
   display: flex;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 24px;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--text);
   text-align: left;
   cursor: pointer;
-}
-
-.ws-type:not(.is-open) .ws-group-toggle {
-  margin-bottom: 0;
 }
 
 .ws-group-toggle .ws-card-title {

@@ -161,6 +161,26 @@ export function sortEntries(entries) {
   return [...entries].sort(comparePaths);
 }
 
+/// Плоская сортировка «по папкам»: файлы одной папки идут рядом, внутри —
+/// по алфавиту. Для «Хранилища» и «Исключений» этого достаточно: полный путь
+/// уже виден в строке.
+export function sortByFolder(items) {
+  return [...items].sort((a, b) => {
+    const af = dirname(a.path);
+    const bf = dirname(b.path);
+    if (af !== bf) {
+      return af.localeCompare(bf, locale(), { numeric: true, sensitivity: 'base' });
+    }
+    return comparePaths(a, b);
+  });
+}
+
+/// Свежие записи сверху. Поле времени у разных списков своё: `created_at`
+/// у исключений, `deleted_at` у хранилища.
+export function sortByTime(items, field) {
+  return [...items].sort((a, b) => (Number(b[field]) || 0) - (Number(a[field]) || 0));
+}
+
 export function groupByFolder(entries) {
   const groups = new Map();
   for (const entry of entries) {
