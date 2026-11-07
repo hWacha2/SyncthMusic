@@ -49,6 +49,7 @@ export default {
   "workspace.settings.history_title": "История библиотеки",
   "workspace.settings.history_text": "Журнал, решения и планы синхронизации на этом ПК и на телефоне. Папки с музыкой не изменяются.",
   "workspace.settings.history_note": "«Хранилище» с копиями удалённых файлов остаётся. После очистки «Проверить» заново сравнит папки.",
+  "workspace.settings.history_offline": "Сброс затрагивает оба устройства. Подключите телефон, чтобы очистить историю.",
   "workspace.settings.clear_history": "Очистить историю",
   "workspace.settings.clearing": "Очищаем…",
   "workspace.settings.toasts_title": "Уведомления",

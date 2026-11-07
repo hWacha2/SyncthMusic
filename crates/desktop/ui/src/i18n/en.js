@@ -49,6 +49,7 @@ export default {
   "workspace.settings.history_title": "Library history",
   "workspace.settings.history_text": "The sync journal, decisions and plans on this PC and on the phone. Music folders are not modified.",
   "workspace.settings.history_note": "The Vault with copies of deleted files stays. After clearing, Check compares the folders from scratch.",
+  "workspace.settings.history_offline": "The reset affects both devices. Connect the phone to clear the history.",
   "workspace.settings.clear_history": "Clear history",
   "workspace.settings.clearing": "Clearing…",
   "workspace.settings.toasts_title": "Notifications",

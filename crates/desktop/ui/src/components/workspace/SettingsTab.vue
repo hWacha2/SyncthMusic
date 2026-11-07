@@ -192,11 +192,14 @@ const connected = computed(() => Boolean(phone.value.connected));
       </div>
       <p class="ws-setting-hint">{{ t('workspace.settings.history_text') }}</p>
       <p class="ws-setting-note">{{ t('workspace.settings.history_note') }}</p>
+      <p v-if="!connected" class="ws-setting-note">
+        {{ t('workspace.settings.history_offline') }}
+      </p>
       <div class="ws-card-actions">
         <button
           type="button"
           class="btn btn--quiet btn--danger btn--small"
-          :disabled="busy"
+          :disabled="busy || !connected"
           @click="askClearHistory"
         >
           <Spinner v-if="clearing" />
