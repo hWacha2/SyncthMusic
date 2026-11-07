@@ -32,7 +32,7 @@ pub use plan::{
 };
 pub use resolve::{resolve, Action, Outcome};
 pub use scan::{scan, ScanReport};
-pub use store::{EntryRow, Peer, PendingDelete, PlanRow, Replica, VaultRow};
+pub use store::{EntryRow, Peer, PendingDelete, Replica, VaultRow};
 
 /// Отображаемое имя продукта для нативных окон, трея и уведомлений.
 ///

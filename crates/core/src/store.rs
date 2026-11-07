@@ -363,28 +363,6 @@ pub struct Peer {
     pub name: String,
 }
 
-/// Полное состояние пути для построения плана. В отличие от `EntryRow`
-/// здесь видны локальные флаги и согласованная база `synced_blob`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanRow {
-    pub path: String,
-    pub blob: String,
-    pub size: u64,
-    pub mtime_ns: i64,
-    pub added_at: u64,
-    pub deleted: bool,
-    pub present: bool,
-    pub ignored: bool,
-    pub synced_blob: String,
-    /// HLC операции, которая сформировала текущее состояние пути. По нему
-    /// видно, устарела ли операция пира: журнал пира может содержать давние
-    /// записи, которые до нас так и не доехали.
-    pub hlc: Hlc,
-    /// Автор этой операции. Нужен для разрешения ничьей по HLC так же, как
-    /// в `is_newer` при применении операций.
-    pub dev: String,
-}
-
 impl Drop for Replica {
     /// Часы живут в памяти, поэтому при закрытии реплики дописываем их в БД.
     /// Ошибку здесь вернуть некому: при следующем открытии часы всё равно
@@ -675,39 +653,6 @@ impl Replica {
         let result = read();
         drop(guard);
         result
-    }
-
-    /// Все пути с локальными флагами — вход для построения плана.
-    ///
-    /// Это совместимая проекция `path_state`: старый код плана ещё читает
-    /// `deleted/present/ignored/synced_blob`. `ResurrectingRemote` отдаёт
-    /// `synced_blob = blob`, иначе локальный проход плана принял бы ожидание
-    /// чужой копии за локальное добавление.
-    pub fn plan_rows(&self) -> Result<Vec<PlanRow>> {
-        Ok(self
-            .path_states()?
-            .into_iter()
-            .map(|row| {
-                let resurrecting_remote = row.state == PathState::ResurrectingRemote;
-                PlanRow {
-                    path: row.path,
-                    blob: row.blob.clone(),
-                    size: row.size,
-                    mtime_ns: row.mtime_ns,
-                    added_at: row.added_at,
-                    deleted: row.state.is_tombstone(),
-                    present: row.present,
-                    ignored: row.state.is_excluded(),
-                    synced_blob: if resurrecting_remote {
-                        row.blob.clone()
-                    } else {
-                        row.base.clone().unwrap_or_default()
-                    },
-                    hlc: row.hlc,
-                    dev: row.dev,
-                }
-            })
-            .collect())
     }
 
     /// Полное состояние пути. Основное чтение для нового кода.

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::{LocalMove, PendingDelete, PlanRow, Replica, ResurrectionRow};
+use crate::store::{LocalMove, PathState, PathStateRow, Replica};
 
 /// Сколько живёт план. Просроченный план не применяется: состояние могло
 /// измениться, а решения относятся к конкретным блобам.
@@ -80,20 +80,25 @@ fn same_folder(from: &str, to: &str) -> bool {
 /// актуальности перед commit. Иначе план мог сказать «добавление», а к моменту
 /// commit в журнале уже лежал `entry_move` — и путь уехал бы пиру как `put`.
 fn local_move_from(
-    by_path: &HashMap<&str, &PlanRow>,
+    by_path: &HashMap<&str, &PathStateRow>,
     move_to: &HashMap<&str, &LocalMove>,
-    row: &PlanRow,
+    row: &PathStateRow,
 ) -> Option<String> {
     move_to.get(row.path.as_str()).and_then(|mv| {
         let source_is_gone = by_path
             .get(mv.from.as_str())
-            .map_or(true, |source| source.deleted);
+            .map_or(true, |source| source.state == PathState::Tombstone);
         (mv.from != row.path
             && mv.blob == row.blob
             && source_is_gone
-            && (mv.hlc == row.hlc || row.synced_blob.is_empty()))
+            && (mv.hlc == row.hlc || row.base.is_none()))
         .then(|| mv.from.clone())
     })
+}
+
+/// Согласованная база пути; пустая строка — базы ещё нет.
+fn base_of(row: &PathStateRow) -> &str {
+    row.base.as_deref().unwrap_or("")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,20 +446,13 @@ impl Plan {
     /// Локальная часть плана ещё соответствует БД? Скан или правка файла
     /// после построения плана делают его непригодным.
     pub fn local_is_current(&self, replica: &Replica) -> Result<bool> {
-        // То же состояние БД, что увидит commit: строки, ожидания удаления,
-        // исключения и переносы читаются одним снимком.
+        // То же состояние БД, что увидит commit: состояния путей и переносы
+        // читаются одним снимком.
         let me = replica.device_id().to_string();
-        let (rows, pending_rows, excluded, local_moves) = replica.read_snapshot(|| {
-            Ok((
-                replica.plan_rows()?,
-                replica.pending_deletes()?,
-                replica.exclusion_paths()?,
-                replica.local_moves(&me)?,
-            ))
-        })?;
-        let by_path: HashMap<&str, &PlanRow> =
-            rows.iter().map(|row| (row.path.as_str(), row)).collect();
-        let pending: HashSet<String> = pending_rows.into_iter().map(|row| row.path).collect();
+        let (states, local_moves) =
+            replica.read_snapshot(|| Ok((replica.path_states()?, replica.local_moves(&me)?)))?;
+        let by_path: HashMap<&str, &PathStateRow> =
+            states.iter().map(|row| (row.path.as_str(), row)).collect();
         let move_to: HashMap<&str, &LocalMove> = local_moves
             .iter()
             .map(|mv| (mv.to.as_str(), mv))
@@ -470,20 +468,24 @@ impl Plan {
                 return Ok(false);
             };
             if change.kind == ChangeKind::Deleted {
-                let still_pending = pending.contains(&change.path);
-                if !row.deleted && !still_pending {
-                    return Ok(false);
+                match row.state {
+                    PathState::Missing | PathState::Tombstone => {}
+                    _ => return Ok(false),
                 }
-                let base = if row.synced_blob.is_empty() {
+                let base = if base_of(row).is_empty() {
                     change.blob.as_str()
                 } else {
-                    row.synced_blob.as_str()
+                    base_of(row)
                 };
                 if base != change.blob {
                     return Ok(false);
                 }
             } else {
-                if row.deleted || row.blob != change.blob || row.ignored != change.ignored {
+                if row.state == PathState::Tombstone
+                    || row.blob != change.blob
+                    || row.state.is_excluded() != change.ignored
+                    || row.present != change.present
+                {
                     return Ok(false);
                 }
                 // За время между планом и commit скан мог распознать перенос
@@ -496,7 +498,7 @@ impl Plan {
                 }
                 let kind = if let Some(from) = &current_from {
                     ChangeKind::for_move(from, &row.path)
-                } else if row.synced_blob.is_empty() {
+                } else if base_of(row).is_empty() {
                     ChangeKind::Added
                 } else {
                     ChangeKind::Updated
@@ -514,12 +516,11 @@ impl Plan {
             let Some(target) = by_path.get(to) else {
                 continue;
             };
-            if target.deleted
-                || target.ignored
-                || excluded.contains(&target.path)
+            if target.state == PathState::Tombstone
+                || target.state.is_excluded()
                 // Перенос уже вошёл в общую базу: отдельной строки плана нет
                 // и не должно быть.
-                || target.blob == target.synced_blob
+                || target.blob == base_of(target)
             {
                 continue;
             }
@@ -538,24 +539,23 @@ impl Plan {
         // Появившийся новый локальный путь тоже делает план неполным.
         // Мягкое удаление, которое пир уже перекрыл более новой операцией с
         // тем же блобом, живёт в плане строкой пира, а не локальной. Без этой
-        // поправки телефон отказывал бы в commit после отмены исключения:
-        // в БД ещё лежит `pending_deletes`, хотя план уже показывает возврат.
+        // поправки телефон отказывал бы в commit после отмены исключения.
         let remote_paths: HashSet<&str> = self
             .remote
             .iter()
             .filter(|change| change.kind != ChangeKind::Deleted)
             .map(|change| change.path.as_str())
             .collect();
-        for row in &rows {
-            if row.ignored || row.deleted || excluded.contains(&row.path) {
+        for row in &states {
+            if row.state.is_excluded() || row.state == PathState::Tombstone {
                 continue;
             }
             if conflicts.contains(row.path.as_str()) {
                 continue;
             }
-            let changed = row.blob != row.synced_blob;
-            let pending_delete = pending.contains(&row.path);
-            if pending_delete && row.synced_blob.is_empty() {
+            let changed = row.blob != base_of(row);
+            let pending_delete = row.state == PathState::Missing;
+            if pending_delete && base_of(row).is_empty() {
                 // Черновик, удалённый до первой синхронизации, не изменение.
                 continue;
             }
@@ -706,30 +706,18 @@ pub fn build_with_peer_have(
     // может быть уже в `entries`, но ещё не в `ops` (скан пишет несколькими
     // транзакциями), и новый путь превратится в «добавление».
     let me = replica.device_id().to_string();
-    let (rows, excluded, pending_deletes, local_moves, removals, resurrections) =
-        replica.read_snapshot(|| {
-            Ok((
-                replica.plan_rows()?,
-                replica.exclusion_paths()?,
-                replica.pending_deletes()?,
-                replica.local_moves(&me)?,
-                replica.removal_hlcs(&me)?,
-                replica.resurrections()?,
-            ))
-        })?;
-    let by_path: HashMap<&str, &PlanRow> =
-        rows.iter().map(|row| (row.path.as_str(), row)).collect();
-    let pending: HashMap<String, PendingDelete> = pending_deletes
-        .into_iter()
-        .map(|row| (row.path.clone(), row))
-        .collect();
-    let resurrection: HashMap<String, ResurrectionRow> = resurrections
-        .into_iter()
-        .map(|row| (row.path.clone(), row))
-        .collect();
+    let (states, local_moves, removals) = replica.read_snapshot(|| {
+        Ok((
+            replica.path_states()?,
+            replica.local_moves(&me)?,
+            replica.removal_hlcs(&me)?,
+        ))
+    })?;
+    let by_path: HashMap<&str, &PathStateRow> =
+        states.iter().map(|row| (row.path.as_str(), row)).collect();
     let remote = remote_state(remote_ops);
 
-    // Последний перенос в каждый путь. В `entries` связи «откуда» нет,
+    // Последний перенос в каждый путь. В `path_state` связи «откуда» нет,
     // поэтому без журнала новый путь неотличим от добавления.
     let mut move_to: HashMap<&str, &LocalMove> = HashMap::new();
     for mv in &local_moves {
@@ -746,11 +734,11 @@ pub fn build_with_peer_have(
         let Some(target) = by_path.get(mv.to.as_str()) else {
             continue;
         };
-        if target.deleted || target.ignored || excluded.contains(&target.path) {
+        if target.state == PathState::Tombstone || target.state.is_excluded() {
             continue;
         }
-        let still_describes_target = mv.blob == target.blob
-            && (mv.hlc == target.hlc || target.synced_blob.is_empty());
+        let still_describes_target =
+            mv.blob == target.blob && (mv.hlc == target.hlc || target.base.is_none());
         if !still_describes_target {
             continue;
         }
@@ -774,123 +762,154 @@ pub fn build_with_peer_have(
     let mut conflict_paths: HashSet<String> = HashSet::new();
 
     // ---------------------------------------------------------- локальные
-    for row in &rows {
-        if row.ignored || excluded.contains(&row.path) {
+    for row in &states {
+        if row.state.is_excluded() {
             // «Только здесь» или явное исключение: путь не участвует в плане
             // ни с одной стороны, пока человек не вернёт его в синхронизацию.
             continue;
         }
-        if row.deleted && local_move_sources.contains(row.path.as_str()) {
-            // Старый путь уже описан строкой переноса — отдельное удаление
-            // заставило бы выбирать между двумя решениями по одному событию.
-            continue;
-        }
-        if let Some(pending_delete) = pending.get(&row.path) {
-            // Путь ни разу не входил в общую базу: пир о нём не знает, и
-            // «удаление» здесь — не изменение, а просто исчезнувший черновик.
-            // Сканер такие записи забывает, это лишь страховка для старых БД.
-            if row.synced_blob.is_empty() {
+        match row.state {
+            PathState::ExcludedLocal | PathState::ExcludedRemote => unreachable!(),
+            PathState::ResurrectingRemote => {
+                // Ожидание копии от пира: синтетическую строку добавит
+                // удалённый проход, локального изменения здесь нет.
                 continue;
             }
-            // Пир уже вернул тот же блоб более новой операцией. Наше «файл
-            // пропал» устарело: файл придёт от пира, а не будет удалён здесь.
-            let restored_by_peer = remote.get(&row.path).is_some_and(|state| {
-                state.present
-                    && state.blob == pending_delete.blob
-                    && state.hlc > pending_delete.hlc()
-            });
-            // Отмена исключения уже пометила путь как возвращаемый с другой
-            // стороны. Пока маркер жив, удаление здесь не показываем.
-            let resurrecting = resurrection
-                .get(&row.path)
-                .is_some_and(|marker| marker.side == "remote");
-            if restored_by_peer || resurrecting {
+            PathState::ResurrectingLocal => {
+                // Возврат локальной копии — обычное добавление с чистой базой.
+                let aligned = remote
+                    .get(&row.path)
+                    .is_some_and(|state| state.present && state.blob == row.blob);
+                local.push(Change {
+                    path: row.path.clone(),
+                    from: None,
+                    kind: ChangeKind::Added,
+                    side: Side::Local,
+                    blob: row.blob.clone(),
+                    base_blob: String::new(),
+                    size: row.size,
+                    mtime_ns: row.mtime_ns,
+                    present: row.present,
+                    ignored: false,
+                    aligned,
+                });
                 continue;
             }
-            local.push(Change {
-                path: row.path.clone(),
-                from: None,
-                kind: ChangeKind::Deleted,
-                side: Side::Local,
-                blob: pending_delete.blob.clone(),
-                base_blob: row.synced_blob.clone(),
-                size: row.size,
-                mtime_ns: row.mtime_ns,
-                present: false,
-                ignored: false,
-                aligned: false,
-            });
-            continue;
-        }
-        if row.deleted {
-            // Подтверждённое удаление несём тому пиру, у которого файл ещё
-            // лежит (или который ещё не применил нашу операцию удаления).
-            // Иначе после общего удаления путь всплывал бы в плане вечно,
-            // хотя обе стороны уже согласны.
-            let peer = remote.get(&row.path);
-            // Пир уже вернул файл более новой операцией. Это добавление с его
-            // стороны, а не наше удаление: иначе один путь попадал бы в план
-            // дважды, и интерфейс показывал бы восстановленный трек как
-            // «удалён на ПК», хотя на телефоне он снова живой.
-            let restored_by_peer = peer.is_some_and(|state| state.present && state.hlc > row.hlc);
-            let peer_deleted = peer.is_some_and(|state| !state.present);
-            let peer_has_it = peer.is_some_and(|state| state.present)
-                || (!peer_deleted
-                    && !peer_applied_delete(
-                        peer_have,
-                        &me,
-                        removals.get(&row.path).copied(),
-                    ));
-            if peer_has_it && !row.synced_blob.is_empty() && !restored_by_peer {
+            PathState::Missing => {
+                // Путь ни разу не входил в общую базу: пир о нём не знает, и
+                // «удаление» здесь — не изменение, а просто исчезнувший
+                // черновик. Сканер такие записи забывает.
+                if row.base.is_none() {
+                    continue;
+                }
+                // Пир уже вернул тот же блоб более новой операцией. Наше «файл
+                // пропал» устарело: файл придёт от пира, а не будет удалён.
+                let restored_by_peer = remote.get(&row.path).is_some_and(|state| {
+                    state.present
+                        && state.blob == row.blob
+                        && row.pending_hlc.is_some_and(|pending| state.hlc > pending)
+                });
+                if restored_by_peer {
+                    continue;
+                }
                 local.push(Change {
                     path: row.path.clone(),
                     from: None,
                     kind: ChangeKind::Deleted,
                     side: Side::Local,
-                    blob: row.synced_blob.clone(),
-                    base_blob: row.synced_blob.clone(),
+                    blob: row.blob.clone(),
+                    base_blob: base_of(row).to_string(),
                     size: row.size,
                     mtime_ns: row.mtime_ns,
                     present: false,
                     ignored: false,
                     aligned: false,
                 });
+                continue;
             }
+            PathState::Tombstone => {
+                if local_move_sources.contains(row.path.as_str()) {
+                    // Старый путь уже описан строкой переноса — отдельное
+                    // удаление заставило бы выбирать между двумя решениями.
+                    continue;
+                }
+                // Подтверждённое удаление несём тому пиру, у которого файл ещё
+                // лежит (или который ещё не применил нашу операцию удаления).
+                // Иначе после общего удаления путь всплывал бы в плане вечно,
+                // хотя обе стороны уже согласны.
+                let peer = remote.get(&row.path);
+                // Пир уже вернул файл более новой операцией. Это добавление с
+                // его стороны, а не наше удаление.
+                let restored_by_peer =
+                    peer.is_some_and(|state| state.present && state.hlc > row.hlc);
+                let peer_deleted = peer.is_some_and(|state| !state.present);
+                let peer_has_it = peer.is_some_and(|state| state.present)
+                    || (!peer_deleted
+                        && !peer_applied_delete(
+                            peer_have,
+                            &me,
+                            removals.get(&row.path).copied(),
+                        ));
+                if peer_has_it && !base_of(row).is_empty() && !restored_by_peer {
+                    local.push(Change {
+                        path: row.path.clone(),
+                        from: None,
+                        kind: ChangeKind::Deleted,
+                        side: Side::Local,
+                        blob: base_of(row).to_string(),
+                        base_blob: base_of(row).to_string(),
+                        size: row.size,
+                        mtime_ns: row.mtime_ns,
+                        present: false,
+                        ignored: false,
+                        aligned: false,
+                    });
+                }
+                continue;
+            }
+            PathState::Live => {}
+        }
+
+        // Live: файл есть здесь или ждёт скачивания.
+        if row.blob == base_of(row) {
             continue;
         }
-        if row.blob != row.synced_blob {
-            // Файл уже идентичен версии пира. Базы может не быть, но данные
-            // передавать незачем: коммит лишь зафиксирует совпадение.
-            let aligned = row.present
-                && remote
-                    .get(&row.path)
-                    .is_some_and(|state| state.present && state.blob == row.blob);
-
-            // Сканер уже распознал переименование и записал `entry_move`.
-            // Проверяем, что перенос всё ещё относится к текущему содержимому:
-            // если путь позже переписали другим блобом, это обычная правка.
-            let moved_from = local_move_from(&by_path, &move_to, row);
-
-            local.push(Change {
-                path: row.path.clone(),
-                from: moved_from.clone(),
-                kind: if let Some(from) = &moved_from {
-                    ChangeKind::for_move(from, &row.path)
-                } else if row.synced_blob.is_empty() {
-                    ChangeKind::Added
-                } else {
-                    ChangeKind::Updated
-                },
-                side: Side::Local,
-                blob: row.blob.clone(),
-                base_blob: row.synced_blob.clone(),
-                size: row.size,
-                mtime_ns: row.mtime_ns,
-                present: row.present,
-                ignored: row.ignored,
-                aligned,
-            });
+        if row.base.is_none() && !row.present && row.dev != me {
+            // Чужое добавление ещё не скачано: это не локальное изменение,
+            // его покажет удалённый проход.
+            continue;
         }
+        // Файл уже идентичен версии пира. Базы может не быть, но данные
+        // передавать незачем: коммит лишь зафиксирует совпадение.
+        let aligned = row.present
+            && remote
+                .get(&row.path)
+                .is_some_and(|state| state.present && state.blob == row.blob);
+
+        // Сканер уже распознал переименование и записал `entry_move`.
+        // Проверяем, что перенос всё ещё относится к текущему содержимому:
+        // если путь позже переписали другим блобом, это обычная правка.
+        let moved_from = local_move_from(&by_path, &move_to, row);
+
+        local.push(Change {
+            path: row.path.clone(),
+            from: moved_from.clone(),
+            kind: if let Some(from) = &moved_from {
+                ChangeKind::for_move(from, &row.path)
+            } else if row.base.is_none() {
+                ChangeKind::Added
+            } else {
+                ChangeKind::Updated
+            },
+            side: Side::Local,
+            blob: row.blob.clone(),
+            base_blob: base_of(row).to_string(),
+            size: row.size,
+            mtime_ns: row.mtime_ns,
+            present: row.present,
+            ignored: false,
+            aligned,
+        });
     }
 
     // ---------------------------------------------------------- удалённые
@@ -906,16 +925,12 @@ pub fn build_with_peer_have(
 
     for state in remote.values() {
         let path = &state.path;
-        if excluded.contains(path) {
+        let row = by_path.get(path.as_str()).copied();
+        if row.is_some_and(|row| row.state.is_excluded()) {
             // Явное исключение: пир может продолжать слать свой журнал, но
             // этот путь не участвует в синхронизации.
             continue;
         }
-        if by_path.get(path.as_str()).is_some_and(|row| row.ignored) {
-            // «Только здесь»: не тянем и не трогаем.
-            continue;
-        }
-        let row = by_path.get(path.as_str()).cloned();
 
         // Журнал пира может содержать давнюю операцию, которая до нас не
         // доехала: watermark двигается только по применённым операциям, а не
@@ -945,9 +960,10 @@ pub fn build_with_peer_have(
             // новее нашего мягкого удаления, значит файл нужно тянуть, а не
             // удалять: иначе отмена исключения оставляла бы удаление навсегда.
             let pending_superseded = row.is_some_and(|row| {
-                pending.get(&row.path).is_some_and(|pending_delete| {
-                    state.blob == pending_delete.blob && state.hlc > pending_delete.hlc()
-                })
+                row.state == PathState::Missing
+                    && row
+                        .pending_hlc
+                        .is_some_and(|pending| state.blob == row.blob && state.hlc > pending)
             });
             // У удалённой строки общая база есть только до тех пор, пока пир
             // не прислал факт новее самого удаления. Если прислал — это
@@ -955,37 +971,37 @@ pub fn build_with_peer_have(
             // вернуться в очередь как добавление, а не потеряться в проверке
             // «у пира лежит та же база». Источник нашего переноса — исключение:
             // пир мог просто ещё не увидеть перенос и присылать старый путь.
-            let base_blob = match &row {
+            let base_blob = match row {
                 Some(_) if pending_superseded => String::new(),
                 Some(row)
-                    if row.deleted
+                    if row.state == PathState::Tombstone
                         && state.hlc > row.hlc
                         && !local_move_sources.contains(row.path.as_str()) =>
                 {
                     String::new()
                 }
-                Some(row) => row.synced_blob.clone(),
+                Some(row) => base_of(row).to_string(),
                 None => String::new(),
             };
             let local_changed = match row {
-                Some(row) if !row.deleted => {
+                Some(row) if row.state != PathState::Tombstone => {
                     !pending_superseded
-                        && (row.blob != row.synced_blob || pending.contains_key(&row.path))
+                        && (row.blob != base_of(row) || row.state == PathState::Missing)
                 }
-                Some(row) if row.deleted => !base_blob.is_empty(),
-                _ => false,
+                Some(_) => !base_blob.is_empty(),
+                None => false,
             };
             let local_blob = row
-                .filter(|row| !row.deleted)
+                .filter(|row| row.state != PathState::Tombstone)
                 .map(|row| row.blob.clone())
                 .unwrap_or_default();
             let same_content = row
-                .filter(|row| !row.deleted)
+                .filter(|row| row.state != PathState::Tombstone)
                 .is_some_and(|row| row.present && row.blob == state.blob);
             let move_changes_old_path = state.moved_from.as_ref().is_some_and(|from| {
                 by_path
                     .get(from.as_str())
-                    .is_some_and(|row| !row.deleted && !row.synced_blob.is_empty())
+                    .is_some_and(|row| row.state != PathState::Tombstone && row.base.is_some())
             });
             // Пир мог прислать старую операцию, которая уже является общей
             // базой. Это не его изменение: конфликт только если обе стороны
@@ -995,13 +1011,17 @@ pub fn build_with_peer_have(
                 || state.moved_from.is_some()
                 || row
                     .as_ref()
-                    .map_or(true, |row| row.deleted || state.blob != row.synced_blob);
+                    .map_or(true, |row| {
+                        row.state == PathState::Tombstone || state.blob != base_of(row)
+                    });
 
             if same_content && !move_changes_old_path {
                 continue;
             }
 
-            if row.is_some_and(|row| row.deleted) && base_blob == state.blob {
+            if row.is_some_and(|row| row.state == PathState::Tombstone)
+                && base_blob == state.blob
+            {
                 // Мы удалили, а у пира лежит та же база: наше удаление —
                 // единственное изменение, его и отправим.
                 continue;
@@ -1015,8 +1035,16 @@ pub fn build_with_peer_have(
 
             if local_changed && !same_content {
                 let reason = match row {
-                    Some(row) if row.deleted => ConflictReason::ChangedVsDeleted,
-                    Some(row) if row.synced_blob.is_empty() => ConflictReason::NoBase,
+                    // Удалённый путь против другого содержимого пира — это
+                    // всегда «изменено против удалено», даже если это мягкое
+                    // удаление (`Missing`), а не подтверждённое.
+                    Some(row)
+                        if row.state == PathState::Tombstone
+                            || row.state == PathState::Missing =>
+                    {
+                        ConflictReason::ChangedVsDeleted
+                    }
+                    Some(row) if row.base.is_none() => ConflictReason::NoBase,
                     _ => ConflictReason::BothChanged,
                 };
                 let (local_path, local_size) = row
@@ -1025,7 +1053,9 @@ pub fn build_with_peer_have(
                 let local_blob = if let Some(from) = &state.moved_from {
                     by_path
                         .get(from.as_str())
-                        .filter(|row| !row.deleted && row.blob != row.synced_blob)
+                        .filter(|row| {
+                            row.state != PathState::Tombstone && row.blob != base_of(row)
+                        })
                         .map(|row| row.blob.clone())
                         .unwrap_or(local_blob)
                 } else {
@@ -1049,11 +1079,11 @@ pub fn build_with_peer_have(
             // конфликт: принять его значило бы молча потерять правку.
             if let Some(from) = &state.moved_from {
                 let source_changed = by_path.get(from.as_str()).is_some_and(|row| {
-                    !row.deleted
-                        && (row.blob != row.synced_blob || pending.contains_key(&row.path))
+                    row.state != PathState::Tombstone
+                        && (row.blob != base_of(row) || row.state == PathState::Missing)
                 });
                 if source_changed {
-                    let source = by_path.get(from.as_str()).cloned();
+                    let source = by_path.get(from.as_str()).copied();
                     conflicts.push(Conflict {
                         path: path.clone(),
                         local_path: from.clone(),
@@ -1100,10 +1130,10 @@ pub fn build_with_peer_have(
             // Путь нам вообще не известен — удалять нечего.
             continue;
         };
-        if row.deleted {
+        if row.state == PathState::Tombstone {
             continue;
         }
-        if pending.contains_key(&row.path) {
+        if row.state == PathState::Missing {
             // Обе стороны удалили — это не конфликт.
             continue;
         }
@@ -1111,15 +1141,10 @@ pub fn build_with_peer_have(
         // Удаление пира старше неё — хвост его `pending_deletes`, а не
         // намерение убрать общий файл. Иначе отмена снова показывала бы
         // удаление, хотя файл жив.
-        if row.present
-            && row.hlc > state.hlc
-            && resurrection
-                .get(&row.path)
-                .is_some_and(|marker| marker.side == "local")
-        {
+        if row.state == PathState::ResurrectingLocal && row.present && row.hlc > state.hlc {
             continue;
         }
-        if row.blob != row.synced_blob {
+        if row.blob != base_of(row) {
             conflicts.push(Conflict {
                 path: row.path.clone(),
                 local_path: row.path.clone(),
@@ -1138,8 +1163,8 @@ pub fn build_with_peer_have(
             from: None,
             kind: ChangeKind::Deleted,
             side: Side::Remote,
-            blob: row.synced_blob.clone(),
-            base_blob: row.synced_blob.clone(),
+            blob: base_of(row).to_string(),
+            base_blob: base_of(row).to_string(),
             size: row.size,
             mtime_ns: row.mtime_ns,
             present: false,
@@ -1151,11 +1176,11 @@ pub fn build_with_peer_have(
     // Отмена исключения на стороне пира: у нас файла нет, но он есть у него.
     // Синтетическая строка добавления заставляет commit запросить блоб. Обычный
     // проход её не увидит, если пир не прислал новую операцию.
-    for marker in resurrection.values() {
-        if marker.side != "remote"
-            || excluded.contains(&marker.path)
-            || by_path.get(marker.path.as_str()).is_some_and(|row| row.ignored)
-            || local.iter().any(|change| change.path == marker.path)
+    for marker in states
+        .iter()
+        .filter(|row| row.state == PathState::ResurrectingRemote)
+    {
+        if local.iter().any(|change| change.path == marker.path)
             || remote_changes
                 .iter()
                 .any(|change| change.path == marker.path)
@@ -2317,6 +2342,157 @@ mod tests {
         // Скан чистит такой призрак целиком, а не оставляет вечное удаление.
         assert_eq!(a.prune_ghost_deletes().unwrap(), 1);
         assert!(a.pending_deletes().unwrap().is_empty());
-        assert!(a.plan_rows().unwrap().iter().all(|row| row.path != "draft.flac"));
+        assert!(a.path_state("draft.flac").unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_path_returns_when_the_peer_has_the_same_blob_newer() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.record_pending_delete("track.flac", "b3:aa", Hlc::new(10, 0))
+            .unwrap();
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("track.flac", "b3:aa"), 1)],
+        )
+        .unwrap();
+
+        assert!(
+            plan.local.is_empty(),
+            "возврат пира отменяет мягкое удаление"
+        );
+        assert_eq!(plan.remote.len(), 1);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Added);
+        assert_eq!(plan.remote[0].base_blob, "");
+    }
+
+    #[test]
+    fn missing_path_with_a_different_peer_blob_is_a_conflict() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.record_pending_delete("track.flac", "b3:aa", Hlc::new(10, 0))
+            .unwrap();
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("track.flac", "b3:bb"), 1)],
+        )
+        .unwrap();
+
+        assert!(plan.local.is_empty());
+        assert!(plan.remote.is_empty());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(
+            plan.conflicts[0].reason,
+            ConflictReason::ChangedVsDeleted
+        );
+    }
+
+    #[test]
+    fn tombstone_accepts_a_newer_peer_restore_as_an_addition() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.apply(&remote(del("track.flac"), 10)).unwrap();
+        assert_eq!(
+            a.path_state("track.flac").unwrap().unwrap().state,
+            PathState::Tombstone
+        );
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[remote(put("track.flac", "b3:aa"), 20)],
+        )
+        .unwrap();
+
+        assert!(plan.local.is_empty(), "пир восстановил файл новее удаления");
+        assert_eq!(plan.remote.len(), 1);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Added);
+        assert_eq!(plan.remote[0].base_blob, "");
+    }
+
+    #[test]
+    fn stale_peer_restore_of_the_deleted_blob_keeps_the_deletion() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.apply(&remote(del("track.flac"), 10)).unwrap();
+
+        // Старый put с тем же блобом не новее tombstone: это хвост журнала
+        // пира, а не восстановление. Удаление всё ещё нужно ему отправить.
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[stale_remote(put("track.flac", "b3:aa"))],
+        )
+        .unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Deleted);
+        assert!(plan.remote.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn resurrecting_remote_asks_for_the_peer_copy() {
+        let a = Replica::in_memory("dev-a").unwrap();
+        a.add_exclusion("track.flac", "remote", "b3:aa", 5, 1)
+            .unwrap();
+        a.add_resurrection("track.flac", "remote", "b3:aa", 5, 1)
+            .unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert!(plan.local.is_empty());
+        assert_eq!(plan.remote.len(), 1);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Added);
+        assert_eq!(plan.remote[0].base_blob, "");
+        assert!(!plan.remote[0].present);
+    }
+
+    #[test]
+    fn resurrecting_local_is_an_addition_and_ignores_a_stale_peer_delete() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "track.flac", "b3:aa");
+        a.add_resurrection("track.flac", "local", "b3:aa", 5, 1)
+            .unwrap();
+
+        let plan = build(
+            &a,
+            "dev-b",
+            "Phone",
+            &[stale_remote(del("track.flac"))],
+        )
+        .unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Added);
+        assert_eq!(plan.local[0].base_blob, "");
+        assert!(
+            plan.remote.is_empty(),
+            "старое удаление пира не должно победить возврат"
+        );
+    }
+
+    #[test]
+    fn undownloaded_remote_addition_is_not_a_local_change() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        a.apply(&remote(put("new.flac", "b3:aa"), 1)).unwrap();
+        let row = a.path_state("new.flac").unwrap().unwrap();
+        assert_eq!(row.state, PathState::Live);
+        assert!(!row.present);
+        assert_eq!(row.dev, "dev-peer");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert!(plan.local.is_empty());
+        assert!(plan.remote.is_empty());
+        assert!(plan.conflicts.is_empty());
     }
 }
