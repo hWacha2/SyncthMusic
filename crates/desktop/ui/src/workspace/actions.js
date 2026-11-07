@@ -279,6 +279,36 @@ export async function undoExclusion(path) {
   }
 }
 
+/// Снять исключение сразу с нескольких путей: один пересбор плана на всю
+/// пачку вместо отдельного сеанса для каждой строки.
+export async function undoExclusionMany(paths) {
+  if (!hasBridge || !paths.length || state.workspace.action || state.workspace.refreshing) {
+    return false;
+  }
+  const gen = nextWorkspaceGeneration();
+  state.workspace.action = 'exclusion-many';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  let ok = false;
+  try {
+    const data = await invoke('workspace_exclusion_undo_many', { paths });
+    if (isWorkspaceGeneration(gen)) state.workspace.data = data;
+    state.workspace.note = t('workspace.exclusion_many_undone', { count: paths.length });
+    state.workspace.noteError = false;
+    ok = true;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.exclusion', { error: errorMessage(error) });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  // Часть путей могла успеть вернуться до ошибки: обновляем план, чтобы
+  // выделение не держало уже обработанные строки.
+  if (!ok) await refreshWorkspace({ keepNote: true });
+  return ok;
+}
+
 export async function restoreVault(path) {
   if (!hasBridge || state.workspace.action) return;
   state.workspace.action = `restore:${path}`;
@@ -296,6 +326,32 @@ export async function restoreVault(path) {
     state.workspace.action = '';
   }
   await refreshWorkspace({ keepNote: true });
+}
+
+/// Восстановить выбранные файлы одной командой: бэкенд возвращает все копии
+/// и делает один скан, а не по скану на каждый файл.
+export async function restoreVaultMany(paths) {
+  if (!hasBridge || !paths.length || state.workspace.action || state.workspace.refreshing) {
+    return false;
+  }
+  state.workspace.action = 'restore-many';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  let ok = false;
+  try {
+    await invoke('workspace_restore_many', { paths });
+    state.workspace.note = t('workspace.vault.restored_many', { count: paths.length });
+    state.workspace.noteError = false;
+    ok = true;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.restore', { error: errorMessage(error) });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  await refreshWorkspace({ keepNote: true });
+  return ok;
 }
 
 /// Список треков в корзине телефона. Запрашивается отдельно от общего статуса:
@@ -346,6 +402,36 @@ export async function restorePhoneVault(path) {
     state.workspace.action = '';
   }
   await loadPhoneVault(true);
+}
+
+/// Вернуть несколько треков из корзины телефона за один сеанс: телефон
+/// создаёт операцию добавления на каждый путь, ПК затем строит общий план.
+export async function restorePhoneVaultMany(paths) {
+  if (!hasBridge || !paths.length || state.workspace.action) return false;
+  state.workspace.action = 'restore-phone-many';
+  state.workspace.note = '';
+  state.workspace.noteError = false;
+  state.workspace.error = '';
+  let ok = false;
+  try {
+    const data = await invoke('workspace_restore_phone_vault_many', { paths });
+    if (data) state.workspace.data = data;
+    state.workspace.note = t('workspace.phone_vault.restored_many', { count: paths.length });
+    state.workspace.noteError = false;
+    ok = true;
+  } catch (error) {
+    state.workspace.note = t('workspace.error.phone_vault_restore', {
+      error: errorMessage(error),
+    });
+    state.workspace.noteError = true;
+  } finally {
+    state.workspace.action = '';
+  }
+  await loadPhoneVault(true);
+  // Часть треков могла вернуться до ошибки: обновляем и план, чтобы
+  // выделение не держало уже обработанные строки.
+  if (!ok) await refreshWorkspace({ keepNote: true });
+  return ok;
 }
 
 /// Удалить с телефона копии старше срока хранения. Список перезапрашиваем:

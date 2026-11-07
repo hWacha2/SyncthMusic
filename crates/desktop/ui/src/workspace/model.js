@@ -161,6 +161,14 @@ export function sortEntries(entries) {
   return [...entries].sort(comparePaths);
 }
 
+/// Папки по алфавиту; корень библиотеки — в конце. Пустая строка означает
+/// корень, поэтому её нельзя сравнивать как обычное имя.
+function compareFolders(a, b) {
+  if (!a) return b ? 1 : 0;
+  if (!b) return -1;
+  return a.localeCompare(b, locale(), { numeric: true, sensitivity: 'base' });
+}
+
 /// Плоская сортировка «по папкам»: файлы одной папки идут рядом, внутри —
 /// по алфавиту. Для «Хранилища» и «Исключений» этого достаточно: полный путь
 /// уже виден в строке.
@@ -168,11 +176,28 @@ export function sortByFolder(items) {
   return [...items].sort((a, b) => {
     const af = dirname(a.path);
     const bf = dirname(b.path);
-    if (af !== bf) {
-      return af.localeCompare(bf, locale(), { numeric: true, sensitivity: 'base' });
-    }
+    if (af !== bf) return compareFolders(af, bf);
     return comparePaths(a, b);
   });
+}
+
+/// Группы по папкам для плоских списков «Хранилища» и «Исключений»: у их
+/// строк нет готового поля `folder`, поэтому путь раскладываем здесь.
+export function groupPathsByFolder(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const folder = dirname(item.path);
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push(item);
+  }
+
+  return [...groups.entries()]
+    .map(([folder, list]) => ({
+      folder,
+      items: sortEntries(list),
+      size: list.reduce((sum, item) => sum + (Number(item.size) || 0), 0),
+    }))
+    .sort((a, b) => compareFolders(a.folder, b.folder));
 }
 
 /// Свежие записи сверху. Поле времени у разных списков своё: `created_at`
@@ -200,12 +225,7 @@ export function groupByFolder(entries) {
         kinds: [...new Set(items.map((item) => item.change?.kind || 'conflict'))],
       };
     })
-    .sort((a, b) => {
-      // Файлы из корня библиотеки — в конце, остальные папки по алфавиту.
-      if (!a.folder) return b.folder ? 1 : 0;
-      if (!b.folder) return -1;
-      return a.folder.localeCompare(b.folder, locale(), { numeric: true, sensitivity: 'base' });
-    });
+    .sort((a, b) => compareFolders(a.folder, b.folder));
 }
 
 const TYPE_ORDER = ['deletion', 'addition', 'change'];

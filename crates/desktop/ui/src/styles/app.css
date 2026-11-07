@@ -671,6 +671,12 @@ button:focus-visible {
   max-width: 760px;
 }
 
+/* Нижняя панель массовых действий не должна перекрывать последнюю строку. */
+.ws-vault.has-selection,
+.ws-exclusions.has-selection {
+  padding-bottom: 52px;
+}
+
 .ws-vault-actions {
   display: flex;
   flex-direction: column;
@@ -1859,6 +1865,12 @@ button:focus-visible {
 
 .ws-folder-rows {
   padding: 0 0 6px 21px;
+}
+
+/* Группы «Хранилища» и «Исключений» живут внутри общей карточки: внешние
+   отступы уже даёт `.ws-card`, здесь нужна только разметка групп. */
+.ws-path-folders {
+  padding: 0;
 }
 
 /* -------------------------------------------------------- изменения: типы */

@@ -1884,6 +1884,27 @@ async fn workspace_restore(path: String) -> Result<Value, String> {
     .await
 }
 
+/// Восстановить несколько файлов из корзины ПК. Скан запускаем один раз:
+/// иначе каждый файл заново обходил бы всю библиотеку.
+#[tauri::command]
+async fn workspace_restore_many(paths: Vec<String>) -> Result<Value, String> {
+    blocking(move || {
+        let mut replica = workspace_replica()?;
+        for path in &paths {
+            vault::restore(&mut replica, path).map_err(|error| format!("{error:#}"))?;
+        }
+        let mut report = None;
+        if let Ok(Some(root)) = replica.root() {
+            report = scan::scan(&root, &mut replica).ok();
+        }
+        Ok(json!({
+            "restored": paths.len(),
+            "added": report.as_ref().map(|report| report.added).unwrap_or(0),
+        }))
+    })
+    .await
+}
+
 /// Корзина телефона: треки, удалённые из общей библиотеки, но ещё лежащие
 /// на телефоне. Блоб не запрашиваем — только список, чтобы показать его в UI.
 #[tauri::command]
@@ -1929,18 +1950,20 @@ async fn workspace_phone_vault(app: tauri::AppHandle) -> Result<Value, String> {
     .await
 }
 
-/// Вернуть трек из корзины телефона. Телефон сам достаёт копию и создаёт
-/// `entry_put`; ПК затем видит путь как чужое добавление и скачивает блоб
-/// обычным сеансом. Поэтому после команды закрываем старый план и строим
-/// новый — иначе восстановление не появилось бы в «Изменениях».
-#[tauri::command]
-async fn workspace_restore_phone_vault(app: tauri::AppHandle, path: String) -> Result<Value, String> {
-    blocking(move || {
-        with_session(&app, |session| {
-            session
-                .transport
-                .set_read_timeout(Some(Duration::from_secs(120)))
-                .map_err(|error| format!("{error:#}"))?;
+/// Общая часть одиночного и массового возврата: телефон сам достаёт копии и
+/// создаёт `entry_put`; ПК затем видит пути как чужие добавления и скачивает
+/// блобы обычным сеансом. После пачки закрываем старый план и строим новый
+/// один раз — иначе восстановление не появилось бы в «Изменениях».
+fn restore_phone_vault_paths(
+    app: &tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    with_session(app, |session| {
+        session
+            .transport
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .map_err(|error| format!("{error:#}"))?;
+        for path in &paths {
             agent::send(
                 session.transport.as_mut(),
                 &AgentMsg::RestoreVault { path: path.clone() },
@@ -1950,27 +1973,46 @@ async fn workspace_restore_phone_vault(app: tauri::AppHandle, path: String) -> R
                 match agent::recv(session.transport.as_mut())
                     .map_err(|error| format!("{error:#}"))?
                 {
-                    AgentMsg::VaultRestored { .. } => return Ok(Ok(())),
+                    AgentMsg::VaultRestored { .. } => break,
                     AgentMsg::Error { message } => return Ok(Err(message)),
                     _ => {}
                 }
             }
-        })?;
+        }
+        Ok(Ok(()))
+    })?;
 
-        let mut replica = workspace_replica()?;
-        let desktop = app.state::<Desktop>();
-        let mut ws = desktop
-            .workspace
-            .lock()
-            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
-        ws.close();
-        ws.session_error = match ensure_preview(&app, &mut ws, &mut replica) {
-            Ok(()) => None,
-            Err(error) => Some(error),
-        };
-        Ok(workspace_payload(&app, &replica, &ws))
-    })
-    .await
+    let mut replica = workspace_replica()?;
+    let desktop = app.state::<Desktop>();
+    let mut ws = desktop
+        .workspace
+        .lock()
+        .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+    ws.close();
+    ws.session_error = match ensure_preview(app, &mut ws, &mut replica) {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+    Ok(workspace_payload(app, &replica, &ws))
+}
+
+/// Вернуть трек из корзины телефона. Телефон сам достаёт копию и создаёт
+/// `entry_put`; ПК затем видит путь как чужое добавление и скачивает блоб
+/// обычным сеансом. Поэтому после команды закрываем старый план и строим
+/// новый — иначе восстановление не появилось бы в «Изменениях».
+#[tauri::command]
+async fn workspace_restore_phone_vault(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+    blocking(move || restore_phone_vault_paths(&app, vec![path])).await
+}
+
+/// Вернуть несколько треков из корзины телефона за один сеанс: телефон
+/// создаёт операцию добавления на каждый путь, ПК строит общий план.
+#[tauri::command]
+async fn workspace_restore_phone_vault_many(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    blocking(move || restore_phone_vault_paths(&app, paths)).await
 }
 
 /// Попросить телефон почистить корзину. Возвращает, сколько строк и файлов
@@ -2020,31 +2062,45 @@ async fn workspace_phone_vault_clear(app: tauri::AppHandle) -> Result<Value, Str
     blocking(move || phone_vault_prune(&app, AgentMsg::ClearVault)).await
 }
 
-/// Вернуть путь в синхронизацию. Старый план построен без этого пути, поэтому
-/// закрываем сеанс и сразу открываем новый: путь возвращается в «Изменения» без
-/// ручной проверки. Если телефон недоступен, исключение всё равно снято —
-/// ошибка связи показывается в статусе, а план построится при следующей проверке.
+/// Общая часть одиночного и массового возврата в синхронизацию. Старый план
+/// построен без этих путей, поэтому закрываем сеанс и сразу открываем новый:
+/// пути возвращаются в «Изменения» без ручной проверки. Если телефон
+/// недоступен, исключение всё равно снято — ошибка связи показывается в
+/// статусе, а план построится при следующей проверке.
+fn undo_exclusions(app: &tauri::AppHandle, paths: Vec<String>) -> Result<Value, String> {
+    let mut replica = workspace_replica()?;
+    let config = load_config();
+    let peer_dev = config.agent.as_ref().map(|link| link.dev.clone());
+    for path in &paths {
+        resolve::undo_exclusion(&mut replica, path, peer_dev.as_deref())
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    let desktop = app.state::<Desktop>();
+    let mut ws = desktop
+        .workspace
+        .lock()
+        .map_err(|_| "состояние синхронизации недоступно".to_string())?;
+    ws.close();
+    ws.session_error = match ensure_preview(app, &mut ws, &mut replica) {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+    Ok(workspace_payload(app, &replica, &ws))
+}
+
 #[tauri::command]
 async fn workspace_exclusion_undo(app: tauri::AppHandle, path: String) -> Result<Value, String> {
-    blocking(move || {
-        let mut replica = workspace_replica()?;
-        let config = load_config();
-        let peer_dev = config.agent.as_ref().map(|link| link.dev.clone());
-        resolve::undo_exclusion(&mut replica, &path, peer_dev.as_deref())
-            .map_err(|error| format!("{error:#}"))?;
-        let desktop = app.state::<Desktop>();
-        let mut ws = desktop
-            .workspace
-            .lock()
-            .map_err(|_| "состояние синхронизации недоступно".to_string())?;
-        ws.close();
-        ws.session_error = match ensure_preview(&app, &mut ws, &mut replica) {
-            Ok(()) => None,
-            Err(error) => Some(error),
-        };
-        Ok(workspace_payload(&app, &replica, &ws))
-    })
-    .await
+    blocking(move || undo_exclusions(&app, vec![path])).await
+}
+
+/// Снять исключение сразу с нескольких путей: один пересбор плана на всю
+/// пачку вместо отдельного сеанса для каждой строки.
+#[tauri::command]
+async fn workspace_exclusion_undo_many(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    blocking(move || undo_exclusions(&app, paths)).await
 }
 
 #[tauri::command]
@@ -2373,11 +2429,14 @@ pub fn run() {
             workspace_progress,
             workspace_commit,
             workspace_restore,
+            workspace_restore_many,
             workspace_phone_vault,
             workspace_restore_phone_vault,
+            workspace_restore_phone_vault_many,
             workspace_phone_vault_gc,
             workspace_phone_vault_clear,
             workspace_exclusion_undo,
+            workspace_exclusion_undo_many,
             workspace_gc,
             workspace_clear_vault,
             workspace_close,
