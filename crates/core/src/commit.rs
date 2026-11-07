@@ -1175,6 +1175,7 @@ mod tests {
     use super::*;
     use crate::plan::{self, PathDecision};
     use crate::store::PathState;
+    use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1250,6 +1251,84 @@ mod tests {
             .unwrap_or_else(|| panic!("нет состояния для {path}"))
     }
 
+    /// Инварианты раздела 4, которые должны держаться после каждого commit.
+    fn assert_invariants(replica: &Replica) {
+        let mut paths = HashSet::new();
+        for row in replica.path_states().unwrap() {
+            assert!(
+                paths.insert(row.path.clone()),
+                "путь повторяется в path_state: {}",
+                row.path
+            );
+            if row.pending_hlc.is_some() {
+                assert_eq!(
+                    row.state,
+                    PathState::Missing,
+                    "pending_hlc допустим только у Missing: {}",
+                    row.path
+                );
+            }
+            match row.state {
+                PathState::Missing => {
+                    assert!(!row.present, "Missing не может быть present: {}", row.path);
+                }
+                PathState::ExcludedLocal | PathState::ResurrectingLocal => {
+                    assert!(row.present, "локальное исключение требует present: {}", row.path);
+                }
+                PathState::ExcludedRemote | PathState::ResurrectingRemote => {
+                    assert!(
+                        !row.present,
+                        "удалённое исключение требует present=0: {}",
+                        row.path
+                    );
+                }
+                PathState::Live | PathState::Tombstone => {
+                    assert!(
+                        row.created_at.is_none(),
+                        "created_at только у исключений: {}",
+                        row.path
+                    );
+                }
+            }
+        }
+
+        // Tombstone не показывает удалённый payload в совместимой проекции.
+        for entry in replica.entries().unwrap() {
+            if entry.deleted {
+                assert!(entry.blob.is_empty(), "tombstone с блобом: {}", entry.path);
+                assert_eq!(entry.size, 0, "tombstone с размером: {}", entry.path);
+                assert_eq!(entry.mtime_ns, 0, "tombstone с mtime: {}", entry.path);
+                assert_eq!(entry.added_at, 0, "tombstone с added_at: {}", entry.path);
+            }
+        }
+
+        // Проекции состояний взаимоисключающие.
+        let pending: HashSet<String> = replica
+            .pending_deletes()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        let excluded = replica.exclusion_paths().unwrap();
+        let resurrecting = replica.resurrection_paths().unwrap();
+        for path in &pending {
+            assert!(
+                !excluded.contains(path),
+                "путь одновременно Missing и Excluded: {path}"
+            );
+            assert!(
+                !resurrecting.contains(path),
+                "путь одновременно Missing и Resurrecting: {path}"
+            );
+        }
+        for path in &excluded {
+            assert!(
+                !resurrecting.contains(path),
+                "путь одновременно Excluded и Resurrecting: {path}"
+            );
+        }
+    }
+
     /// Прогнать commit: план строится по `preview_ops`, а в `finalize`
     /// приходят операции, которые пир подготовил после решения.
     fn run(
@@ -1277,6 +1356,7 @@ mod tests {
         let prepared = prepare(&mut f.replica, &plan, &resolution).unwrap();
         apply_local(&mut f.replica, &plan, &resolution, &prepared).unwrap();
         finalize(&mut f.replica, &plan, &resolution, decision_ops).unwrap();
+        assert_invariants(&f.replica);
         plan
     }
 

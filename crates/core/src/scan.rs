@@ -901,6 +901,47 @@ mod tests {
         assert!(!lost.present);
     }
 
+    /// Пункт 15 раздела 10: после полного сброса истории первый скан
+    /// начинает путь заново (`base=None`), а старые операции и решения
+    /// не воскрешают исчезнувшие пути.
+    #[test]
+    fn first_scan_after_full_reset_starts_a_new_life() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut replica = Replica::in_memory("dev-a").unwrap();
+
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        scan(root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+        let blob = state(&replica, "track.flac").blob;
+        assert_eq!(state(&replica, "track.flac").base.as_deref(), Some(blob.as_str()));
+
+        // Старое решение по пути, которого уже нет на диске.
+        let del = replica
+            .make_op(OpKind::EntryDel {
+                path: "old.flac".into(),
+            })
+            .unwrap();
+        replica.apply(&del).unwrap();
+        assert_eq!(state(&replica, "old.flac").state, PathState::Tombstone);
+        assert!(replica.op_count().unwrap() > 0);
+
+        replica.reset_history().unwrap();
+        assert_eq!(replica.op_count().unwrap(), 0);
+        assert!(replica.path_states().unwrap().is_empty());
+
+        scan(root, &mut replica).unwrap();
+        let row = state(&replica, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base, None, "после сброса это новая жизнь");
+        assert!(row.present);
+        assert_eq!(row.blob, blob);
+        assert!(
+            replica.path_state("old.flac").unwrap().is_none(),
+            "старое решение не должно воскрешать путь"
+        );
+    }
+
     #[test]
     fn downloaded_peer_addition_becomes_a_common_base() {
         let tmp = TempDir::new().unwrap();

@@ -125,6 +125,61 @@ fn two_devices_converge_and_deletions_stay_local() {
     assert!(!on_a.deleted, "файл на ПК должен остаться");
 }
 
+/// Пункт 15 раздела 10: после полного сброса на обоих устройствах первый
+/// скан начинает заново, а старые операции не воскрешают исчезнувшие пути.
+#[test]
+fn full_reset_on_both_devices_starts_a_new_life() {
+    let ctx = setup();
+    let mut a = Replica::open(&ctx.tmp.path().join("data_a"), "dev-a").unwrap();
+    a.set_root(&ctx.root_a).unwrap();
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    a.confirm_synced().unwrap();
+
+    let mut b = Replica::open(&ctx.tmp.path().join("data_b"), "dev-b").unwrap();
+    b.set_root(&ctx.root_b).unwrap();
+    sync_via_pipe(&mut a, &mut b, &ctx.pipe_dir);
+    copy_tree(&ctx.root_a, &ctx.root_b);
+    scan::scan(&ctx.root_b, &mut b).unwrap();
+    sync_via_pipe(&mut a, &mut b, &ctx.pipe_dir);
+    assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
+
+    // Один файл исчез с обоих устройств ещё до сброса.
+    fs::remove_file(ctx.root_a.join("Album/01.flac")).unwrap();
+    fs::remove_file(ctx.root_b.join("Album/01.flac")).unwrap();
+
+    a.reset_history().unwrap();
+    b.reset_history().unwrap();
+    assert_eq!(a.op_count().unwrap(), 0);
+    assert_eq!(b.op_count().unwrap(), 0);
+    assert!(a.path_states().unwrap().is_empty());
+    assert!(b.path_states().unwrap().is_empty());
+
+    scan::scan(&ctx.root_a, &mut a).unwrap();
+    scan::scan(&ctx.root_b, &mut b).unwrap();
+    for replica in [&a, &b] {
+        let rows = replica.path_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "Album/02.flac");
+        assert_eq!(rows[0].state.as_str(), "live");
+        assert!(rows[0].base.is_none(), "после сброса это новая жизнь");
+        assert!(rows[0].present);
+        assert!(
+            !replica
+                .entries()
+                .unwrap()
+                .iter()
+                .any(|row| row.path == "Album/01.flac"),
+            "старые операции не должны воскрешать удалённый путь"
+        );
+    }
+    // Содержимое совпадает; mtime после копирования разный, поэтому хеши
+    // сойдутся только после первого обмена — это нормальный первый скан.
+    assert_eq!(
+        a.entry("Album/02.flac").unwrap().unwrap().blob,
+        b.entry("Album/02.flac").unwrap().unwrap().blob
+    );
+}
+
 #[test]
 fn rescan_is_cheap_and_stable() {
     let ctx = setup();
