@@ -1,22 +1,26 @@
 ﻿//! Разрешение ожидающих удалений — единственное место, где рождается `entry_del`.
 //!
-//! Удаление файла на устройстве ничего не реплицирует: сканер кладёт запись в
-//! `pending_deletes`. Операция удаления появляется только после явного решения
-//! пользователя. Поэтому «главное устройство» не нужно: приоритет у решения
-//! человека, а не у железа.
+//! Удаление файла на устройстве ничего не реплицирует: сканер переводит путь в
+//! `Missing` и хранит `pending_hlc`. Операция удаления появляется только после
+//! явного решения пользователя. Поэтому «главное устройство» не нужно:
+//! приоритет у решения человека, а не у железа.
 //!
 //! Решение принимается по **блобам**, а не по путям. Если трек на другом
 //! устройстве успели перенести в другую папку, «удалить везде» всё равно
 //! удалит все его копии, а «только здесь» не тронет общую библиотеку.
+//!
+//! Здесь же живёт отмена исключения: она переводит `Excluded*` в
+//! `ResurrectingLocal`/`ResurrectingRemote` (см. `docs/path-state.md`, 5.5).
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+use crate::hlc::Hlc;
 use crate::op::OpKind;
 use crate::plan::{Decision, PathDecision};
 use crate::scan;
-use crate::store::Replica;
+use crate::store::{PathState, Replica};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -41,9 +45,8 @@ pub struct Outcome {
 /// Применяет решение к ожидающей записи.
 pub fn resolve(replica: &mut Replica, path: &str, action: Action) -> Result<Outcome> {
     let pending = replica
-        .pending_deletes()?
-        .into_iter()
-        .find(|p| p.path == path)
+        .path_state(path)?
+        .filter(|row| row.state == PathState::Missing && row.pending_hlc.is_some())
         .with_context(|| format!("нет ожидающего удаления для {path}"))?;
 
     let root = replica.root()?.context("корень библиотеки не задан")?;
@@ -81,7 +84,6 @@ fn delete_everywhere(
         let kind = OpKind::EntryDel { path: path.clone() };
         let op = replica.make_op(kind)?;
         replica.apply(&op)?;
-        replica.clear_pending_delete(&path)?;
         if path != origin || !moved_elsewhere {
             out.deleted_paths.push(path.clone());
         }
@@ -95,9 +97,14 @@ fn delete_everywhere(
 
     // Ожидания, указывавшие на этот блоб под другими путями, больше не нужны.
     // Неудачные пути оставляем в очереди — их можно повторить.
-    for p in replica.pending_deletes()? {
-        if p.blob == blob && !failed.contains(&p.path) {
-            replica.clear_pending_delete(&p.path)?;
+    for mut row in replica.path_states()? {
+        if row.blob == blob && !failed.contains(&row.path) && row.pending_hlc.is_some() {
+            row.pending_hlc = None;
+            if row.state == PathState::Missing {
+                row.state = PathState::Live;
+                row.created_at = None;
+            }
+            replica.save_path_state(&row)?;
         }
     }
 
@@ -106,8 +113,16 @@ fn delete_everywhere(
 
 fn only_here(replica: &mut Replica, path: &str, root: &Path) -> Result<Outcome> {
     let mut out = Outcome::default();
-    replica.set_ignored(path, true)?;
-    replica.clear_pending_delete(path)?;
+    let Some(mut row) = replica.path_state(path)? else {
+        bail!("путь не найден в библиотеке: {path}");
+    };
+    // «Только здесь» — исключение на стороне пира: файл остался в общей
+    // библиотеке, но на это устройство больше не вернётся.
+    row.state = PathState::ExcludedRemote;
+    row.present = false;
+    row.pending_hlc = None;
+    row.created_at = Some(Hlc::wall_ms());
+    replica.save_path_state(&row)?;
     out.ignored_paths.push(path.to_string());
 
     // Файла уже нет (иначе он не был бы в ожидании), но если он здесь —
@@ -123,119 +138,161 @@ fn only_here(replica: &mut Replica, path: &str, root: &Path) -> Result<Outcome> 
 /// обмене с тем, у кого он есть; если запись удалена везде — берём копию
 /// из корзины.
 pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
-    match replica.entry(path)? {
-        Some(e) if e.deleted => crate::vault::restore(replica, path),
-        Some(_) => {
-            replica.set_ignored(path, false)?;
-            replica.mark_absent(path)?;
-            replica.clear_pending_delete(path)?;
-            Ok(())
-        }
-        None => bail!("путь не найден в библиотеке: {path}"),
+    let Some(row) = replica.path_state(path)? else {
+        bail!("путь не найден в библиотеке: {path}");
+    };
+    if row.state.is_tombstone() {
+        return crate::vault::restore(replica, path);
     }
+    if row.state.is_excluded() {
+        let out = undo_exclusion(replica, path, None)?;
+        if out.lost {
+            bail!("«{path}» потерян: копии нет ни здесь, ни у пира");
+        }
+        return Ok(());
+    }
+    // Путь и так в синхронизации: снимаем только ожидание удаления.
+    if row.pending_hlc.is_some() {
+        let mut row = row;
+        row.pending_hlc = None;
+        if row.state == PathState::Missing {
+            row.state = PathState::Live;
+            row.created_at = None;
+        }
+        replica.save_path_state(&row)?;
+    }
+    Ok(())
 }
 
 /// Что произошло при отмене исключения. Нужно интерфейсу и тестам, чтобы
-/// отличить «файл остался здесь» от «файл придёт от пира».
+/// отличить «файл остался здесь» от «файл придёт от пира» и от потери.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UndoOutcome {
     /// Уцелевшая копия лежит на этом устройстве и возвращена как добавление.
     pub kept_local: bool,
     /// Здесь файла нет: копию нужно забрать у пира.
     pub waiting_remote: bool,
+    /// Копии нет ни здесь, ни у пира: путь переведён в `Tombstone`.
+    pub lost: bool,
 }
 
-/// Снимает исключение и возвращает путь в синхронизацию.
+/// Снимает исключение и возвращает путь в синхронизацию (раздел 5.5).
 ///
-/// Сторона, где файл уцелел, должна сообщить об этом второй стороне, а
-/// сторона без файла — попросить его заново. Простого удаления строки
-/// `exclusions` недостаточно: у пира мог остаться `pending_delete` или
-/// `OnlyHere`, и путь снова выглядел бы удалённым.
+/// Сторона, где файл уцелел, сообщает об этом пиру свежим `EntryPut`, а
+/// сторона без файла ждёт копию от пира. Старое `OnlyHere` перебивается
+/// `Unset` у всех известных пиров: иначе при следующем слиянии решений
+/// исключение вернулось бы.
 pub fn undo_exclusion(
     replica: &mut Replica,
     path: &str,
     peer_dev: Option<&str>,
 ) -> Result<UndoOutcome> {
     let mut out = UndoOutcome::default();
-    let Some(exclusion) = replica.exclusion(path)? else {
-        // Повторная отмена — не ошибка: исключение уже снято.
+    let Some(mut row) = replica.path_state(path)? else {
         return Ok(out);
     };
-    replica.remove_exclusion(path)?;
-    // `local_ignored` — старый механизм; после явных исключений он мог
-    // остаться от прежних версий и продолжил бы скрывать путь.
-    replica.clear_ignored(path)?;
+    if !row.state.is_excluded() {
+        // Повторная отмена — не ошибка: исключение уже снято.
+        return Ok(out);
+    }
 
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let disk = disk_path(&root, path);
-    let entry = replica.entry(path)?;
+    let now = Hlc::wall_ms();
 
     if disk.is_file() {
-        // Копия уцелела здесь. Свежий `EntryPut` делает её добавлением для
-        // пира: старый `pending_delete` пира получит более новый HLC и
-        // перестанет считаться удалением. `synced_blob` сбрасываем, иначе
-        // план счёл бы файл уже согласованным и не отправил его.
+        // Копия уцелела здесь. Сначала выводим путь из исключения: операции
+        // по исключённым путям не применяются. Затем свежий `EntryPut` делает
+        // файл добавлением для пира — старый `pending_delete` получит более
+        // новый HLC и перестанет считаться удалением.
         let blob = scan::hash_file(&disk)?;
         let meta = std::fs::metadata(&disk)?;
         let size = meta.len();
         let mtime_ns = scan::mtime_ns_public(&meta);
-        let kind = OpKind::EntryPut {
+
+        row.state = PathState::ResurrectingLocal;
+        row.base = None;
+        row.blob = blob.clone();
+        row.size = size;
+        row.mtime_ns = mtime_ns;
+        row.present = true;
+        row.pending_hlc = None;
+        row.created_at = Some(now);
+        replica.save_path_state(&row)?;
+
+        let op = replica.make_op(OpKind::EntryPut {
             path: path.to_string(),
-            blob: blob.clone(),
+            blob,
             size,
             mtime_ns,
-            added_at: crate::Hlc::wall_ms(),
-        };
-        let op = replica.make_op(kind)?;
+            added_at: now,
+        })?;
         replica.apply(&op)?;
-        replica.mark_present(path)?;
-        replica.clear_pending_delete(path)?;
-        replica.forget_synced_base(path)?;
-        replica.add_resurrection(path, "local", &blob, size, mtime_ns)?;
         out.kept_local = true;
-    } else if let Some(entry) = entry.filter(|entry| !entry.deleted && !entry.blob.is_empty()) {
-        // Здесь файла нет, но у пира он остался. Маркер заставляет план
-        // показать добавление с его стороны и не отправлять пиру наше
-        // мягкое удаление, пока блоб не доехал.
-        replica.clear_pending_delete(path)?;
-        replica.mark_absent(path)?;
-        replica.add_resurrection(
-            path,
-            "remote",
-            &entry.blob,
-            entry.size,
-            entry.mtime_ns,
-        )?;
+    } else if !row.blob.is_empty() {
+        // Здесь файла нет, но блоб известен: копию должен прислать пир.
+        // Маркер заставляет план показать добавление с его стороны.
+        row.state = PathState::ResurrectingRemote;
+        row.present = false;
+        row.pending_hlc = None;
+        row.created_at = Some(now);
+        replica.save_path_state(&row)?;
         out.waiting_remote = true;
+    } else {
+        // Ни здесь, ни у пира копии нет: не висим в ожидании, а честно
+        // фиксируем потерю.
+        row.state = PathState::Tombstone;
+        row.present = false;
+        row.pending_hlc = None;
+        row.created_at = None;
+        replica.save_path_state(&row)?;
+        out.lost = true;
     }
 
-    // Старое `OnlyHere` должно уступить отмене и на пире. `Unset` хранится с
-    // новым HLC, поэтому переживает переподключение и перебивает решение,
-    // которое иначе снова исключило бы путь.
-    if let Some(peer) = peer_dev {
-        let mut set = replica.load_decisions(peer)?;
+    unset_decisions(replica, path, &row.blob, peer_dev)?;
+    Ok(out)
+}
+
+/// Записать `Unset` всем известным пирам: исключения глобальны, а решения
+/// хранятся per-peer. Иначе другой пир снова прислал бы `OnlyHere`.
+fn unset_decisions(
+    replica: &mut Replica,
+    path: &str,
+    blob: &str,
+    peer_dev: Option<&str>,
+) -> Result<()> {
+    let mut peers: BTreeSet<String> = replica
+        .known_peers()?
+        .into_iter()
+        .map(|peer| peer.dev)
+        .collect();
+    if let Some(dev) = peer_dev {
+        peers.insert(dev.to_string());
+    }
+    for peer in peers {
+        let mut set = replica.load_decisions(&peer)?;
         if set
             .get(path)
-            .is_some_and(|decision| decision.action != Decision::Unset)
+            .is_some_and(|decision| decision.action == Decision::Unset)
         {
-            let blob = set
-                .get(path)
-                .map(|decision| decision.blob.clone())
-                .filter(|blob| !blob.is_empty())
-                .unwrap_or_else(|| exclusion.blob.clone());
-            let decision = PathDecision {
-                path: path.to_string(),
-                action: Decision::Unset,
-                blob,
-                hlc: replica.next_hlc()?,
-                dev: replica.device_id().to_string(),
-            };
-            set.entries.insert(path.to_string(), decision);
-            replica.save_decisions(peer, &set)?;
+            continue;
         }
+        let blob = set
+            .get(path)
+            .map(|decision| decision.blob.clone())
+            .filter(|blob| !blob.is_empty())
+            .unwrap_or_else(|| blob.to_string());
+        let decision = PathDecision {
+            path: path.to_string(),
+            action: Decision::Unset,
+            blob,
+            hlc: replica.next_hlc()?,
+            dev: replica.device_id().to_string(),
+        };
+        set.entries.insert(path.to_string(), decision);
+        replica.save_decisions(&peer, &set)?;
     }
-
-    Ok(out)
+    Ok(())
 }
 
 /// Удаляет файл и опустевшие каталоги. Отсутствие файла — не ошибка.
@@ -284,10 +341,10 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
     // переименованный только по регистру/Unicode: на Windows/macOS старый путь
     // указывает на тот же самый файл, что и новый.
     let live_keys: HashMap<String, String> = replica
-        .live_entries()?
+        .path_states()?
         .into_iter()
-        .filter(|e| replica.is_present(&e.path).unwrap_or(false))
-        .map(|e| (crate::path::key(&e.path), e.path))
+        .filter(|row| !row.state.is_tombstone() && row.present)
+        .map(|row| (crate::path::key(&row.path), row.path))
         .collect();
 
     let rows = replica.deleted_present()?;
@@ -299,13 +356,13 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
                     "не удаляю «{path}»: это тот же файл, что живой «{other}» \
                      (различие только в регистре/Unicode)"
                 );
-                replica.mark_absent(&path)?;
+                set_present(replica, &path, false)?;
                 continue;
             }
         }
         let abs = disk_path(root, &path);
         if !abs.is_file() {
-            replica.mark_absent(&path)?;
+            set_present(replica, &path, false)?;
             continue;
         }
         let on_disk = scan::hash_file(&abs);
@@ -319,7 +376,7 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
                 }
                 std::fs::remove_file(&abs)
                     .with_context(|| format!("удаление {}", abs.display()))?;
-                replica.mark_absent(&path)?;
+                set_present(replica, &path, false)?;
                 prune_empty_dirs(root, abs.parent());
             }
             Ok(_) => {
@@ -342,7 +399,7 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
                 };
                 let op = replica.make_op(kind)?;
                 replica.apply(&op)?;
-                replica.mark_absent(&path)?;
+                set_present(replica, &path, false)?;
                 saved.push(conflict);
             }
             Err(_) => {
@@ -354,10 +411,210 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
     Ok(saved)
 }
 
+/// Поставить/снять `present`, не меняя состояние пути.
+fn set_present(replica: &Replica, path: &str, present: bool) -> Result<()> {
+    let Some(mut row) = replica.path_state(path)? else {
+        return Ok(());
+    };
+    if row.present != present {
+        row.present = present;
+        replica.save_path_state(&row)?;
+    }
+    Ok(())
+}
+
 pub fn disk_path(root: &Path, rel: &str) -> std::path::PathBuf {
     let mut p = root.to_path_buf();
     for part in rel.split('/') {
         p.push(part);
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::PathStateRow;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _tmp: TempDir,
+        root: PathBuf,
+        replica: Replica,
+    }
+
+    fn fixture(files: &[(&str, &[u8])]) -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("music");
+        fs::create_dir_all(&root).unwrap();
+        for (rel, bytes) in files {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, bytes).unwrap();
+        }
+        let mut replica = Replica::open(&tmp.path().join("state"), "dev-a").unwrap();
+        replica.set_root(&root).unwrap();
+        replica.enable_exclusions();
+        scan::scan(&root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+        Fixture {
+            _tmp: tmp,
+            root,
+            replica,
+        }
+    }
+
+    fn blob_of(bytes: &[u8]) -> String {
+        format!("b3:{}", blake3::hash(bytes).to_hex())
+    }
+
+    fn state(f: &Fixture, path: &str) -> PathStateRow {
+        f.replica
+            .path_state(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("нет состояния для {path}"))
+    }
+
+    fn only_here_decision(blob: &str) -> PathDecision {
+        PathDecision {
+            path: "track.flac".into(),
+            action: Decision::OnlyHere,
+            blob: blob.into(),
+            hlc: Hlc::new(1, 0),
+            dev: "dev-a".into(),
+        }
+    }
+
+    // ------------------------------------------------------- отмена (раздел 5.5)
+
+    #[test]
+    fn undo_excluded_local_with_file_resurrects_local() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "local", &blob, 3, 1)
+            .unwrap();
+        assert_eq!(state(&f, "track.flac").state, PathState::ExcludedLocal);
+
+        let out = undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        assert!(out.kept_local);
+        assert!(!out.waiting_remote);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::ResurrectingLocal);
+        assert_eq!(row.base, None);
+        assert!(row.present);
+        assert_eq!(row.blob, blob);
+        assert_eq!(fs::read(f.root.join("track.flac")).unwrap(), b"one");
+        // Свежий EntryPut должен уехать пиру.
+        assert!(f
+            .replica
+            .ops()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::EntryPut { path, .. } if path == "track.flac")));
+    }
+
+    #[test]
+    fn undo_excluded_local_without_file_waits_for_remote() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "local", &blob, 3, 1)
+            .unwrap();
+        fs::remove_file(f.root.join("track.flac")).unwrap();
+        // Скан ещё не видел пропажу: состояние остаётся ExcludedLocal.
+        assert_eq!(state(&f, "track.flac").state, PathState::ExcludedLocal);
+
+        let out = undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        assert!(out.waiting_remote);
+        assert!(!out.kept_local);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::ResurrectingRemote);
+        assert!(!row.present);
+        assert_eq!(row.blob, blob);
+    }
+
+    #[test]
+    fn undo_excluded_remote_waits_for_remote() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "remote", &blob, 3, 1)
+            .unwrap();
+        fs::remove_file(f.root.join("track.flac")).unwrap();
+
+        let out = undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        assert!(out.waiting_remote);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::ResurrectingRemote);
+        assert!(!row.present);
+        assert_eq!(row.blob, blob);
+    }
+
+    #[test]
+    fn undo_without_any_known_copy_reports_loss() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        fs::remove_file(f.root.join("track.flac")).unwrap();
+        f.replica
+            .add_exclusion("track.flac", "remote", "", 0, 0)
+            .unwrap();
+
+        let out = undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        assert!(out.lost);
+        assert!(!out.kept_local && !out.waiting_remote);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::Tombstone);
+        assert!(!row.present);
+    }
+
+    #[test]
+    fn undo_writes_unset_to_every_known_peer() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        f.replica.add_peer("dev-b", "127.0.0.1:1", "Phone").unwrap();
+        f.replica.add_peer("dev-c", "127.0.0.1:2", "Tablet").unwrap();
+        for peer in ["dev-b", "dev-c"] {
+            let mut set = f.replica.load_decisions(peer).unwrap();
+            set.entries
+                .insert("track.flac".into(), only_here_decision(&blob));
+            f.replica.save_decisions(peer, &set).unwrap();
+        }
+        f.replica
+            .add_exclusion("track.flac", "local", &blob, 3, 1)
+            .unwrap();
+
+        undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        for peer in ["dev-b", "dev-c"] {
+            let set = f.replica.load_decisions(peer).unwrap();
+            assert_eq!(
+                set.get("track.flac").unwrap().action,
+                Decision::Unset,
+                "Unset должен уехать пиру {peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_undo_is_a_no_op() {
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "local", &blob, 3, 1)
+            .unwrap();
+        undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        let out = undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+
+        assert!(!out.kept_local && !out.waiting_remote && !out.lost);
+        assert_eq!(state(&f, "track.flac").state, PathState::ResurrectingLocal);
+    }
 }

@@ -18,7 +18,7 @@ use crate::hlc::Hlc;
 use crate::op::OpKind;
 use crate::resolve::{disk_path, prune_empty_dirs};
 use crate::scan;
-use crate::store::{Replica, VaultRow};
+use crate::store::{PathState, Replica, VaultRow};
 
 /// Сколько дней хранить удалённое по умолчанию.
 pub const DEFAULT_TTL_DAYS: u64 = 30;
@@ -115,14 +115,14 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
         .context("корзина доступна только для реплики на диске")?;
     let root = replica.root()?.context("корень библиотеки не задан")?;
 
-    let row = match replica.vault_for_path(path)? {
+    let vault_row = match replica.vault_for_path(path)? {
         Some(r) => r,
         None => bail!("«{path}» удалён, и копии в корзине нет — восстановить нечем"),
     };
 
-    let src = vault_blob_path(&data_dir, &row.blob);
+    let src = vault_blob_path(&data_dir, &vault_row.blob);
     if !src.is_file() {
-        replica.remove_vault_row(&row.blob, &row.path)?;
+        replica.remove_vault_row(&vault_row.blob, &vault_row.path)?;
         bail!("«{path}» удалён, но файл корзины потерян — восстановить нечем");
     }
 
@@ -134,31 +134,35 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
     // На пути уже может лежать новый файл с тем же именем: скачали заново или
     // создали вручную. Восстановление не имеет права его перезаписать, поэтому
     // занятую версию сохраняем рядом как conflict-copy.
-    if dst.is_file() && scan::hash_file(&dst).ok().as_deref() != Some(row.blob.as_str()) {
+    if dst.is_file() && scan::hash_file(&dst).ok().as_deref() != Some(vault_row.blob.as_str()) {
         crate::commit::save_conflict_copy(replica, &root, &dst, path)?;
     }
     // Копия, а не hardlink: восстановленный файл будут править тегами, и он не
     // должен менять содержимое корзины (там может лежать тот же блоб).
     std::fs::copy(&src, &dst).with_context(|| format!("восстановление {}", dst.display()))?;
-    scan::restore_mtime(&dst, row.mtime_ns)?;
+    scan::restore_mtime(&dst, vault_row.mtime_ns)?;
 
     let kind = OpKind::EntryPut {
         path: path.to_string(),
-        blob: row.blob.clone(),
-        size: row.size,
-        mtime_ns: row.mtime_ns,
-        added_at: row.added_at,
+        blob: vault_row.blob.clone(),
+        size: vault_row.size,
+        mtime_ns: vault_row.mtime_ns,
+        added_at: vault_row.added_at,
     };
     let op = replica.make_op(kind)?;
     replica.apply(&op)?;
-    replica.set_ignored(path, false)?;
-    replica.mark_present(path)?;
-    replica.clear_pending_delete(path)?;
-    // Удаление уже согласовано с пиром, так что старой общей базы у пути
-    // больше нет: возвращённый файл должен снова попасть в очередь как
-    // локальное добавление, а не считаться неизменившимся.
-    replica.forget_synced_base(path)?;
-    replica.remove_vault_row(&row.blob, &row.path)?;
+    // `Tombstone` → `Live { base=None, present=1 }`: удаление уже было общим
+    // фактом, поэтому возвращённый файл — новая жизнь, а не правка старой
+    // базы. План должен снова показать его как добавление.
+    if let Some(mut row) = replica.path_state(path)? {
+        row.state = PathState::Live;
+        row.base = None;
+        row.present = true;
+        row.pending_hlc = None;
+        row.created_at = None;
+        replica.save_path_state(&row)?;
+    }
+    replica.remove_vault_row(&vault_row.blob, &vault_row.path)?;
     Ok(())
 }
 
@@ -256,6 +260,44 @@ pub fn gc(replica: &Replica, ttl_days: u64) -> Result<GcReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn restore_brings_tombstone_back_as_a_new_life() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("music");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("track.flac"), b"one").unwrap();
+        let mut replica = Replica::open(&tmp.path().join("state"), "dev-a").unwrap();
+        replica.set_root(&root).unwrap();
+        scan::scan(&root, &mut replica).unwrap();
+        replica.confirm_synced().unwrap();
+
+        // Подтверждённое удаление: копия в корзине, состояние Tombstone.
+        preserve_file(&replica, &root, "track.flac").unwrap();
+        let op = replica
+            .make_op(OpKind::EntryDel {
+                path: "track.flac".into(),
+            })
+            .unwrap();
+        replica.apply(&op).unwrap();
+        fs::remove_file(root.join("track.flac")).unwrap();
+        assert_eq!(
+            replica.path_state("track.flac").unwrap().unwrap().state,
+            PathState::Tombstone
+        );
+
+        restore(&mut replica, "track.flac").unwrap();
+
+        let row = replica.path_state("track.flac").unwrap().unwrap();
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base, None, "возврат — новая жизнь, а не правка базы");
+        assert!(row.present);
+        assert!(row.pending_hlc.is_none());
+        assert_eq!(fs::read(root.join("track.flac")).unwrap(), b"one");
+        assert!(replica.vault_rows().unwrap().is_empty());
+    }
 
     #[test]
     fn blob_key_is_windows_safe() {

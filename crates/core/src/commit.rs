@@ -866,6 +866,16 @@ pub fn finalize(
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
+    // Возврат, который пользователь отклонил, снова становится исключением.
+    // Запоминаем до применения операций пира: `EntryPut` может превратить
+    // `ResurrectingRemote` в `Live` раньше, чем мы посмотрим на решение.
+    let resurrecting_remote: HashSet<String> = replica
+        .path_states()?
+        .into_iter()
+        .filter(|row| row.state == PathState::ResurrectingRemote)
+        .map(|row| row.path)
+        .collect();
+
     // Операции по исключённым путям не применяем: иначе чужое добавление
     // создало бы у нас запись, а чужое удаление убрало бы файл, который
     // человек решил оставить. Watermark по ним не двигается, поэтому после
@@ -943,6 +953,32 @@ pub fn finalize(
                 outcome.accepted += 1;
             }
             _ => outcome.rejected += 1,
+        }
+    }
+
+    // Отказ от возврата: путь снова исключён на стороне пира, а не висит в
+    // `ResurrectingRemote`. `Accept` раскладывает копию и снимает маркер,
+    // `OnlyHere` уже исключил путь в `apply_local`, `DeleteEverywhere` удаляет.
+    for change in &plan.remote {
+        if !resurrecting_remote.contains(&change.path) {
+            continue;
+        }
+        let decision = resolution.action(&change.path).unwrap_or(Decision::Keep);
+        if matches!(
+            decision,
+            Decision::Accept | Decision::OnlyHere | Decision::DeleteEverywhere
+        ) {
+            continue;
+        }
+        let Some(mut row) = replica.path_state(&change.path)? else {
+            continue;
+        };
+        if matches!(row.state, PathState::Live | PathState::ResurrectingRemote) {
+            row.state = PathState::ExcludedRemote;
+            row.present = false;
+            row.pending_hlc = None;
+            row.created_at = None;
+            replica.save_path_state(&row)?;
         }
     }
 
@@ -1599,5 +1635,73 @@ mod tests {
         assert_eq!(row.base, Some(blob_of(b"remote")));
         assert!(row.present);
         assert_eq!(fs::read(f.root.join("track.flac")).unwrap(), b"remote");
+    }
+
+    // ------------------------------------------------------- возврат (раздел 5.5)
+
+    #[test]
+    fn commit_resurrecting_local_accept_and_revert() {
+        // Accept: возвращённая копия становится согласованной базой.
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        let row = state(&f, "track.flac");
+        f.replica
+            .add_resurrection("track.flac", "local", &blob, row.size, row.mtime_ns)
+            .unwrap();
+        let plan = run(&mut f, &[], &[], &[("track.flac", Decision::Accept, "dev-a")]);
+        assert_eq!(plan.local[0].kind, ChangeKind::Added);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base.as_deref(), Some(blob.as_str()));
+        assert!(row.present);
+        assert!(f.root.join("track.flac").is_file());
+
+        // Revert: файл снова удаляется и попадает в корзину.
+        let mut f = fixture(&[("track.flac", b"one")]);
+        let blob = blob_of(b"one");
+        let row = state(&f, "track.flac");
+        f.replica
+            .add_resurrection("track.flac", "local", &blob, row.size, row.mtime_ns)
+            .unwrap();
+        run(&mut f, &[], &[], &[("track.flac", Decision::Revert, "dev-a")]);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::Tombstone);
+        assert!(!row.present);
+        assert!(!f.root.join("track.flac").exists());
+        assert!(f.replica.vault_for_path("track.flac").unwrap().is_some());
+    }
+
+    #[test]
+    fn commit_resurrecting_remote_accept_and_reject() {
+        // Accept: копия скачивается, путь снова живой.
+        let mut f = fixture(&[]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "remote", &blob, 3, 1)
+            .unwrap();
+        let out = resolve::undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+        assert!(out.waiting_remote);
+        stage(&f.replica, b"one");
+        let plan = run(&mut f, &[], &[], &[("track.flac", Decision::Accept, "dev-a")]);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Added);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::Live);
+        assert_eq!(row.base.as_deref(), Some(blob.as_str()));
+        assert!(row.present);
+        assert_eq!(fs::read(f.root.join("track.flac")).unwrap(), b"one");
+
+        // Keep: возврат отклонён, путь снова исключён и не висит в ожидании.
+        let mut f = fixture(&[]);
+        let blob = blob_of(b"one");
+        f.replica
+            .add_exclusion("track.flac", "remote", &blob, 3, 1)
+            .unwrap();
+        resolve::undo_exclusion(&mut f.replica, "track.flac", None).unwrap();
+        run(&mut f, &[], &[], &[("track.flac", Decision::Keep, "dev-a")]);
+        let row = state(&f, "track.flac");
+        assert_eq!(row.state, PathState::ExcludedRemote);
+        assert!(!row.present);
+        assert!(row.created_at.is_none());
+        assert!(!f.root.join("track.flac").exists());
     }
 }
