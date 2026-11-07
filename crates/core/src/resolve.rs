@@ -49,14 +49,24 @@ pub fn resolve(replica: &mut Replica, path: &str, action: Action) -> Result<Outc
     let root = replica.root()?.context("корень библиотеки не задан")?;
 
     match action {
-        Action::DeleteEverywhere => delete_everywhere(replica, &root, &pending.blob),
+        Action::DeleteEverywhere => delete_everywhere(replica, &root, &pending.blob, path),
         Action::OnlyHere => only_here(replica, path, &root),
     }
 }
 
-fn delete_everywhere(replica: &mut Replica, root: &Path, blob: &str) -> Result<Outcome> {
+fn delete_everywhere(
+    replica: &mut Replica,
+    root: &Path,
+    blob: &str,
+    origin: &str,
+) -> Result<Outcome> {
     let mut out = Outcome::default();
     let targets = replica.live_paths_by_blob(blob)?;
+    // Если трек успели перенести, среди целей есть и старый путь, по которому
+    // человек принял решение. Он уже исчез здесь; в отчёте оставляем только
+    // реально найденную живую копию, но операцию удаления шлём и по нему.
+    let moved_elsewhere = targets.iter().any(|path| path != origin)
+        && replica.moved_from(origin, blob)?;
     let mut failed: Vec<String> = Vec::new();
 
     for path in targets {
@@ -72,7 +82,9 @@ fn delete_everywhere(replica: &mut Replica, root: &Path, blob: &str) -> Result<O
         let op = replica.make_op(kind)?;
         replica.apply(&op)?;
         replica.clear_pending_delete(&path)?;
-        out.deleted_paths.push(path.clone());
+        if path != origin || !moved_elsewhere {
+            out.deleted_paths.push(path.clone());
+        }
         out.ops_emitted += 1;
 
         match remove_file(root, &path) {
