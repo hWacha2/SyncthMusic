@@ -689,6 +689,12 @@ impl Replica {
         Ok(())
     }
 
+    /// Записать одно состояние пути. Commit и undo сами реализуют переходы
+    /// из `docs/path-state.md`, поэтому им нужна запись строки целиком.
+    pub fn save_path_state(&self, row: &PathStateRow) -> Result<()> {
+        write_path_state(&self.conn, row)
+    }
+
     /// Сохранить замороженный план. Решения в JSON не входят: они живут
     /// отдельно и подмешиваются при загрузке.
     pub fn save_plan(&self, plan: &Plan) -> Result<()> {
