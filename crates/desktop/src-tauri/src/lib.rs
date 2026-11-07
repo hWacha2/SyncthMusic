@@ -17,7 +17,7 @@ use syncth_core::agent::{self, AgentIdentity, AgentMsg, AGENT_PROTO};
 use syncth_core::net::{CommitStage, PreviewSession, SYNC_PORT};
 use syncth_core::plan::{ChangeKind, Plan};
 use syncth_core::transport::Transport;
-use syncth_core::{scan, vault, Decision, Hlc, Replica};
+use syncth_core::{resolve, scan, vault, Decision, Hlc, Replica};
 use tauri::Manager;
 
 const SYNC_BIND: &str = "0.0.0.0:47887";
@@ -1787,6 +1787,11 @@ async fn workspace_commit(app: tauri::AppHandle) -> Result<Value, String> {
         clear_progress(&app);
         ws.close();
         ws.session_error = None;
+        // Успешный commit уже применил или отклонил все возвращаемые пути:
+        // маркеры больше не должны влиять на следующий план.
+        replica
+            .clear_resurrections()
+            .map_err(|error| format!("{error:#}"))?;
 
         let mut scanned = None;
         if let Ok(Some(root)) = replica.root() {
@@ -1972,8 +1977,9 @@ async fn workspace_phone_vault_clear(app: tauri::AppHandle) -> Result<Value, Str
 async fn workspace_exclusion_undo(app: tauri::AppHandle, path: String) -> Result<Value, String> {
     blocking(move || {
         let mut replica = workspace_replica()?;
-        replica
-            .remove_exclusion(&path)
+        let config = load_config();
+        let peer_dev = config.agent.as_ref().map(|link| link.dev.clone());
+        resolve::undo_exclusion(&mut replica, &path, peer_dev.as_deref())
             .map_err(|error| format!("{error:#}"))?;
         let desktop = app.state::<Desktop>();
         let mut ws = desktop

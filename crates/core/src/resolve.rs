@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::op::OpKind;
+use crate::plan::{Decision, PathDecision};
 use crate::scan;
 use crate::store::Replica;
 
@@ -120,6 +121,109 @@ pub fn restore(replica: &mut Replica, path: &str) -> Result<()> {
         }
         None => bail!("путь не найден в библиотеке: {path}"),
     }
+}
+
+/// Что произошло при отмене исключения. Нужно интерфейсу и тестам, чтобы
+/// отличить «файл остался здесь» от «файл придёт от пира».
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// Уцелевшая копия лежит на этом устройстве и возвращена как добавление.
+    pub kept_local: bool,
+    /// Здесь файла нет: копию нужно забрать у пира.
+    pub waiting_remote: bool,
+}
+
+/// Снимает исключение и возвращает путь в синхронизацию.
+///
+/// Сторона, где файл уцелел, должна сообщить об этом второй стороне, а
+/// сторона без файла — попросить его заново. Простого удаления строки
+/// `exclusions` недостаточно: у пира мог остаться `pending_delete` или
+/// `OnlyHere`, и путь снова выглядел бы удалённым.
+pub fn undo_exclusion(
+    replica: &mut Replica,
+    path: &str,
+    peer_dev: Option<&str>,
+) -> Result<UndoOutcome> {
+    let mut out = UndoOutcome::default();
+    let Some(exclusion) = replica.exclusion(path)? else {
+        // Повторная отмена — не ошибка: исключение уже снято.
+        return Ok(out);
+    };
+    replica.remove_exclusion(path)?;
+    // `local_ignored` — старый механизм; после явных исключений он мог
+    // остаться от прежних версий и продолжил бы скрывать путь.
+    replica.clear_ignored(path)?;
+
+    let root = replica.root()?.context("корень библиотеки не задан")?;
+    let disk = disk_path(&root, path);
+    let entry = replica.entry(path)?;
+
+    if disk.is_file() {
+        // Копия уцелела здесь. Свежий `EntryPut` делает её добавлением для
+        // пира: старый `pending_delete` пира получит более новый HLC и
+        // перестанет считаться удалением. `synced_blob` сбрасываем, иначе
+        // план счёл бы файл уже согласованным и не отправил его.
+        let blob = scan::hash_file(&disk)?;
+        let meta = std::fs::metadata(&disk)?;
+        let size = meta.len();
+        let mtime_ns = scan::mtime_ns_public(&meta);
+        let kind = OpKind::EntryPut {
+            path: path.to_string(),
+            blob: blob.clone(),
+            size,
+            mtime_ns,
+            added_at: crate::Hlc::wall_ms(),
+        };
+        let op = replica.make_op(kind)?;
+        replica.apply(&op)?;
+        replica.mark_present(path)?;
+        replica.clear_pending_delete(path)?;
+        replica.forget_synced_base(path)?;
+        replica.add_resurrection(path, "local", &blob, size, mtime_ns)?;
+        out.kept_local = true;
+    } else if let Some(entry) = entry.filter(|entry| !entry.deleted && !entry.blob.is_empty()) {
+        // Здесь файла нет, но у пира он остался. Маркер заставляет план
+        // показать добавление с его стороны и не отправлять пиру наше
+        // мягкое удаление, пока блоб не доехал.
+        replica.clear_pending_delete(path)?;
+        replica.mark_absent(path)?;
+        replica.add_resurrection(
+            path,
+            "remote",
+            &entry.blob,
+            entry.size,
+            entry.mtime_ns,
+        )?;
+        out.waiting_remote = true;
+    }
+
+    // Старое `OnlyHere` должно уступить отмене и на пире. `Unset` хранится с
+    // новым HLC, поэтому переживает переподключение и перебивает решение,
+    // которое иначе снова исключило бы путь.
+    if let Some(peer) = peer_dev {
+        let mut set = replica.load_decisions(peer)?;
+        if set
+            .get(path)
+            .is_some_and(|decision| decision.action != Decision::Unset)
+        {
+            let blob = set
+                .get(path)
+                .map(|decision| decision.blob.clone())
+                .filter(|blob| !blob.is_empty())
+                .unwrap_or_else(|| exclusion.blob.clone());
+            let decision = PathDecision {
+                path: path.to_string(),
+                action: Decision::Unset,
+                blob,
+                hlc: replica.next_hlc()?,
+                dev: replica.device_id().to_string(),
+            };
+            set.entries.insert(path.to_string(), decision);
+            replica.save_decisions(peer, &set)?;
+        }
+    }
+
+    Ok(out)
 }
 
 /// Удаляет файл и опустевшие каталоги. Отсутствие файла — не ошибка.

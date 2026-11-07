@@ -6,7 +6,7 @@
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::{Replica, ScanRow};
+use crate::store::{Replica, ResurrectionRow, ScanRow};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -141,6 +141,28 @@ pub fn scan_with_progress(
     });
 
     let seen: BTreeSet<String> = files.iter().map(|(_, rel)| rel.clone()).collect();
+
+    // Пути, возвращаемые после отмены исключения. Пока файла здесь нет, их
+    // нельзя записывать в `pending_deletes`: иначе отмена снова превратится
+    // в удаление. Когда файл доехал (или, наоборот, исчез с уцелевшей
+    // стороны), маркер больше не нужен.
+    let resurrections: HashMap<String, ResurrectionRow> = replica
+        .resurrections()?
+        .into_iter()
+        .map(|row| (row.path.clone(), row))
+        .collect();
+    let mut resurrected: HashSet<String> = resurrections.keys().cloned().collect();
+    let mut stale_markers = Vec::new();
+    for (path, marker) in &resurrections {
+        let present = seen.contains(path);
+        if (marker.side == "remote" && present) || (marker.side == "local" && !present) {
+            stale_markers.push(path.clone());
+        }
+    }
+    for path in stale_markers {
+        replica.remove_resurrection(&path)?;
+        resurrected.remove(&path);
+    }
 
     // Всё состояние путей читаем один раз. Раньше на каждый файл делались
     // отдельные SELECT'ы `entry`/`is_present`/`is_ignored`, а на телефоне это
@@ -448,6 +470,7 @@ pub fn scan_with_progress(
             || seen.contains(&row.path)
             || row.ignored
             || excluded.contains(&row.path)
+            || resurrected.contains(&row.path)
         {
             continue;
         }

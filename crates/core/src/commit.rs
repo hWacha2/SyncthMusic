@@ -954,6 +954,10 @@ pub fn finalize(
             if !replica.is_present(&rel)? {
                 replica.mark_present(&rel)?;
             }
+            // Содержимое уже на месте: путь больше не ждёт удаления и не
+            // нуждается в возврате с другой стороны.
+            replica.clear_pending_delete(&rel)?;
+            replica.remove_resurrection(&rel)?;
             continue;
         }
         let Some(src) = blob_source(replica, &root, &entry.blob)? else {
@@ -969,6 +973,14 @@ pub fn finalize(
         }
         write_blob(&root, &rel, &src, entry.mtime_ns)?;
         replica.mark_present(&rel)?;
+        replica.clear_pending_delete(&rel)?;
+        replica.remove_resurrection(&rel)?;
+    }
+
+    // Принятое содержимое уже разложено по диску: маркер возврата для таких
+    // путей больше не нужен.
+    for path in &confirmed {
+        replica.remove_resurrection(path)?;
     }
 
     let paths: Vec<String> = confirmed.into_iter().collect();

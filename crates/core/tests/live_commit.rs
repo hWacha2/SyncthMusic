@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use syncth_core::net::{serve_stream, PreviewSession};
-use syncth_core::{scan, ChangeKind, Decision, Replica};
+use syncth_core::{plan, resolve, scan, ChangeKind, Decision, Replica};
 use tempfile::TempDir;
 
 struct Pair {
@@ -360,6 +360,158 @@ fn decision_can_be_undone_and_chosen_again() {
     assert!(root_a.join("new.txt").is_file());
     assert!(root_b.join("new.txt").is_file());
     assert!(b.live_entries().unwrap().iter().any(|e| e.path == "new.txt"));
+}
+
+#[test]
+fn undo_exclusion_restores_the_phone_copy_when_pc_kept_the_file() {
+    let Pair {
+        tmp,
+        root_a,
+        root_b,
+        mut a,
+        b,
+        token,
+    } = setup();
+    let _keep_tmp = &tmp;
+    // Список исключений ведёт только ПК.
+    a.enable_exclusions();
+
+    // Общая база: без неё мягкое удаление неотличимо от исчезнувшего черновика.
+    let mut b = commit_with_b(&mut a, b, &token, |session, _| {
+        assert_eq!(session.plan.path_count(), 0);
+    });
+
+    // Телефон удалил файл. ПК оставляет его только у себя.
+    fs::remove_file(root_b.join("song.txt")).unwrap();
+    scan::scan(&root_b, &mut b).unwrap();
+
+    let b = commit_with_b(&mut a, b, &token, |session, replica| {
+        assert_eq!(session.plan.remote.len(), 1);
+        assert_eq!(session.plan.remote[0].kind, ChangeKind::Deleted);
+        let path = session.plan.remote[0].path.clone();
+        session
+            .record_decision(replica, &path, Decision::OnlyHere)
+            .unwrap();
+        session.poll(replica).unwrap();
+    });
+
+    assert!(root_a.join("song.txt").is_file());
+    assert!(!root_b.join("song.txt").exists());
+    assert_eq!(
+        a.exclusion("song.txt").unwrap().expect("исключение").side,
+        "local",
+        "уцелевшая копия должна быть отмечена как локальная"
+    );
+
+    // Отмена: уцелевшая копия на ПК возвращается в синхронизацию как добавление.
+    let outcome = resolve::undo_exclusion(&mut a, "song.txt", Some("dev-b")).unwrap();
+    assert!(outcome.kept_local);
+    assert!(a.exclusion("song.txt").unwrap().is_none());
+
+    let peer_have = b.watermarks().unwrap();
+    let pc_plan =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    let local = pc_plan
+        .local
+        .iter()
+        .find(|change| change.path == "song.txt")
+        .expect("возвращённый файл должен попасть в изменения");
+    assert_eq!(local.kind, ChangeKind::Added);
+    assert!(local.base_blob.is_empty());
+    assert!(
+        pc_plan.remote.iter().all(|change| change.path != "song.txt"),
+        "старое мягкое удаление телефона не должно вернуться в план"
+    );
+
+    // Commit должен отдать файл телефону и снять ожидание удаления там.
+    let b = commit_with_b(&mut a, b, &token, |session, _| {
+        assert_eq!(session.plan.local.len(), 1);
+        assert_eq!(session.plan.local[0].kind, ChangeKind::Added);
+        assert_eq!(session.plan.path_count(), 1);
+    });
+
+    assert_eq!(fs::read(root_b.join("song.txt")).unwrap(), b"version one");
+    assert!(b.pending_deletes().unwrap().is_empty());
+    assert!(a.pending_deletes().unwrap().is_empty());
+    assert!(a.resurrections().unwrap().is_empty());
+    let entry_a = a.entry("song.txt").unwrap().unwrap();
+    let entry_b = b.entry("song.txt").unwrap().unwrap();
+    assert_eq!(a.synced_blob("song.txt").unwrap(), entry_a.blob);
+    assert_eq!(b.synced_blob("song.txt").unwrap(), entry_b.blob);
+    assert_eq!(entry_a.blob, entry_b.blob);
+}
+
+#[test]
+fn undo_exclusion_downloads_the_surviving_copy_from_the_phone() {
+    let Pair {
+        tmp,
+        root_a,
+        root_b,
+        mut a,
+        b,
+        token,
+    } = setup();
+    let _keep_tmp = &tmp;
+    a.enable_exclusions();
+
+    let b = commit_with_b(&mut a, b, &token, |session, _| {
+        assert_eq!(session.plan.path_count(), 0);
+    });
+
+    // ПК удалил файл и оставляет его только на телефоне.
+    fs::remove_file(root_a.join("song.txt")).unwrap();
+    scan::scan(&root_a, &mut a).unwrap();
+
+    let b = commit_with_b(&mut a, b, &token, |session, replica| {
+        assert_eq!(session.plan.local.len(), 1);
+        assert_eq!(session.plan.local[0].kind, ChangeKind::Deleted);
+        let path = session.plan.local[0].path.clone();
+        session
+            .record_decision(replica, &path, Decision::OnlyHere)
+            .unwrap();
+        session.poll(replica).unwrap();
+    });
+
+    assert!(!root_a.join("song.txt").exists());
+    assert!(root_b.join("song.txt").is_file());
+    assert_eq!(
+        a.exclusion("song.txt").unwrap().expect("исключение").side,
+        "remote",
+        "уцелевшая копия должна быть отмечена как удалённая"
+    );
+
+    // Отмена: здесь файла нет, копию должен прислать телефон.
+    let outcome = resolve::undo_exclusion(&mut a, "song.txt", Some("dev-b")).unwrap();
+    assert!(outcome.waiting_remote);
+    assert!(a.exclusion("song.txt").unwrap().is_none());
+    assert!(a.pending_deletes().unwrap().is_empty());
+
+    let peer_have = b.watermarks().unwrap();
+    let pc_plan =
+        plan::build_with_peer_have(&a, &b.device_id(), "Phone", &[], Some(&peer_have)).unwrap();
+    let remote = pc_plan
+        .remote
+        .iter()
+        .find(|change| change.path == "song.txt")
+        .expect("путь должен вернуться добавлением со стороны телефона");
+    assert_eq!(remote.kind, ChangeKind::Added);
+    assert!(remote.base_blob.is_empty());
+    assert!(pc_plan.local.iter().all(|change| change.path != "song.txt"));
+
+    // Commit скачивает блоб с телефона и раскладывает его на ПК.
+    let _b = commit_with_b(&mut a, b, &token, |session, _| {
+        assert_eq!(session.plan.remote.len(), 1);
+        assert_eq!(session.plan.remote[0].kind, ChangeKind::Added);
+        assert!(session.plan.local.is_empty());
+    });
+
+    assert_eq!(fs::read(root_a.join("song.txt")).unwrap(), b"version one");
+    assert!(a.pending_deletes().unwrap().is_empty());
+    assert!(a.resurrections().unwrap().is_empty());
+    assert_eq!(
+        a.synced_blob("song.txt").unwrap(),
+        a.entry("song.txt").unwrap().unwrap().blob
+    );
 }
 
 #[test]

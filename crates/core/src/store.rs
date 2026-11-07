@@ -155,6 +155,19 @@ CREATE TABLE IF NOT EXISTS exclusions (
     mtime_ns   INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
+
+-- Путь, который после отмены исключения возвращается в синхронизацию.
+-- `side` говорит, где лежит уцелевшая копия: `local` — на этом устройстве,
+-- `remote` — у пира. Пока файла здесь нет, скан не должен записывать его в
+-- `pending_deletes`, а план обязан показать добавление с той стороны.
+CREATE TABLE IF NOT EXISTS resurrections (
+    path       TEXT PRIMARY KEY,
+    side       TEXT NOT NULL,
+    blob       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +238,18 @@ pub struct VaultRow {
 /// сопряжённом. Значение не зависит от того, кто именно принял решение.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExclusionRow {
+    pub path: String,
+    pub side: String,
+    pub blob: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub created_at: u64,
+}
+
+/// Путь, возвращаемый в синхронизацию после отмены исключения. `side` —
+/// сторона с уцелевшей копией: `local` или `remote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResurrectionRow {
     pub path: String,
     pub side: String,
     pub blob: String,
@@ -1556,6 +1581,12 @@ impl Replica {
                  created_at = excluded.created_at",
             params![path, side, blob, size as i64, mtime_ns, Hlc::wall_ms() as i64],
         )?;
+        // Новое исключение отменяет прежнее намерение вернуть путь: иначе
+        // маркер продолжит подавлять удаление и показывать добавление.
+        self.conn.execute(
+            "DELETE FROM resurrections WHERE path = ?1",
+            params![path],
+        )?;
         Ok(())
     }
 
@@ -1564,6 +1595,65 @@ impl Replica {
             .conn
             .execute("DELETE FROM exclusions WHERE path = ?1", params![path])?
             > 0)
+    }
+
+    // ------------------------------------------------------- resurrections
+
+    pub fn add_resurrection(
+        &self,
+        path: &str,
+        side: &str,
+        blob: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO resurrections(path, side, blob, size, mtime_ns, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                 side = excluded.side,
+                 blob = excluded.blob,
+                 size = excluded.size,
+                 mtime_ns = excluded.mtime_ns,
+                 created_at = excluded.created_at",
+            params![path, side, blob, size as i64, mtime_ns, Hlc::wall_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_resurrection(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM resurrections WHERE path = ?1", params![path])?
+            > 0)
+    }
+
+    pub fn clear_resurrections(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM resurrections", [])?)
+    }
+
+    pub fn resurrections(&self) -> Result<Vec<ResurrectionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, side, blob, size, mtime_ns, created_at
+             FROM resurrections ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ResurrectionRow {
+                path: r.get(0)?,
+                side: r.get(1)?,
+                blob: r.get(2)?,
+                size: r.get::<_, i64>(3)? as u64,
+                mtime_ns: r.get(4)?,
+                created_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn resurrection_paths(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM resurrections")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Все живые пути, ссылающиеся на блоб. Нужно, чтобы «удалить навсегда»
@@ -1682,6 +1772,7 @@ impl Replica {
             "pending_deletes",
             "sync_plans",
             "plan_decisions",
+            "resurrections",
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }

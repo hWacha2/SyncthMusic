@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::hlc::Hlc;
 use crate::op::{Op, OpKind};
 use crate::path;
-use crate::store::{LocalMove, PlanRow, Replica};
+use crate::store::{LocalMove, PendingDelete, PlanRow, Replica, ResurrectionRow};
 
 /// Сколько живёт план. Просроченный план не применяется: состояние могло
 /// измениться, а решения относятся к конкретным блобам.
@@ -536,6 +536,16 @@ impl Plan {
             }
         }
         // Появившийся новый локальный путь тоже делает план неполным.
+        // Мягкое удаление, которое пир уже перекрыл более новой операцией с
+        // тем же блобом, живёт в плане строкой пира, а не локальной. Без этой
+        // поправки телефон отказывал бы в commit после отмены исключения:
+        // в БД ещё лежит `pending_deletes`, хотя план уже показывает возврат.
+        let remote_paths: HashSet<&str> = self
+            .remote
+            .iter()
+            .filter(|change| change.kind != ChangeKind::Deleted)
+            .map(|change| change.path.as_str())
+            .collect();
         for row in &rows {
             if row.ignored || row.deleted || excluded.contains(&row.path) {
                 continue;
@@ -553,7 +563,10 @@ impl Plan {
                 .local
                 .iter()
                 .any(|change| change.path == row.path);
-            if (changed || pending_delete) && !in_plan {
+            if (changed || pending_delete)
+                && !in_plan
+                && !(pending_delete && remote_paths.contains(row.path.as_str()))
+            {
                 return Ok(false);
             }
         }
@@ -693,7 +706,7 @@ pub fn build_with_peer_have(
     // может быть уже в `entries`, но ещё не в `ops` (скан пишет несколькими
     // транзакциями), и новый путь превратится в «добавление».
     let me = replica.device_id().to_string();
-    let (rows, excluded, pending_deletes, local_moves, removals) =
+    let (rows, excluded, pending_deletes, local_moves, removals, resurrections) =
         replica.read_snapshot(|| {
             Ok((
                 replica.plan_rows()?,
@@ -701,13 +714,18 @@ pub fn build_with_peer_have(
                 replica.pending_deletes()?,
                 replica.local_moves(&me)?,
                 replica.removal_hlcs(&me)?,
+                replica.resurrections()?,
             ))
         })?;
     let by_path: HashMap<&str, &PlanRow> =
         rows.iter().map(|row| (row.path.as_str(), row)).collect();
-    let pending: HashMap<String, (String, u64)> = pending_deletes
+    let pending: HashMap<String, PendingDelete> = pending_deletes
         .into_iter()
-        .map(|row| (row.path, (row.blob, row.detected_at)))
+        .map(|row| (row.path.clone(), row))
+        .collect();
+    let resurrection: HashMap<String, ResurrectionRow> = resurrections
+        .into_iter()
+        .map(|row| (row.path.clone(), row))
         .collect();
     let remote = remote_state(remote_ops);
 
@@ -767,11 +785,26 @@ pub fn build_with_peer_have(
             // заставило бы выбирать между двумя решениями по одному событию.
             continue;
         }
-        if let Some((blob, _)) = pending.get(&row.path) {
+        if let Some(pending_delete) = pending.get(&row.path) {
             // Путь ни разу не входил в общую базу: пир о нём не знает, и
             // «удаление» здесь — не изменение, а просто исчезнувший черновик.
             // Сканер такие записи забывает, это лишь страховка для старых БД.
             if row.synced_blob.is_empty() {
+                continue;
+            }
+            // Пир уже вернул тот же блоб более новой операцией. Наше «файл
+            // пропал» устарело: файл придёт от пира, а не будет удалён здесь.
+            let restored_by_peer = remote.get(&row.path).is_some_and(|state| {
+                state.present
+                    && state.blob == pending_delete.blob
+                    && state.hlc > pending_delete.hlc()
+            });
+            // Отмена исключения уже пометила путь как возвращаемый с другой
+            // стороны. Пока маркер жив, удаление здесь не показываем.
+            let resurrecting = resurrection
+                .get(&row.path)
+                .is_some_and(|marker| marker.side == "remote");
+            if restored_by_peer || resurrecting {
                 continue;
             }
             local.push(Change {
@@ -779,7 +812,7 @@ pub fn build_with_peer_have(
                 from: None,
                 kind: ChangeKind::Deleted,
                 side: Side::Local,
-                blob: blob.clone(),
+                blob: pending_delete.blob.clone(),
                 base_blob: row.synced_blob.clone(),
                 size: row.size,
                 mtime_ns: row.mtime_ns,
@@ -908,6 +941,14 @@ pub fn build_with_peer_have(
         }
 
         if state.present {
+            // Пир вернул тот же блоб, который у нас «пропал». Его операция
+            // новее нашего мягкого удаления, значит файл нужно тянуть, а не
+            // удалять: иначе отмена исключения оставляла бы удаление навсегда.
+            let pending_superseded = row.is_some_and(|row| {
+                pending.get(&row.path).is_some_and(|pending_delete| {
+                    state.blob == pending_delete.blob && state.hlc > pending_delete.hlc()
+                })
+            });
             // У удалённой строки общая база есть только до тех пор, пока пир
             // не прислал факт новее самого удаления. Если прислал — это
             // восстановление: прежней базы у пути больше нет, и файл должен
@@ -915,6 +956,7 @@ pub fn build_with_peer_have(
             // «у пира лежит та же база». Источник нашего переноса — исключение:
             // пир мог просто ещё не увидеть перенос и присылать старый путь.
             let base_blob = match &row {
+                Some(_) if pending_superseded => String::new(),
                 Some(row)
                     if row.deleted
                         && state.hlc > row.hlc
@@ -927,7 +969,8 @@ pub fn build_with_peer_have(
             };
             let local_changed = match row {
                 Some(row) if !row.deleted => {
-                    row.blob != row.synced_blob || pending.contains_key(&row.path)
+                    !pending_superseded
+                        && (row.blob != row.synced_blob || pending.contains_key(&row.path))
                 }
                 Some(row) if row.deleted => !base_blob.is_empty(),
                 _ => false,
@@ -946,8 +989,10 @@ pub fn build_with_peer_have(
             });
             // Пир мог прислать старую операцию, которая уже является общей
             // базой. Это не его изменение: конфликт только если обе стороны
-            // действительно ушли от базы.
-            let remote_changed = state.moved_from.is_some()
+            // действительно ушли от базы. Возврат файла после нашего мягкого
+            // удаления — изменение, даже если блоб совпал с базой.
+            let remote_changed = pending_superseded
+                || state.moved_from.is_some()
                 || row
                     .as_ref()
                     .map_or(true, |row| row.deleted || state.blob != row.synced_blob);
@@ -1062,6 +1107,18 @@ pub fn build_with_peer_have(
             // Обе стороны удалили — это не конфликт.
             continue;
         }
+        // Отмена исключения уже вернула локальную копию свежим `EntryPut`.
+        // Удаление пира старше неё — хвост его `pending_deletes`, а не
+        // намерение убрать общий файл. Иначе отмена снова показывала бы
+        // удаление, хотя файл жив.
+        if row.present
+            && row.hlc > state.hlc
+            && resurrection
+                .get(&row.path)
+                .is_some_and(|marker| marker.side == "local")
+        {
+            continue;
+        }
         if row.blob != row.synced_blob {
             conflicts.push(Conflict {
                 path: row.path.clone(),
@@ -1085,6 +1142,43 @@ pub fn build_with_peer_have(
             base_blob: row.synced_blob.clone(),
             size: row.size,
             mtime_ns: row.mtime_ns,
+            present: false,
+            ignored: false,
+            aligned: false,
+        });
+    }
+
+    // Отмена исключения на стороне пира: у нас файла нет, но он есть у него.
+    // Синтетическая строка добавления заставляет commit запросить блоб. Обычный
+    // проход её не увидит, если пир не прислал новую операцию.
+    for marker in resurrection.values() {
+        if marker.side != "remote"
+            || excluded.contains(&marker.path)
+            || by_path.get(marker.path.as_str()).is_some_and(|row| row.ignored)
+            || local.iter().any(|change| change.path == marker.path)
+            || remote_changes
+                .iter()
+                .any(|change| change.path == marker.path)
+            || conflict_paths.contains(&marker.path)
+        {
+            continue;
+        }
+        // Пир уже удалил файл: скачивать нечего, пусть план покажет удаление.
+        if remote
+            .get(&marker.path)
+            .is_some_and(|state| !state.present)
+        {
+            continue;
+        }
+        remote_changes.push(Change {
+            path: marker.path.clone(),
+            from: None,
+            kind: ChangeKind::Added,
+            side: Side::Remote,
+            blob: marker.blob.clone(),
+            base_blob: String::new(),
+            size: marker.size,
+            mtime_ns: marker.mtime_ns,
             present: false,
             ignored: false,
             aligned: false,

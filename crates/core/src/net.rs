@@ -245,6 +245,18 @@ fn try_recv_msg(r: &mut BufReader<TcpStream>) -> Result<Option<Msg>> {
     }
 }
 
+/// Ждём сообщение commit, пропуская безвредный фоновый трафик сессии:
+/// heartbeat, отдельные решения и их сводки. Они могли оказаться в сокете
+/// раньше `CommitGo`/`CommitPlan` и не должны ломать рукопожатие.
+fn recv_commit_step<R: Read>(r: &mut R) -> Result<Msg> {
+    loop {
+        match recv_msg(r)? {
+            Msg::Heartbeat | Msg::Decision(_) | Msg::DecisionState { .. } => continue,
+            other => return Ok(other),
+        }
+    }
+}
+
 // ------------------------------------------------------------------ blobs
 
 /// Блобы, которые физически есть на этом устройстве.
@@ -1436,7 +1448,12 @@ impl PreviewSession {
             if self.announced.get(path) == Some(decision) {
                 continue;
             }
-            if self.plan.blob_for(path).as_deref() != Some(decision.blob.as_str()) {
+            // `Unset` — надгробие отмены решения. Оно обязано доехать до пира
+            // даже если блоб пути уже другой: иначе старое `OnlyHere` вернётся
+            // при следующем слиянии решений.
+            if decision.action != Decision::Unset
+                && self.plan.blob_for(path).as_deref() != Some(decision.blob.as_str())
+            {
                 continue;
             }
             outgoing.push(decision.clone());
@@ -1484,8 +1501,11 @@ impl PreviewSession {
         } else {
             Default::default()
         };
+        // Возвращаемый путь не должен уехать пиру как мягкое удаление: план
+        // специально покажет его добавлением с другой стороны.
+        let resurrected = replica.resurrection_paths()?;
         for pending in replica.pending_deletes()? {
-            if excluded.contains(&pending.path) {
+            if excluded.contains(&pending.path) || resurrected.contains(&pending.path) {
                 continue;
             }
             ops.push(replica.make_op_at(
@@ -1500,18 +1520,14 @@ impl PreviewSession {
 
     // ------------------------------------------------------------ commit
 
-    /// Ждём конкретный шаг commit, пропуская heartbeat.
+    /// Ждём конкретный шаг commit, пропуская фоновый трафик сессии.
     ///
-    /// Пир шлёт heartbeat раз в 10 секунд и может успеть отправить его прямо
-    /// перед `Commit` — сообщение окажется в сокете раньше `CommitGo` и не
-    /// должно ломать рукопожатие.
+    /// Пир шлёт heartbeat раз в 10 секунд и мог успеть отправить его прямо
+    /// перед `Commit`. Решения и их сводки тоже могут лежать в сокете с
+    /// момента, когда commit ещё не был начат: они уже не меняют замороженный
+    /// план и не должны ломать рукопожатие.
     fn recv_commit_msg(&mut self) -> Result<Msg> {
-        loop {
-            match recv_msg(&mut self.r)? {
-                Msg::Heartbeat => continue,
-                other => return Ok(other),
-            }
-        }
+        recv_commit_step(&mut self.r)
     }
 
     /// Клиентская сторона commit: проверить план, обменяться операциями и
@@ -2256,6 +2272,47 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn commit_handshake_skips_background_session_messages() {
+        // Живая сессия успевает положить в сокет heartbeat, решение и сводку
+        // до того, как начнётся commit. Они не должны сдвигать рукопожатие:
+        // иначе обе стороны падают с «ожидали commit_go».
+        let decision = PathDecision {
+            path: "a.flac".into(),
+            action: Decision::Unset,
+            blob: "b3:aa".into(),
+            hlc: Hlc::new(1, 0),
+            dev: "dev-b".into(),
+        };
+        let mut buf = Vec::new();
+        send_msg(&mut buf, &Msg::Heartbeat).unwrap();
+        send_msg(&mut buf, &Msg::Decision(decision)).unwrap();
+        send_msg(
+            &mut buf,
+            &Msg::DecisionState {
+                state: BTreeMap::new(),
+                version: Hlc::new(2, 0),
+            },
+        )
+        .unwrap();
+        send_msg(&mut buf, &Msg::CommitGo).unwrap();
+        send_msg(
+            &mut buf,
+            &Msg::CommitPlan {
+                ops: Vec::new(),
+                needs: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let mut r = &buf[..];
+        assert!(matches!(recv_commit_step(&mut r).unwrap(), Msg::CommitGo));
+        assert!(matches!(
+            recv_commit_step(&mut r).unwrap(),
+            Msg::CommitPlan { .. }
+        ));
     }
 
     #[test]
