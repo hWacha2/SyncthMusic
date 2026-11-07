@@ -9,9 +9,10 @@ import WorkspaceHead from '../components/workspace/WorkspaceHead.vue';
 import WorkspaceNotices from '../components/workspace/WorkspaceNotices.vue';
 import WorkspaceProgress from '../components/workspace/WorkspaceProgress.vue';
 import WorkspaceRail from '../components/workspace/WorkspaceRail.vue';
-import { computed, onMounted } from 'vue';
+import { computed, onMounted, watch } from 'vue';
 import { state } from '../store.js';
 import { refreshWorkspace } from '../store.js';
+import { loadPhoneVault } from '../workspace/actions.js';
 
 const data = computed(() => state.workspace.data);
 // Пока данные устарели после сброса, нижняя панель продолжает показывать
@@ -24,6 +25,15 @@ onMounted(() => {
   // или возврата из устройств состояние могло быть сброшено.
   if (!data.value && !state.workspace.refreshing) refreshWorkspace();
 });
+
+// Корзина телефона нужна не только на своей вкладке: без неё счётчик
+// «Хранилища» показывает только файлы ПК. Загружаем её один раз при входе
+// в рабочую область и заново — после переподключения телефона.
+watch(
+  () => state.workspace.data?.phone?.connected,
+  () => loadPhoneVault(),
+  { immediate: true },
+);
 </script>
 
 <template>

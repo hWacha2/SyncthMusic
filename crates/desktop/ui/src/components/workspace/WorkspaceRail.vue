@@ -7,7 +7,7 @@ import IconExclude from '../icons/IconExclude.vue';
 import { computed } from 'vue';
 import { t } from '../../i18n/index.js';
 import { state } from '../../store.js';
-import { basename, connectionState, pendingCount } from '../../workspace/model.js';
+import { basename, connectionState, pendingCount, vaultTotals } from '../../workspace/model.js';
 import { selectTab } from '../../workspace/actions.js';
 
 const props = defineProps({
@@ -36,7 +36,7 @@ function countFor(id, data) {
   if (state.workspace.stale) return 0;
   if (id === 'changes') return pendingCount(data);
   if (id === 'exclusions') return Number(data?.exclusions?.length) || 0;
-  if (id === 'vault') return Number(data?.pc?.vault_files) || 0;
+  if (id === 'vault') return vaultTotals(data).count;
   return 0;
 }
 </script>

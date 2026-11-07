@@ -4,7 +4,7 @@ import Spinner from '../Spinner.vue';
 import { t } from '../../i18n/index.js';
 import { formatSize, number } from '../../format.js';
 import { refreshWorkspace, state } from '../../store.js';
-import { canCommit, headline, pendingCount, planData } from '../../workspace/model.js';
+import { canCommit, headline, pendingCount, planData, vaultTotals } from '../../workspace/model.js';
 import { commitWorkspace } from '../../workspace/actions.js';
 
 const props = defineProps({
@@ -36,11 +36,12 @@ const head = computed(() => {
     };
   }
   if (props.tab === 'vault') {
+    const vault = vaultTotals(props.data);
     return {
       title: t('workspace.tab.vault'),
       text: t('workspace.vault.sub', {
-        count: number(props.data?.pc?.vault_files || 0),
-        size: formatSize(props.data?.pc?.vault_size || 0),
+        count: number(vault.count),
+        size: formatSize(vault.size),
       }),
     };
   }

@@ -17,6 +17,7 @@ import {
   decisionMeta,
   pendingCount,
   planData,
+  vaultTotals,
 } from '../../workspace/model.js';
 import { askForget, selectTab } from '../../workspace/actions.js';
 
@@ -34,6 +35,7 @@ const items = computed(() => decisionItems(props.data));
 const conn = computed(() => connectionState(props.data));
 const connected = computed(() => conn.value.tone === 'on');
 const phone = computed(() => props.data?.phone || {});
+const vault = computed(() => vaultTotals(props.data));
 
 // Карточка «Требует решения» не должна расти вместе со списком: показываем
 // первые несколько нерешённых пунктов. Решённые здесь не нужны — они остаются
@@ -85,9 +87,9 @@ function attentionMeta(item) {
     </div>
     <div class="ws-stat">
       <span class="ws-stat-k">{{ t('workspace.stats.vault') }}</span>
-      <div class="ws-stat-v">{{ number(pc.vault_files || 0) }}</div>
+      <div class="ws-stat-v">{{ number(vault.count) }}</div>
       <span class="ws-stat-n">
-        {{ Number(pc.vault_files) > 0 ? formatSize(pc.vault_size || 0) : t('workspace.stats.vault_empty') }}
+        {{ vault.count > 0 ? formatSize(vault.size) : t('workspace.stats.vault_empty') }}
       </span>
     </div>
   </div>

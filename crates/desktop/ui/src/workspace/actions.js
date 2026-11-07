@@ -250,6 +250,9 @@ export async function commitWorkspace() {
   state.workspace.noteError = false;
   state.workspace.tab = 'overview';
   await refreshWorkspace({ keepNote: true });
+  // Синхронизация могла переложить удалённые треки в корзину телефона:
+  // обновляем её один раз здесь, а не при каждом переключении вкладки.
+  await loadPhoneVault(true);
 }
 
 /// Возвращает путь в синхронизацию. Ничего не решает автоматически: путь
@@ -310,7 +313,9 @@ export async function loadPhoneVault(force = false) {
     const result = await invoke('workspace_phone_vault');
     state.workspace.phoneVault = Array.isArray(result?.rows) ? result.rows : [];
   } catch (error) {
-    state.workspace.phoneVault = [];
+    // Не стираем уже показанный список из-за одной неудачной попытки:
+    // иначе при обновлении на экране снова мелькает пустая корзина.
+    if (state.workspace.phoneVault === null) state.workspace.phoneVault = [];
     state.workspace.phoneVaultError = errorMessage(error);
   } finally {
     state.workspace.phoneVaultLoading = false;

@@ -59,10 +59,10 @@ const restoreLabel = computed(() =>
 function selectDevice(next) {
   if (next === 'phone' && !phoneLinked.value) return;
   device.value = next;
-  // Корзину телефона запрашиваем при каждом входе на его страницу: это редкий
-  // экран, а фоновый опрос статуса её не обновляет. Повторный клик — это же
-  // и повторная попытка после ошибки.
-  if (next === 'phone') loadPhoneVault(true);
+  // Список телефона уже загружен при входе в рабочую область. Здесь только
+  // добираем его, если кэша ещё нет; после удалений и восстановлений его
+  // обновляют сами действия, а не каждое переключение вкладки.
+  if (next === 'phone') loadPhoneVault();
 }
 
 function askGcDevice() {
@@ -150,7 +150,7 @@ function restoring(path) {
       </section>
     </template>
 
-    <template v-else-if="onPhone && phoneError">
+    <template v-else-if="onPhone && phoneError && !rows.length">
       <section class="ws-card ws-empty-card">
         <span class="ws-empty-icon is-calm"><IconVault /></span>
         <b>{{ panel }}</b>
@@ -161,7 +161,7 @@ function restoring(path) {
       </section>
     </template>
 
-    <template v-else-if="onPhone && phoneLoading">
+    <template v-else-if="onPhone && phoneLoading && !rows.length">
       <section class="ws-card ws-empty-card">
         <span class="ws-empty-icon is-calm"><IconVault /></span>
         <b>{{ panel }}</b>
@@ -182,6 +182,11 @@ function restoring(path) {
         <h2 class="ws-card-title">{{ panel }}</h2>
         <span class="ws-tag">{{ t('workspace.vault.count', { count: rows.length }) }}</span>
       </div>
+      <!-- Пока список обновляется, уже прочитанные строки остаются на месте:
+           иначе при каждом входе на вкладку телефона мелькает пустой экран. -->
+      <p v-if="onPhone && phoneError" class="ws-vault-hint">
+        {{ t('workspace.error.phone_vault', { error: phoneError }) }}
+      </p>
       <div class="ws-rows">
         <div v-for="row in rows" :key="row.path" class="ws-row">
           <span class="ws-row-kind is-vault">{{ formatSize(row.size) }}</span>

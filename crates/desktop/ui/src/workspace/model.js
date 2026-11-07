@@ -65,6 +65,16 @@ export function pendingCount(data = workspaceData()) {
   return pendingDecisions(data).length;
 }
 
+/// Суммарная корзина: файлы ПК плюс уже прочитанная корзина подключённого
+/// телефона. Пока список телефона не загружен, показываем хотя бы корзину ПК.
+export function vaultTotals(data = workspaceData()) {
+  const pcCount = Number(data?.pc?.vault_files) || 0;
+  const pcSize = Number(data?.pc?.vault_size) || 0;
+  const phoneRows = workspaceConnected(data) ? state.workspace.phoneVault || [] : [];
+  const phoneSize = phoneRows.reduce((sum, row) => sum + (Number(row.size) || 0), 0);
+  return { count: pcCount + phoneRows.length, size: pcSize + phoneSize };
+}
+
 // Единый список изменений для вкладки «Изменения». Конфликты идут первыми и
 // вытесняют одноимённую строку из обычных изменений, чтобы путь не задвоился.
 export function changeEntries(data = workspaceData()) {
