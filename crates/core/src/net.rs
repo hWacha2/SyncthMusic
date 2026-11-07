@@ -33,7 +33,7 @@ use crate::path;
 use crate::plan::{self, Decision, DecisionSet, PathDecision, Plan};
 use crate::resolve;
 use crate::scan;
-use crate::store::{EntryRow, Replica};
+use crate::store::{EntryRow, PathState, Replica};
 
 const MAX_MSG: usize = 256 * 1024 * 1024;
 const DISCOVERY_PORT: u16 = 47_888;
@@ -275,14 +275,22 @@ fn missing_blobs(replica: &Replica) -> Result<Vec<String>> {
     let have = available_blobs(replica)?;
     let mut want = Vec::new();
     let mut seen = HashSet::new();
-    for e in replica.live_entries()? {
-        if replica.is_present(&e.path)? || replica.is_ignored(&e.path)? {
+    for row in replica.path_states()? {
+        // Только то, что действительно ждёт скачивания: живой путь без файла
+        // и возврат, ожидающий копию от пира. `Missing` — это чужое решение
+        // об удалении, `Excluded*` — решение человека, `Tombstone` — факт.
+        let wanted = match row.state {
+            PathState::Live => !row.present,
+            PathState::ResurrectingRemote => true,
+            _ => false,
+        };
+        if !wanted || row.blob.is_empty() {
             continue;
         }
-        if have.contains(&e.blob) || !seen.insert(e.blob.clone()) {
+        if have.contains(&row.blob) || !seen.insert(row.blob.clone()) {
             continue;
         }
-        want.push(e.blob);
+        want.push(row.blob);
     }
     Ok(want)
 }
@@ -2239,6 +2247,97 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::PathStateRow;
+
+    #[test]
+    fn missing_blobs_asks_only_for_live_absent_and_resurrecting_remote() {
+        let replica = Replica::in_memory("dev-a").unwrap();
+        let row = |path: &str, state: PathState, blob: &str, present: bool| PathStateRow {
+            path: path.into(),
+            state,
+            base: None,
+            blob: blob.into(),
+            size: 1,
+            mtime_ns: 1,
+            added_at: 1,
+            hlc: Hlc::new(1, 0),
+            dev: "dev-b".into(),
+            present,
+            pending_hlc: None,
+            created_at: None,
+        };
+        // Ждём скачивания.
+        replica
+            .save_path_state(&row("live_absent.flac", PathState::Live, "b3:live", false))
+            .unwrap();
+        replica
+            .save_path_state(&row(
+                "resurrecting_remote.flac",
+                PathState::ResurrectingRemote,
+                "b3:res",
+                false,
+            ))
+            .unwrap();
+        // Тот же блоб уже есть под живым путём — качать нечего.
+        replica
+            .save_path_state(&row(
+                "live_present.flac",
+                PathState::Live,
+                "b3:present",
+                true,
+            ))
+            .unwrap();
+        replica
+            .save_path_state(&row(
+                "live_absent_dup.flac",
+                PathState::Live,
+                "b3:present",
+                false,
+            ))
+            .unwrap();
+        // Повтор блоба не дублирует запрос.
+        replica
+            .save_path_state(&row("live_absent_dup2.flac", PathState::Live, "b3:live", false))
+            .unwrap();
+        // Ни одно из этих состояний не ждёт блоб от пира.
+        replica
+            .save_path_state(&row(
+                "resurrecting_local.flac",
+                PathState::ResurrectingLocal,
+                "b3:res-local",
+                true,
+            ))
+            .unwrap();
+        replica
+            .save_path_state(&row("missing.flac", PathState::Missing, "b3:missing", false))
+            .unwrap();
+        replica
+            .save_path_state(&row(
+                "excluded_local.flac",
+                PathState::ExcludedLocal,
+                "b3:excl-local",
+                true,
+            ))
+            .unwrap();
+        replica
+            .save_path_state(&row(
+                "excluded_remote.flac",
+                PathState::ExcludedRemote,
+                "b3:excl-remote",
+                false,
+            ))
+            .unwrap();
+        replica
+            .save_path_state(&row("tombstone.flac", PathState::Tombstone, "b3:tomb", false))
+            .unwrap();
+        replica
+            .save_path_state(&row("empty.flac", PathState::Live, "", false))
+            .unwrap();
+
+        let want = missing_blobs(&replica).unwrap();
+
+        assert_eq!(want, vec!["b3:live", "b3:res"]);
+    }
 
     #[test]
     fn directed_broadcast_uses_network_prefix() {
