@@ -226,7 +226,7 @@ enum PathState {
 | local `Updated` + Accept | `Live` | `Live { base=blob }` | `EntryPut`, confirm |
 | local `Updated` + Revert | `Live` | `Live { blob=base, base=base }` | `EntryPut` с `base_blob`, confirm |
 | local `Renamed/Moved` + Accept | `Live` | `Live { base=blob }` + `Tombstone(from)` | `EntryMove`, confirm target |
-| local `Renamed/Moved` + Revert | `Live` | `Tombstone(to)` + `Live(from)` | обратный `EntryMove`, confirm source |
+| local `Renamed/Moved` + Revert | `Live` | `Tombstone(to)` + `Live(from)` | обратный `EntryMove`; confirm source только если он уже был в общей базе, иначе путь снова `Added` |
 | local `Deleted` + DeleteEverywhere | `Missing`/`Live` | `Tombstone` | `EntryDel`, pending снимается |
 | local `Deleted` + KeepInLibrary | `Missing` | `Live { base=blob, present=1 }` | `EntryPut`, restore из vault/блоба, confirm |
 | local `Deleted` + OnlyHere | `Missing` | `ExcludedRemote` | exclusion; pending снимается |
@@ -296,7 +296,7 @@ enum PathState {
 | Состояние | `plan.local` | `plan.remote` | `conflicts` |
 |---|---|---|---|
 | `Live { base=None, present=1 }` | `Added` (`base=""`) | — | — |
-| `Live { base=Some(b), blob!=b, present=1 }` | `Updated` (`base=b`) или `Renamed/Moved` по журналу переносов | — | — |
+| `Live { base=Some(b), blob!=b, present=1 }` | `Updated` (`base=b`) или `Renamed/Moved` по журналу переносов (цепочка начинается с базы или не замыкается) | — | — |
 | `Live { base=Some(b), blob==b, present=1 }` | — (aligned, если пир с тем же блобом) | — | — |
 | `Live { base=Some(b), present=0 }` | — | если пир прислал новее/другое — `Updated`/`Added` | — |
 | `Live { base=None, present=0, dev=peer }` | — | `Added` (файл ждёт скачивания) | — |
@@ -312,6 +312,8 @@ enum PathState {
 - `Missing` + remote `EntryPut` того же блоба новее `pending_hlc` → возврат.
 - `Tombstone` + remote `EntryPut` новее `tombstone.hlc` → `Added`; если блоб
   равен `deleted_blob` и HLC не новее — stale, игнор.
+- Замкнутая цепочка `entry_move` без базы — возврат отклонённого переноса:
+  файл вернулся на прежнее место и остаётся `Added`, а не `Moved`.
 
 `PlanRow` (совместимая проекция) для `Tombstone` отдаёт `deleted=1`, но
 сохраняет `blob/size/mtime/added_at` удалённого содержимого: плану нужны

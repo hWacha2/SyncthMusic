@@ -1619,7 +1619,8 @@ impl PreviewSession {
                 total_bytes: 0,
             });
             commit::apply_local(replica, &self.plan, &resolution, &prepared)?;
-            let outcome = commit::finalize(replica, &self.plan, &resolution, &peer_ops)?;
+            let outcome =
+                commit::finalize(replica, &self.plan, &resolution, &prepared, &peer_ops)?;
             self.send(&Msg::CommitDone {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,
@@ -1721,7 +1722,8 @@ impl PreviewSession {
             }
 
             commit::apply_local(replica, &self.plan, &resolution, &prepared)?;
-            let outcome = commit::finalize(replica, &self.plan, &resolution, &peer_ops)?;
+            let outcome =
+                commit::finalize(replica, &self.plan, &resolution, &prepared, &peer_ops)?;
             self.send(&Msg::CommitDone {
                 accepted: outcome.accepted,
                 rejected: outcome.rejected,

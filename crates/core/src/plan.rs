@@ -91,9 +91,40 @@ fn local_move_from(
         (mv.from != row.path
             && mv.blob == row.blob
             && source_is_gone
-            && (mv.hlc == row.hlc || row.base.is_none()))
+            && (mv.hlc == row.hlc || row.base.is_none())
+            && move_chain_is_real(mv, &row.blob, by_path, move_to))
         .then(|| mv.from.clone())
     })
+}
+
+/// Настоящий ли перенос: цепочка либо начинается с согласованной базы, либо
+/// не замыкается. Замкнутая цепочка без базы — это возврат отклонённого
+/// переноса: файл вернулся на прежнее место и остаётся добавлением.
+fn move_chain_is_real(
+    mv: &LocalMove,
+    blob: &str,
+    by_path: &HashMap<&str, &PathStateRow>,
+    move_to: &HashMap<&str, &LocalMove>,
+) -> bool {
+    let mut current = mv.from.as_str();
+    let mut visited: HashSet<&str> = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return false;
+        }
+        if let Some(row) = by_path.get(current) {
+            if let Some(base) = &row.base {
+                return base == blob;
+            }
+        }
+        let Some(previous) = move_to.get(current) else {
+            return true;
+        };
+        if previous.blob != blob {
+            return true;
+        }
+        current = previous.from.as_str();
+    }
 }
 
 /// Согласованная база пути; пустая строка — базы ещё нет.
@@ -744,8 +775,14 @@ pub fn build_with_peer_have(
         }
         // Цепочка a→b→c: цель у c, но старый файл на телефоне может называться
         // a. Пока блоб тот же, все промежуточные источники — часть переноса.
+        // Журнал хранит и обратный перенос после «Отклонить», поэтому цепочка
+        // может замкнуться; посещённые источники обрывают обход.
         let mut current = mv;
+        let mut visited: HashSet<&str> = HashSet::new();
         loop {
+            if !visited.insert(current.from.as_str()) {
+                break;
+            }
             local_move_sources.insert(current.from.as_str());
             let Some(previous) = move_to.get(current.from.as_str()).copied() else {
                 break;
@@ -1381,6 +1418,13 @@ mod tests {
         replica.confirm_synced().unwrap();
     }
 
+    /// Локальное добавление, которое ещё не подтверждали как общую базу.
+    fn added(replica: &mut Replica, path: &str, blob: &str) {
+        let op = replica.make_op(put(path, blob)).unwrap();
+        replica.apply(&op).unwrap();
+        replica.mark_present(path).unwrap();
+    }
+
     /// То, что делает сканер, увидев переименование: одна операция переноса
     /// и обновлённые флаги присутствия. Файл на диске здесь не нужен.
     fn apply_move(replica: &mut Replica, from: &str, to: &str, blob: &str) {
@@ -1578,6 +1622,54 @@ mod tests {
             .local
             .iter()
             .all(|change| change.kind != ChangeKind::Deleted));
+    }
+
+    #[test]
+    fn move_of_an_unsynced_addition_is_still_a_move() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        added(&mut a, "Album/01.flac", "b3:aa");
+        apply_move(&mut a, "Album/01.flac", "Compilations/01.flac", "b3:aa");
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].kind, ChangeKind::Moved);
+        assert_eq!(plan.local[0].from.as_deref(), Some("Album/01.flac"));
+    }
+
+    #[test]
+    fn rejected_move_of_an_unsynced_addition_becomes_an_addition() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        added(&mut a, "Album/01.flac", "b3:aa");
+        apply_move(&mut a, "Album/01.flac", "Compilations/01.flac", "b3:aa");
+        // «Отклонить»: файл вернулся, но источник так и не стал общей базой.
+        apply_move(&mut a, "Compilations/01.flac", "Album/01.flac", "b3:aa");
+
+        // Прямой и обратный переносы образуют цикл в журнале: обход цепочки
+        // обязан его разорвать, а файл — снова стать добавлением.
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert_eq!(plan.local.len(), 1);
+        assert_eq!(plan.local[0].path, "Album/01.flac");
+        assert_eq!(plan.local[0].kind, ChangeKind::Added);
+        assert_eq!(plan.local[0].from, None);
+    }
+
+    #[test]
+    fn rejected_move_of_a_synced_file_leaves_no_changes() {
+        let mut a = Replica::in_memory("dev-a").unwrap();
+        synced(&mut a, "Album/01.flac", "b3:aa");
+        apply_move(&mut a, "Album/01.flac", "Compilations/01.flac", "b3:aa");
+        apply_move(&mut a, "Compilations/01.flac", "Album/01.flac", "b3:aa");
+        a.confirm_synced_paths(&["Album/01.flac".to_string()])
+            .unwrap();
+
+        let plan = build(&a, "dev-b", "Phone", &[]).unwrap();
+
+        assert!(
+            plan.local.is_empty(),
+            "согласованный перенос после отказа не должен возвращаться в план"
+        );
     }
 
     #[test]

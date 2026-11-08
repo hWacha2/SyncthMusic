@@ -20,7 +20,7 @@ use crate::path;
 use crate::plan::{Change, ChangeKind, Decision, PathDecision, Plan, Resolution, Side};
 use crate::resolve;
 use crate::scan;
-use crate::store::{PathState, PathStateRow, Replica};
+use crate::store::{LocalMove, PathState, PathStateRow, Replica};
 use crate::vault;
 
 #[derive(Debug, Default, Clone)]
@@ -32,6 +32,10 @@ pub struct Prepared {
     /// Ожидаемые размеры блобов из `needs`. По ним интерфейс показывает,
     /// сколько байт осталось принять; сам протокол размеры не передаёт.
     pub need_sizes: HashMap<String, u64>,
+    /// Источники переносов, которые до отказа уже были согласованы с пиром.
+    /// Только их можно снова подтвердить как общую базу: добавление, которое
+    /// ещё не синхронизировали, после отказа остаётся добавлением.
+    pub move_sources_in_base: HashSet<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +259,18 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
     let root = replica.root()?.context("корень библиотеки не задан")?;
     let me = replica.device_id().to_string();
 
+    // Для отказа от переноса нужно знать, был ли источник согласован с пиром
+    // ещё до цепочки переносов. Скан сохраняет базу в tombstone источника,
+    // поэтому снимок до применения операций даёт ответ.
+    let (states, local_moves) =
+        replica.read_snapshot(|| Ok((replica.path_states()?, replica.local_moves(&me)?)))?;
+    let by_path: HashMap<&str, &PathStateRow> =
+        states.iter().map(|row| (row.path.as_str(), row)).collect();
+    let move_to: HashMap<&str, &LocalMove> = local_moves
+        .iter()
+        .map(|mv| (mv.to.as_str(), mv))
+        .collect();
+
     // Свежие операции должны побеждать по HLC всё, что пришло от пира,
     // включая версии, из-за которых возник конфликт.
     replica.observe_hlc(plan.version)?;
@@ -340,7 +356,12 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
                 ));
                 let (op_from, op_to) = match decision {
                     Decision::Accept => (from.clone(), change.path.clone()),
-                    Decision::Revert => (change.path.clone(), from.clone()),
+                    Decision::Revert => {
+                        if move_source_in_base(from, &change.blob, &by_path, &move_to) {
+                            prepared.move_sources_in_base.insert(from.clone());
+                        }
+                        (change.path.clone(), from.clone())
+                    }
                     _ => continue,
                 };
                 prepared.ops.push(replica.make_op(OpKind::EntryMove {
@@ -485,6 +506,38 @@ pub fn prepare(replica: &mut Replica, plan: &Plan, resolution: &Resolution) -> R
     }
 
     Ok(prepared)
+}
+
+/// Было ли содержимое переноса согласовано с пиром до всей цепочки переносов.
+///
+/// Скан оставляет базу в tombstone источника, а промежуточные имена цепочки
+/// базы не имеют. Поэтому идём от `from` назад по журналу, пока не найдём
+/// путь с базой. Цикл прямого и обратного переноса обрывается посещёнными.
+fn move_source_in_base(
+    from: &str,
+    blob: &str,
+    by_path: &HashMap<&str, &PathStateRow>,
+    move_to: &HashMap<&str, &LocalMove>,
+) -> bool {
+    let mut current = from;
+    let mut visited: HashSet<&str> = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return false;
+        }
+        if let Some(row) = by_path.get(current) {
+            if let Some(base) = &row.base {
+                return base == blob;
+            }
+        }
+        let Some(previous) = move_to.get(current) else {
+            return false;
+        };
+        if previous.blob != blob {
+            return false;
+        }
+        current = previous.from.as_str();
+    }
 }
 
 fn write_blob(root: &Path, rel: &str, src: &Path, mtime_ns: i64) -> Result<()> {
@@ -861,6 +914,7 @@ pub fn finalize(
     replica: &mut Replica,
     plan: &Plan,
     resolution: &Resolution,
+    prepared: &Prepared,
     peer_ops: &[Op],
 ) -> Result<Outcome> {
     let root = replica.root()?.context("корень библиотеки не задан")?;
@@ -923,7 +977,11 @@ pub fn finalize(
             }
             (ChangeKind::Renamed | ChangeKind::Moved, Decision::Revert) => {
                 if let Some(from) = &change.from {
-                    confirmed.insert(from.clone());
+                    // Несогласованное добавление после возврата остаётся
+                    // добавлением: подтверждать его как базу нельзя.
+                    if prepared.move_sources_in_base.contains(from) {
+                        confirmed.insert(from.clone());
+                    }
                 }
                 outcome.accepted += 1;
             }
@@ -1355,7 +1413,7 @@ mod tests {
         assert!(resolution.unresolved().is_empty());
         let prepared = prepare(&mut f.replica, &plan, &resolution).unwrap();
         apply_local(&mut f.replica, &plan, &resolution, &prepared).unwrap();
-        finalize(&mut f.replica, &plan, &resolution, decision_ops).unwrap();
+        finalize(&mut f.replica, &plan, &resolution, &prepared, decision_ops).unwrap();
         assert_invariants(&f.replica);
         plan
     }
@@ -1458,6 +1516,40 @@ mod tests {
         assert_eq!(state(&f, "new.flac").state, PathState::Tombstone);
         assert!(f.root.join("old.flac").is_file());
         assert!(!f.root.join("new.flac").exists());
+    }
+
+    #[test]
+    fn rejecting_a_move_of_an_unsynced_addition_keeps_it_pending() {
+        let mut f = fixture(&[("old.flac", b"one")]);
+        // Базы нет: добавление ещё не синхронизировали.
+        fs::rename(f.root.join("old.flac"), f.root.join("new.flac")).unwrap();
+        crate::scan::scan(&f.root, &mut f.replica).unwrap();
+
+        let plan = run(
+            &mut f,
+            &[],
+            &[],
+            &[("new.flac", Decision::Revert, "dev-a")],
+        );
+        assert_eq!(plan.local[0].kind, ChangeKind::Renamed);
+
+        let source = state(&f, "old.flac");
+        assert_eq!(source.state, PathState::Live);
+        assert_eq!(
+            source.base, None,
+            "несогласованное добавление не должно стать общей базой"
+        );
+        assert!(source.present);
+        assert_eq!(state(&f, "new.flac").state, PathState::Tombstone);
+        assert!(f.root.join("old.flac").is_file());
+
+        // Следующая проверка снова показывает файл как добавление, а не
+        // обратный перенос из отклонённого пути.
+        let next = plan::build(&f.replica, "dev-b", "Phone", &[]).unwrap();
+        assert_eq!(next.local.len(), 1);
+        assert_eq!(next.local[0].path, "old.flac");
+        assert_eq!(next.local[0].kind, ChangeKind::Added);
+        assert_eq!(next.local[0].from, None);
     }
 
     #[test]
