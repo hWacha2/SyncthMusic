@@ -299,5 +299,15 @@ fn accepting_a_remote_move_moves_the_file_on_the_other_side() {
     assert_eq!(album_files(&pair.root_a), vec![MOVED.to_string()]);
     assert_eq!(album_files(&pair.root_b), vec![MOVED.to_string()]);
     assert_eq!(fs::read(pair.root_b.join(MOVED)).unwrap(), b"base-bytes");
+    // Принимающая сторона должна переименовать файл, а не отправить старую
+    // копию в корзину и разложить блоб по новому пути заново.
+    assert!(
+        open_a(&pair).vault_rows().unwrap().is_empty(),
+        "перенос не должен оставлять копию в корзине ПК"
+    );
+    assert!(
+        open_b(&pair).vault_rows().unwrap().is_empty(),
+        "перенос не должен оставлять копию в корзине телефона"
+    );
     assert_eq!(state_hash(&open_a(&pair)), state_hash(&open_b(&pair)));
 }

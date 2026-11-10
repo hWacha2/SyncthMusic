@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::hlc::Hlc;
-use crate::op::OpKind;
+use crate::op::{Op, OpKind};
 use crate::plan::{Decision, PathDecision};
 use crate::scan;
 use crate::store::{PathState, Replica};
@@ -409,6 +409,155 @@ pub fn prune_deleted_files(replica: &mut Replica, root: &Path) -> Result<Vec<Str
     }
 
     Ok(saved)
+}
+
+/// Физически переносит локальный файл вслед за `entry_move`.
+///
+/// Без этого принимающая сторона сначала отправила бы старый файл в корзину,
+/// а потом скачала тот же блоб по новому пути. Если локальная версия отличается
+/// (её правили здесь), ничего не трогаем: конфликт разберёт `prune_deleted_files`.
+pub fn apply_moves(replica: &mut Replica, root: &Path, ops: &[Op]) -> Result<usize> {
+    let mut moved = 0;
+    for op in ops {
+        let OpKind::EntryMove {
+            from,
+            to,
+            blob,
+            mtime_ns,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let src = disk_path(root, from);
+        let dst = disk_path(root, to);
+        let same_key = crate::path::key(from) == crate::path::key(to);
+
+        if !src.is_file() {
+            // Перенос уже сделан (или файл только предстоит скачать).
+            if dst.is_file() && scan::hash_file(&dst).ok().as_deref() == Some(blob.as_str()) {
+                replica.mark_present(to)?;
+                replica.mark_absent(from)?;
+            }
+            continue;
+        }
+        // Занятый destination не перезаписываем: это может быть чужая правка.
+        // Для совпадающего ключа нужно убедиться, что это действительно тот же
+        // файл (смена регистра/NFC), а не два разных файла на регистрозависимой ФС.
+        if dst.exists() {
+            if !same_key {
+                continue;
+            }
+            if !same_existing_file(&src, &dst) {
+                tracing::warn!(
+                    "не переношу {from} → {to}: на диске уже есть другой файл"
+                );
+                continue;
+            }
+        }
+        match scan::hash_file(&src) {
+            Ok(h) if &h == blob => {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let result = if from == to {
+                    Ok(())
+                } else if same_key {
+                    // Windows/macOS считают `A.flac` и `a.flac` одним файлом и
+                    // могут отказать в прямом rename. Идём через временное имя.
+                    rename_case_safe(&src, &dst)
+                } else {
+                    std::fs::rename(&src, &dst)
+                };
+                match result {
+                    Ok(()) => {
+                        scan::restore_mtime(&dst, *mtime_ns)?;
+                        replica.mark_present(to)?;
+                        replica.mark_absent(from)?;
+                        moved += 1;
+                    }
+                    Err(e) if same_key => {
+                        // На регистронезависимой ФС src и dst — один и тот же файл;
+                        // rename мог не понадобиться. Главное — проверить содержимое.
+                        if dst.is_file()
+                            && scan::hash_file(&dst).ok().as_deref() == Some(blob.as_str())
+                        {
+                            replica.mark_present(to)?;
+                            replica.mark_absent(from)?;
+                        } else {
+                            tracing::warn!("не удалось перенести {from} → {to}: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("не удалось перенести {from} → {to}: {e}"),
+                }
+            }
+            Ok(_) => {
+                tracing::debug!("локальная версия {from} отличается — оставляю для конфликта");
+            }
+            Err(e) => tracing::warn!("не читается {from} при переносе: {e:#}"),
+        }
+    }
+    Ok(moved)
+}
+
+/// Один и тот же файл на диске? Нужно для смены только регистра/NFC, когда
+/// `dst.exists()` — это не занятый путь, а тот же самый inode.
+fn same_existing_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Метаданные Windows не дают стабильного file index в std; канонизация
+        // разрешает регистр через саму ФС и возвращает одно и то же имя.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Переименование, меняющее только регистр/NFC. Прямой `rename` на Windows и
+/// macOS может отказать, потому что целевое имя «уже занято» тем же файлом.
+/// Поэтому сначала уводим файл во временное служебное имя, затем — в целевое.
+fn rename_case_safe(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let mut tmp = None;
+    for index in 0..1024u32 {
+        let candidate = parent.join(format!(".syncth-tmp-{pid}-{index}"));
+        if !candidate.exists() {
+            tmp = Some(candidate);
+            break;
+        }
+    }
+    let Some(tmp) = tmp else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "не удалось подобрать временное имя",
+        ));
+    };
+    std::fs::rename(src, &tmp)?;
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Возвращаем файл на место, чтобы не потерять его под temp-именем.
+            let _ = std::fs::rename(&tmp, src);
+            Err(e)
+        }
+    }
 }
 
 /// Поставить/снять `present`, не меняя состояние пути.

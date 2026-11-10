@@ -235,7 +235,7 @@ enum PathState {
 | remote `Added` + OnlyHere | — | `ExcludedRemote` | exclusion, peer op не применяется |
 | remote `Updated` + Accept | `Live` | `Live { base=blob, present=1 }` | `place`, confirm |
 | remote `Updated` + Revert | `Live` | `Live { base=old }` | peer создаёт revert-put, локально применяются обе операции, confirm |
-| remote `Renamed/Moved` + Accept | `Live` | `Live { base=blob, present=1 }` + `Tombstone(from)` | `place`, `prune_deleted_files` |
+| remote `Renamed/Moved` + Accept | `Live` | `Live { base=blob, present=1 }` + `Tombstone(from)` | `apply_moves` (rename на диске, без корзины), `place`, confirm |
 | remote `Renamed/Moved` + Revert | `Live` | `Tombstone(to)` + `Live(from)` | peer создаёт обратный move |
 | remote `Deleted` + DeleteEverywhere | `Live` | `Tombstone` | peer создаёт `EntryDel` |
 | remote `Deleted` + KeepInLibrary | `Live` | `Live` (без изменений) | peer создаёт `EntryPut`; локальный файл уже есть |

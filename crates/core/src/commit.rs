@@ -946,6 +946,10 @@ pub fn finalize(
         .cloned()
         .collect();
     replica.apply_all(&peer_ops)?;
+    // Чужой перенос — это именно перенос: переименовываем файл на диске до
+    // prune, иначе старая копия уйдёт в корзину, а новый путь придётся
+    // раскладывать из блоба заново.
+    resolve::apply_moves(replica, &root, &peer_ops)?;
     // Удаления приходят операцией, но файл на диске убирает эта функция
     // (с копией в корзину). Заодно спасает локальные правки.
     resolve::prune_deleted_files(replica, &root)?;
@@ -1293,6 +1297,22 @@ mod tests {
         .unwrap()
     }
 
+    fn peer_move(from: &str, to: &str, bytes: &[u8], offset_ms: u64) -> Op {
+        let mut peer = Replica::in_memory("dev-b").unwrap();
+        peer.make_op_at(
+            Hlc::new(Hlc::wall_ms() + offset_ms, 0),
+            OpKind::EntryMove {
+                from: from.into(),
+                to: to.into(),
+                blob: blob_of(bytes),
+                size: bytes.len() as u64,
+                mtime_ns: 1,
+                added_at: 1,
+            },
+        )
+        .unwrap()
+    }
+
     /// Положить содержимое в `incoming` так, будто блоб уже скачан.
     fn stage(replica: &Replica, bytes: &[u8]) -> String {
         let blob = blob_of(bytes);
@@ -1550,6 +1570,35 @@ mod tests {
         assert_eq!(next.local[0].path, "old.flac");
         assert_eq!(next.local[0].kind, ChangeKind::Added);
         assert_eq!(next.local[0].from, None);
+    }
+
+    #[test]
+    fn accepting_a_remote_move_renames_instead_of_vaulting_the_source() {
+        let mut f = fixture(&[("Album/old.flac", b"one")]);
+        base(&mut f, "Album/old.flac");
+
+        // Пир переносит уже согласованный файл: принимающая сторона должна
+        // переименовать свой файл, а не отправить его в корзину и скопировать
+        // блоб по новому пути.
+        let mv = peer_move("Album/old.flac", "Compilations/old.flac", b"one", 10);
+        let plan = run(&mut f, &[mv.clone()], &[mv], &[]);
+
+        assert_eq!(plan.remote.len(), 1);
+        assert_eq!(plan.remote[0].kind, ChangeKind::Moved);
+        assert!(!f.root.join("Album/old.flac").exists());
+        assert_eq!(fs::read(f.root.join("Compilations/old.flac")).unwrap(), b"one");
+
+        let source = state(&f, "Album/old.flac");
+        assert_eq!(source.state, PathState::Tombstone);
+        assert!(!source.present);
+        let target = state(&f, "Compilations/old.flac");
+        assert_eq!(target.state, PathState::Live);
+        assert!(target.present);
+        assert_eq!(target.base.as_deref(), Some(blob_of(b"one").as_str()));
+        assert!(
+            f.replica.vault_rows().unwrap().is_empty(),
+            "перенос не должен оставлять старую копию в корзине"
+        );
     }
 
     #[test]
