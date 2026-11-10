@@ -657,19 +657,13 @@ button:focus-visible {
   background: rgba(255, 255, 255, 0.016);
 }
 
-.ws-vault {
+.ws-vault, .ws-exclusions {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-width: 760px;
+
 }
 
-.ws-exclusions {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 760px;
-}
 
 /* Нижняя панель массовых действий не должна перекрывать последнюю строку. */
 .ws-vault.has-selection,

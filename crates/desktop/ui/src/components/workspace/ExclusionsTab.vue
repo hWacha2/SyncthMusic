@@ -200,20 +200,20 @@ async function applyBulk() {
         <p class="ws-vault-hint">{{ active.hint }}</p>
       </section>
 
-      <section class="ws-card">
-        <div class="ws-card-head">
+      <section class="ws-groups">
+       <!-- <div class="ws-card-head">
           <h2 class="ws-card-title">{{ active.title }}</h2>
           <span class="ws-tag">
             {{ t('workspace.exclusions.count', { count: activeRows.length }) }}
           </span>
-        </div>
+        </div> -->
 
         <p v-if="!activeRows.length" class="ws-empty-line">
           {{ t('workspace.exclusions.side_empty') }}
         </p>
 
         <template v-else>
-          <div class="ws-sort-row ws-card-sort">
+          <div class="ws-sort-row">
             <SortTabs v-model="sort" :options="sortOptions" />
             <div class="ws-sort-tools">
               <button
@@ -229,7 +229,7 @@ async function applyBulk() {
             </div>
           </div>
 
-          <div v-if="sort === 'folders'" class="ws-folders ws-path-folders">
+          <div v-if="sort === 'folders'" class="ws-card ws-folders ">
             <div
               v-for="folder in folderGroups"
               :key="folder.folder"

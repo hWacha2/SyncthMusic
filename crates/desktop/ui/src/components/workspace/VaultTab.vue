@@ -240,6 +240,34 @@ async function applyBulk() {
       </div>
       <p class="ws-vault-hint">{{ hint }}</p>
     </section>
+    <section class="ws-card ws-vault-actions">
+      <div class="ws-vault-action">
+        <div class="ws-setting-copy">
+          <span class="ws-setting-title">{{ t('workspace.vault.old_title') }}</span>
+          <span class="ws-setting-hint">{{ t('workspace.vault.old_text') }}</span>
+        </div>
+        <button
+            class="btn btn--quiet btn--small"
+            :disabled="busy || !canClear"
+            @click="askGcDevice"
+        >
+          <Spinner v-if="gc" />{{ t('workspace.vault.gc') }}
+        </button>
+      </div>
+      <div class="ws-vault-action">
+        <div class="ws-setting-copy">
+          <span class="ws-setting-title">{{ t('workspace.vault.all_title') }}</span>
+          <span class="ws-setting-hint">{{ t('workspace.vault.all_text') }}</span>
+        </div>
+        <button
+            class="btn btn--quiet btn--danger btn--small"
+            :disabled="busy || !canClear"
+            @click="askClearDevice"
+        >
+          <Spinner v-if="clearing" />{{ t('workspace.vault.clear_all') }}
+        </button>
+      </div>
+    </section>
 
     <template v-if="onPhone && !phoneConnected">
       <section class="ws-card ws-empty-card">
@@ -277,17 +305,17 @@ async function applyBulk() {
     </template>
 
     <template v-else>
-      <section class="ws-card">
-        <div class="ws-card-head">
-          <h2 class="ws-card-title">{{ panel }}</h2>
-          <span class="ws-tag">{{ t('workspace.vault.count', { count: rows.length }) }}</span>
-        </div>
-        <!-- Пока список обновляется, уже прочитанные строки остаются на месте:
-             иначе при каждом входе на вкладку телефона мелькает пустой экран. -->
+      <section class="ws-groups">
+        <!-- <div class="ws-card-head">
+           <h2 class="ws-card-title">{{ panel }}</h2>
+           <span class="ws-tag">{{ t('workspace.vault.count', { count: rows.length }) }}</span>
+         </div> хз и так понятно что сохранены на пк/телефоне  -->
+         <!-- Пока список обновляется, уже прочитанные строки остаются на месте:
+              иначе при каждом входе на вкладку телефона мелькает пустой экран. -->
         <p v-if="onPhone && phoneError" class="ws-card-hint">
           {{ t('workspace.error.phone_vault', { error: phoneError }) }}
         </p>
-        <div class="ws-sort-row ws-card-sort">
+        <div class="ws-sort-row">
           <SortTabs v-model="sort" :options="sortOptions" />
           <div class="ws-sort-tools">
             <button
@@ -303,11 +331,11 @@ async function applyBulk() {
           </div>
         </div>
 
-        <div v-if="sort === 'folders'" class="ws-folders ws-path-folders">
+        <div v-if="sort === 'folders'" class="ws-card ws-folders">
           <div
             v-for="folder in folderGroups"
             :key="folder.folder"
-            class="ws-folder"
+            class=" ws-folder"
             :class="{ 'is-open': isExpanded(folder) }"
           >
             <div class="ws-folder-head">
@@ -353,7 +381,7 @@ async function applyBulk() {
           </div>
         </div>
 
-        <div v-else class="ws-rows">
+        <div v-else class="ws-card ws-rows">
           <PathRow
             v-for="row in flatRows"
             :key="row.path"
@@ -372,34 +400,7 @@ async function applyBulk() {
         </div>
       </section>
 
-      <section class="ws-card ws-vault-actions">
-        <div class="ws-vault-action">
-          <div class="ws-setting-copy">
-            <span class="ws-setting-title">{{ t('workspace.vault.old_title') }}</span>
-            <span class="ws-setting-hint">{{ t('workspace.vault.old_text') }}</span>
-          </div>
-          <button
-            class="btn btn--quiet btn--small"
-            :disabled="busy || !canClear"
-            @click="askGcDevice"
-          >
-            <Spinner v-if="gc" />{{ t('workspace.vault.gc') }}
-          </button>
-        </div>
-        <div class="ws-vault-action">
-          <div class="ws-setting-copy">
-            <span class="ws-setting-title">{{ t('workspace.vault.all_title') }}</span>
-            <span class="ws-setting-hint">{{ t('workspace.vault.all_text') }}</span>
-          </div>
-          <button
-            class="btn btn--quiet btn--danger btn--small"
-            :disabled="busy || !canClear"
-            @click="askClearDevice"
-          >
-            <Spinner v-if="clearing" />{{ t('workspace.vault.clear_all') }}
-          </button>
-        </div>
-      </section>
+
     </template>
 
     <Teleport to="body">
